@@ -635,14 +635,37 @@ Sealed Resources version=2
 mod live {
     use super::*;
 
+    /// The whole check, against whatever is actually published right now:
+    /// the tag parses, the universal .zip is there, and its checksum is found
+    /// in SHA256SUMS. A release that fails this is one the updater could not
+    /// install, and this is the only test that would notice.
     #[tokio::test]
     #[ignore = "hits the network"]
-    async fn a_repo_with_no_releases_reads_as_up_to_date() {
-        let got = fetch_latest(Version::parse("0.1.0").unwrap()).await;
+    async fn the_published_release_is_installable_by_an_older_build() {
+        let update = fetch_latest(Version::parse("0.0.1").unwrap())
+            .await
+            .expect("the check succeeds")
+            .expect("something newer than 0.0.1 is published");
+
         assert!(
-            matches!(got, Ok(None)),
-            "expected no update, got {got:?}"
+            update.url.ends_with(ASSET_SUFFIX),
+            "asset {} is not the universal zip",
+            update.url
         );
+        assert!(update.size > 0, "asset has no size");
+        let sum = update
+            .sha256
+            .as_deref()
+            .expect("the release publishes SHA256SUMS covering its zip");
+        assert_eq!(sum.len(), 64, "not a sha256: {sum}");
+    }
+
+    /// ...and the running build is never offered itself.
+    #[tokio::test]
+    #[ignore = "hits the network"]
+    async fn the_current_version_is_not_offered_an_update() {
+        let got = fetch_latest(current_version()).await;
+        assert!(matches!(got, Ok(None)), "expected no update, got {got:?}");
     }
 
     #[tokio::test]
