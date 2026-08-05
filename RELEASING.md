@@ -4,10 +4,9 @@ A release is one universal (Intel + Apple Silicon) `.app`, signed with a
 Developer ID certificate, notarized by Apple, and stapled — so a downloaded copy
 opens with no Gatekeeper warning, no right-click, no `xattr -d`.
 
-Releases are currently cut **from a Mac**, because notarization needs the
-Developer ID certificate and the repository has no signing secrets yet. The
-GitHub workflow runs the same `make` targets and is ready to take over — see
-[Releasing from a tag](#releasing-from-a-tag).
+Releases are cut **from a Mac**, by hand. Notarization needs the Developer ID
+certificate in a local keychain, so there is no CI here to run it: the `make`
+targets below are the whole pipeline.
 
 ## What gets published
 
@@ -78,47 +77,8 @@ ID` means the signature is good but the notary step did not run.
 builds nothing — it only uploads what `release-macos` left behind, and it
 re-checks `spctl` first, so it cannot publish an unnotarized build by accident.
 
-## Releasing from a tag
-
-The `release` workflow does all of the above on a macOS runner and creates the
-release itself. It is **manual-only** right now: without the signing secrets a
-tag-triggered run can do nothing but fail, so the `push:` trigger is commented
-out in `.github/workflows/release.yml`.
-
-To switch over: add the four secrets below, uncomment that trigger, and then
-
-```sh
-# 1. bump the version in Cargo.toml ([workspace.package] version)
-# 2. commit it
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-The tag must match `Cargo.toml`. `make check-version` runs first and fails the
-build if it does not, before anything expensive happens. Actions is free for
-this repository while it stays public, including the macOS runners.
-
-### Repository secrets
-
-Settings → Secrets and variables → Actions:
-
-| Secret | How to produce it |
-| --- | --- |
-| `MACOS_CERT_P12` | see below |
-| `MACOS_CERT_PASSWORD` | the password you chose when exporting the `.p12` |
-| `APPLE_ID` | the Apple ID you stored notarytool credentials for |
-| `APPLE_APP_PASSWORD` | the app-specific password from setup step 2 |
-
-To produce `MACOS_CERT_P12`: Keychain Access → My Certificates → right-click
-*Developer ID Application: ZENIT GROUP LLC* → Export → `.p12`, set a password,
-then:
-
-```sh
-base64 -i Certificates.p12 | pbcopy
-```
-
-Paste that as the secret value. The workflow decodes it into a throwaway
-keychain that dies with the runner.
+Both `release-macos` and `publish` run `make check-version` first, which refuses
+a `TAG` that disagrees with `Cargo.toml` before anything expensive happens.
 
 ## Version numbers
 
