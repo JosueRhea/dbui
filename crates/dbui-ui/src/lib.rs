@@ -8,6 +8,7 @@ mod components;
 mod json_format;
 mod root;
 mod tabs;
+mod text_diff;
 mod text_input;
 mod theme;
 mod update;

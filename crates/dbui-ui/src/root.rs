@@ -15,7 +15,8 @@ use dbui_app::domain::{
 };
 use dbui_app::{store, ConnectionStatus, DbRuntime, RowUpdate, Workspace};
 use gpui::{
-    div, prelude::*, px, Context, FocusHandle, KeyDownEvent, SharedString, Window,
+    div, prelude::*, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
+    MouseUpEvent, Pixels, SharedString, Window,
 };
 
 /// Which surface the keyboard is talking to.
@@ -193,6 +194,25 @@ pub struct DbUi {
     pub(crate) theme_prev: Option<String>,
     /// Where the self-update flow has got to; drawn as a status-bar chip.
     pub(crate) update: crate::update::UpdateState,
+    /// Height of the expanded change bubble's diff area, dragged by its top
+    /// edge. A one-key edit needs three lines and a rewritten blob needs
+    /// thirty, and only the person looking at it knows which this is.
+    pub(crate) change_bubble_height: Pixels,
+    /// Live drag: `(pointer y, height)` as they were when the edge was grabbed.
+    pub(crate) change_bubble_drag: Option<(Pixels, Pixels)>,
+}
+
+/// Starting height of the diff area, and the range the drag is allowed.
+pub(crate) const BUBBLE_HEIGHT_DEFAULT: f32 = 180.;
+const BUBBLE_HEIGHT_MIN: f32 = 48.;
+/// Past this the bubble is eating the grid it is describing.
+const BUBBLE_HEIGHT_MAX_FRACTION: f32 = 0.7;
+
+/// Resolve a drag into a height. `rise` is how far the edge was pulled upward,
+/// which is the direction that makes the panel bigger.
+fn bubble_height_for(start_height: Pixels, rise: Pixels, viewport_height: Pixels) -> Pixels {
+    let max = (f32::from(viewport_height) * BUBBLE_HEIGHT_MAX_FRACTION).max(BUBBLE_HEIGHT_MIN);
+    px((f32::from(start_height) + f32::from(rise)).clamp(BUBBLE_HEIGHT_MIN, max))
 }
 
 impl DbUi {
@@ -218,6 +238,36 @@ impl DbUi {
             sidebar_cursor: None,
             theme_prev: None,
             update: crate::update::UpdateState::default(),
+            change_bubble_height: px(BUBBLE_HEIGHT_DEFAULT),
+            change_bubble_drag: None,
+        }
+    }
+
+    /// Grab the bubble's top edge at pointer position `y`.
+    pub(crate) fn begin_change_bubble_drag(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        self.change_bubble_drag = Some((y, self.change_bubble_height));
+        cx.notify();
+    }
+
+    /// Track the pointer. Dragging the top edge upwards makes the panel taller,
+    /// so the delta is inverted.
+    pub(crate) fn drag_change_bubble(
+        &mut self,
+        y: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start_y, start_height)) = self.change_bubble_drag else {
+            return;
+        };
+        self.change_bubble_height =
+            bubble_height_for(start_height, start_y - y, window.viewport_size().height);
+        cx.notify();
+    }
+
+    pub(crate) fn end_change_bubble_drag(&mut self, cx: &mut Context<Self>) {
+        if self.change_bubble_drag.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -1728,6 +1778,25 @@ impl Render for DbUi {
             .key_context("DbUi")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key))
+            // The pointer leaves the 5px grab strip on the first frame of a
+            // drag, so the tracking lives on the root instead.
+            .when(self.change_bubble_drag.is_some(), |root| {
+                root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    this.drag_change_bubble(event.position.y, window, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                        this.end_change_bubble_drag(cx)
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                        this.end_change_bubble_drag(cx)
+                    }),
+                )
+            })
             .on_action(cx.listener(|this, _: &crate::NewConnection, _window, cx| {
                 this.open_new_connection(cx)
             }))
@@ -1812,5 +1881,44 @@ impl Render for DbUi {
             .child(self.render_status_bar(cx))
             .children(modal)
             .children(palette)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dragging_the_bubble_edge_upward_makes_it_taller() {
+        let viewport = px(800.);
+        let start = px(BUBBLE_HEIGHT_DEFAULT);
+        assert_eq!(bubble_height_for(start, px(60.), viewport), px(240.));
+        assert_eq!(bubble_height_for(start, px(-60.), viewport), px(120.));
+    }
+
+    #[test]
+    fn the_bubble_cannot_be_dragged_past_either_stop() {
+        let viewport = px(800.);
+        let start = px(BUBBLE_HEIGHT_DEFAULT);
+        assert_eq!(
+            bubble_height_for(start, px(-9000.), viewport),
+            px(BUBBLE_HEIGHT_MIN),
+            "it must never collapse to nothing"
+        );
+        assert_eq!(
+            bubble_height_for(start, px(9000.), viewport),
+            px(800. * BUBBLE_HEIGHT_MAX_FRACTION),
+            "and never swallow the grid it describes"
+        );
+    }
+
+    /// A very short window must not produce a max below the min, which would
+    /// make `clamp` panic.
+    #[test]
+    fn a_tiny_window_still_yields_a_valid_range() {
+        assert_eq!(
+            bubble_height_for(px(BUBBLE_HEIGHT_DEFAULT), px(9000.), px(10.)),
+            px(BUBBLE_HEIGHT_MIN)
+        );
     }
 }

@@ -25,6 +25,75 @@ pub fn display_text(text: &str) -> String {
     pretty_if_json(text).unwrap_or_else(|| text.to_string())
 }
 
+/// How a stored JSON value is laid out in the database.
+///
+/// `jsonb` and MySQL `JSON` normalize whatever they are handed, but Postgres
+/// `json` and any `text` column keep the bytes verbatim -- so the layout a
+/// value arrived in is the layout it has to leave in, or editing one key
+/// rewrites the whitespace of the whole document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonLayout {
+    /// Serde's compact form, byte for byte: `{"a":1}`.
+    Compact,
+    /// Serde's pretty form, byte for byte: two-space indent.
+    Pretty,
+    /// Structured JSON in some other shape -- four-space indent, tabs, a space
+    /// after the colon. Nothing we can reproduce by re-serializing.
+    Custom,
+}
+
+/// The layout of `text`, or `None` when it is not a JSON object or array.
+pub fn layout_of(text: &str) -> Option<JsonLayout> {
+    let trimmed = text.trim();
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if !matches!(
+        value,
+        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+    ) {
+        return None;
+    }
+    if serde_json::to_string(&value).is_ok_and(|compact| compact == trimmed) {
+        return Some(JsonLayout::Compact);
+    }
+    if serde_json::to_string_pretty(&value).is_ok_and(|pretty| pretty == trimmed) {
+        return Some(JsonLayout::Pretty);
+    }
+    Some(JsonLayout::Custom)
+}
+
+/// What a detail-sidebar editor should be seeded with for a stored value.
+///
+/// A compact blob is expanded because it is otherwise unreadable, and that is
+/// safe: [`write_text`] can put it back exactly as it was. A value already
+/// carrying its own formatting is handed over untouched -- reformatting it
+/// would mean every save rewrote lines the user never visited.
+pub fn editor_text(stored: &str) -> String {
+    match layout_of(stored) {
+        Some(JsonLayout::Compact) => pretty_if_json(stored).unwrap_or_else(|| stored.to_string()),
+        _ => stored.to_string(),
+    }
+}
+
+/// What to write back after the user edited `edited` in place of `stored`.
+///
+/// The contract is that untouched parts of the document come out byte for byte
+/// as they went in. That holds in both directions: a compact value is
+/// re-serialized compactly, and a value we could not have reproduced was never
+/// reformatted for editing in the first place, so its buffer is already right.
+///
+/// Invalid JSON passes straight through — the server is the one that gets to
+/// reject it.
+pub fn write_text(stored: &str, edited: &str) -> String {
+    let trimmed = edited.trim();
+    if layout_of(stored) != Some(JsonLayout::Compact) {
+        return trimmed.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => serde_json::to_string(&value).unwrap_or_else(|_| trimmed.to_string()),
+        Err(_) => trimmed.to_string(),
+    }
+}
+
 /// True when the strings are identical, or both parse as equal JSON values.
 pub fn texts_equivalent(a: &str, b: &str) -> bool {
     if a == b {
@@ -227,6 +296,79 @@ mod tests {
     fn equivalent_ignores_whitespace() {
         assert!(texts_equivalent(r#"{"a":1}"#, "{\n  \"a\": 1\n}"));
         assert!(!texts_equivalent(r#"{"a":1}"#, r#"{"a":2}"#));
+    }
+
+    #[test]
+    fn layouts_are_told_apart_by_round_tripping() {
+        assert_eq!(layout_of(r#"{"a":1}"#), Some(JsonLayout::Compact));
+        assert_eq!(layout_of("{\n  \"a\": 1\n}"), Some(JsonLayout::Pretty));
+        // A space after the colon is neither of serde's two forms.
+        assert_eq!(layout_of(r#"{"a": 1}"#), Some(JsonLayout::Custom));
+        assert_eq!(layout_of("{\n    \"a\": 1\n}"), Some(JsonLayout::Custom));
+        assert_eq!(layout_of("42"), None);
+        assert_eq!(layout_of("not json"), None);
+    }
+
+    #[test]
+    fn a_compact_value_is_expanded_to_edit_and_compacted_to_save() {
+        let stored = r#"{"a":1,"b":2}"#;
+        let editing = editor_text(stored);
+        assert!(editing.contains('\n'), "compact JSON must expand to edit");
+        assert_eq!(
+            write_text(stored, &editing),
+            stored,
+            "an untouched round trip must return the stored bytes"
+        );
+
+        let edited = editing.replace("\"b\": 2", "\"b\": 3");
+        assert_eq!(write_text(stored, &edited), r#"{"a":1,"b":3}"#);
+    }
+
+    #[test]
+    fn a_hand_formatted_value_is_never_reformatted() {
+        let stored = "{\n    \"a\": 1,\n    \"b\": 2\n}";
+        assert_eq!(
+            editor_text(stored),
+            stored,
+            "four-space indent is the user's, not ours to normalize"
+        );
+
+        let edited = stored.replace("\"b\": 2", "\"b\": 3");
+        assert_eq!(
+            write_text(stored, &edited),
+            edited,
+            "only the line the user touched may differ"
+        );
+    }
+
+    #[test]
+    fn editing_one_key_leaves_the_other_lines_alone() {
+        // The regression this whole path exists for: a change to one key must
+        // not come back as a change to every line.
+        let stored = "{\n    \"keep\": \"me\",\n    \"flag\": false\n}";
+        let edited = stored.replace("false", "true");
+        let written = write_text(stored, &edited);
+
+        let untouched = written
+            .lines()
+            .filter(|line| stored.lines().any(|old| old == *line))
+            .count();
+        assert_eq!(untouched, 3, "only the flag line should differ: {written}");
+    }
+
+    #[test]
+    fn key_order_survives_a_save() {
+        // Alphabetically out of order on purpose: `preserve_order` is what
+        // stops this from coming back sorted.
+        let stored = r#"{"zebra":1,"apple":2}"#;
+        let edited = editor_text(stored).replace("2", "3");
+        assert_eq!(write_text(stored, &edited), r#"{"zebra":1,"apple":3}"#);
+    }
+
+    #[test]
+    fn invalid_json_is_passed_through_for_the_server_to_reject() {
+        let stored = r#"{"a":1}"#;
+        assert_eq!(write_text(stored, "{\"a\": oops"), "{\"a\": oops");
     }
 
     #[test]

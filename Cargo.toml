@@ -50,7 +50,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 async-trait = "0.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` is not optional here. Editing one key of a JSON cell
+# re-serializes the whole value, so without it every save would rewrite the
+# object with its keys sorted alphabetically. gpui happens to turn the feature
+# on today; this makes that guarantee ours rather than a transitive accident.
+serde_json = { version = "1", features = ["preserve_order"] }
 dirs = "6"
 plist = "1"
 

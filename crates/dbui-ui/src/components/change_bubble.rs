@@ -2,9 +2,19 @@
 
 use super::button;
 use crate::root::DbUi;
-use crate::tabs::{PendingRowEdit, WorkspaceTab};
-use crate::theme::metrics;
-use gpui::{div, prelude::*, px, AnyElement, Context, SharedString};
+use crate::tabs::{FieldChange, PendingRowEdit, WorkspaceTab};
+use crate::text_diff::{line_diff, DiffLine};
+use crate::theme::{metrics, Theme};
+use gpui::{div, prelude::*, px, AnyElement, Context, MouseButton, MouseDownEvent, SharedString};
+
+/// A one-line before/after has to fit beside its column name, and a diff line
+/// has to fit the bubble. Past this the tail is dropped -- the bubble is a
+/// summary, and the detail sidebar holds the full value.
+const MAX_LINE_CHARS: usize = 120;
+
+/// Enough to show a small edit in full without the bubble swallowing the
+/// window. A larger change says how much more there is.
+const MAX_DIFF_LINES: usize = 12;
 
 impl DbUi {
     pub(crate) fn render_change_bubble(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -62,6 +72,10 @@ impl DbUi {
                 .on_click(cx.listener(|this, _, _window, cx| this.save_pending_edits(cx)))
         };
 
+        if expanded {
+            bubble = bubble.child(resize_handle(self.change_bubble_drag.is_some(), theme, cx));
+        }
+
         bubble = bubble.child(
             div()
                 .flex()
@@ -96,7 +110,9 @@ impl DbUi {
             bubble = bubble.child(
                 div()
                     .id("change-bubble-details")
-                    .max_h(px(180.))
+                    .w_full()
+                    .min_w(px(0.))
+                    .h(self.change_bubble_height)
                     .overflow_y_scroll()
                     .border_t_1()
                     .border_color(theme.divider)
@@ -113,7 +129,39 @@ impl DbUi {
     }
 }
 
-fn render_edit_group(edit: &PendingRowEdit, theme: &crate::theme::Theme) -> AnyElement {
+/// The bubble's top edge: drag it up for more diff, down for less.
+///
+/// Only the pointer-down lives here. Once the drag starts the pointer is off
+/// this 5px strip immediately, so the root view owns the move and release.
+fn resize_handle(dragging: bool, theme: &Theme, cx: &mut Context<DbUi>) -> AnyElement {
+    div()
+        .id("change-bubble-resize")
+        .w_full()
+        .h(px(5.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_row_resize()
+        .when(dragging, |strip| strip.bg(theme.accent))
+        .hover(|strip| strip.bg(theme.hover))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                this.begin_change_bubble_drag(event.position.y, cx);
+            }),
+        )
+        .child(
+            div()
+                .w(px(28.))
+                .h(px(2.))
+                .rounded_full()
+                .bg(theme.text_faint),
+        )
+        .into_any_element()
+}
+
+fn render_edit_group(edit: &PendingRowEdit, theme: &Theme) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -124,31 +172,128 @@ fn render_edit_group(edit: &PendingRowEdit, theme: &crate::theme::Theme) -> AnyE
                 .text_color(theme.text_muted)
                 .child(SharedString::from(edit.label.clone())),
         )
-        .children(edit.changes.iter().map(|change| {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .font_family(metrics::MONO_FONT)
-                .text_size(metrics::text_size_small())
-                .child(
-                    div()
-                        .text_color(theme.text)
-                        .child(SharedString::from(change.column.clone())),
-                )
-                .child(div().text_color(theme.text_faint).child(":"))
-                .child(
-                    div()
-                        .text_color(theme.danger)
-                        .child(SharedString::from(change.old_text.clone())),
-                )
-                .child(div().text_color(theme.text_faint).child("→"))
-                .child(
-                    div()
-                        .text_color(theme.success)
-                        .child(SharedString::from(change.new_text.clone())),
-                )
-                .into_any_element()
-        }))
+        .children(
+            edit.changes
+                .iter()
+                .map(|change| render_change(change, theme)),
+        )
         .into_any_element()
+}
+
+fn render_change(change: &FieldChange, theme: &Theme) -> AnyElement {
+    let multiline = change.old_text.contains('\n') || change.new_text.contains('\n');
+    let diff = if multiline {
+        line_diff(&change.old_text, &change.new_text)
+    } else {
+        None
+    };
+
+    match diff {
+        Some(lines) if !lines.is_empty() => div()
+            .w_full()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(column_label(&change.column, theme))
+            .child(render_diff_lines(&lines, theme))
+            .into_any_element(),
+        // A scalar, or a document too large to diff: the old inline form, but
+        // flattened onto one line so a stray newline cannot grow the row.
+        _ => div()
+            .w_full()
+            .min_w(px(0.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .overflow_hidden()
+            .font_family(metrics::MONO_FONT)
+            .text_size(metrics::text_size_small())
+            .child(column_label(&change.column, theme))
+            .child(div().text_color(theme.text_faint).child(":"))
+            .child(
+                div()
+                    .text_color(theme.danger)
+                    .child(SharedString::from(one_line(&change.old_text))),
+            )
+            .child(div().text_color(theme.text_faint).child("→"))
+            .child(
+                div()
+                    .text_color(theme.success)
+                    .child(SharedString::from(one_line(&change.new_text))),
+            )
+            .into_any_element(),
+    }
+}
+
+fn column_label(column: &str, theme: &Theme) -> AnyElement {
+    div()
+        .font_family(metrics::MONO_FONT)
+        .text_size(metrics::text_size_small())
+        .text_color(theme.text)
+        .child(SharedString::from(column.to_string()))
+        .into_any_element()
+}
+
+fn render_diff_lines(lines: &[DiffLine], theme: &Theme) -> AnyElement {
+    let hidden = lines.len().saturating_sub(MAX_DIFF_LINES);
+
+    let mut body = div()
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .font_family(metrics::MONO_FONT)
+        .text_size(metrics::text_size_small())
+        .children(lines.iter().take(MAX_DIFF_LINES).map(|line| {
+            let (marker, text, color) = match line {
+                DiffLine::Removed(text) => ("-", text, theme.danger),
+                DiffLine::Added(text) => ("+", text, theme.success),
+            };
+            div()
+                .w_full()
+                .min_w(px(0.))
+                .flex()
+                .gap_1()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_color(color)
+                .child(div().flex_shrink_0().child(marker))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(SharedString::from(one_line(text))),
+                )
+        }));
+
+    if hidden > 0 {
+        body = body.child(
+            div()
+                .text_color(theme.text_faint)
+                .child(SharedString::from(format!("… {hidden} more line(s)"))),
+        );
+    }
+
+    body.into_any_element()
+}
+
+/// Collapse a value onto one line and cap it, the way the grid renders a cell:
+/// a newline here would paint over the row below it.
+fn one_line(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if out.chars().count() >= MAX_LINE_CHARS {
+            out.push('…');
+            return out;
+        }
+        match ch {
+            '\n' => out.push('⏎'),
+            '\t' => out.push(' '),
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }

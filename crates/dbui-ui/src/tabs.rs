@@ -22,9 +22,17 @@ pub enum TablePane {
 #[derive(Clone)]
 pub struct FieldChange {
     pub column: String,
+    /// The stored value, normalized the same way as `new_text` so that the
+    /// diff shows the change and not the difference in layout between them.
     pub old_text: String,
-    pub new_value: Value,
+    /// The pending value, normalized alongside `old_text`.
     pub new_text: String,
+    /// The editor buffer verbatim. Reopening the row restores this, so leaving
+    /// a row and coming back does not hand the user back a reformatted copy of
+    /// what they typed.
+    pub edited_text: String,
+    /// Exactly what the UPDATE will bind.
+    pub new_value: Value,
 }
 
 /// A dirty row waiting to be saved with the rest of the batch.
@@ -62,7 +70,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// How a value appears in the change bubble / draft editors.
+/// How a value appears in the change bubble.
+///
+/// Both sides of a diff go through this, so a compact stored blob and the
+/// compact value replacing it are compared expanded — the diff then reports
+/// the key that moved rather than "the whole line changed".
 fn display_change_text(value: &Value) -> String {
     value_editor_text(value)
 }
@@ -161,6 +173,7 @@ impl RowDraft {
                     column: name.clone(),
                     old_text: display_change_text(original),
                     new_text: display_change_text(&parsed),
+                    edited_text: input.text().to_string(),
                     new_value: parsed,
                 });
             }
@@ -188,7 +201,7 @@ impl RowDraft {
                 .iter_mut()
                 .find(|(name, _, _)| name == &change.column)
             {
-                *input = TextInput::with_text(change.new_text.clone(), true);
+                *input = TextInput::with_text(change.edited_text.clone(), true);
             }
         }
     }
@@ -236,7 +249,7 @@ fn value_editor_text(value: &Value) -> String {
             if is_special_token(&text) {
                 quote_draft_literal(&text)
             } else {
-                json_format::display_text(&text)
+                json_format::editor_text(&text)
             }
         }
     }
@@ -587,10 +600,17 @@ fn parse_typed_literal(trimmed: &str, original: &Value) -> Result<Value, String>
                 Ok(Value::Text(trimmed.to_string()))
             }
         }
-        Value::Text(_) | Value::Uuid(_) | Value::Temporal(_) => {
-            Ok(Value::Text(trimmed.to_string()))
-        }
-        Value::Json(_) => Ok(Value::Json(trimmed.to_string())),
+        // A `text` column is included on purpose: one holding JSON is expanded
+        // for editing like any other, so it has to be put back the same way.
+        Value::Text(_) => Ok(Value::Text(json_format::write_text(
+            &original.to_text(),
+            trimmed,
+        ))),
+        Value::Uuid(_) | Value::Temporal(_) => Ok(Value::Text(trimmed.to_string())),
+        Value::Json(_) => Ok(Value::Json(json_format::write_text(
+            &original.to_text(),
+            trimmed,
+        ))),
         Value::Bytes(_) | Value::Array(_) | Value::Unsupported(_) => Err(
             "this column type cannot be edited from the sidebar yet".into(),
         ),
@@ -701,6 +721,207 @@ mod tests {
         };
         assert!(!draft.is_dirty(&[compact.clone()]));
         assert!(draft.to_pending(&[compact]).unwrap().is_none());
+    }
+
+    /// Build a draft over an `id` primary key plus one editable column.
+    fn draft_with(column: &str, buffer: &str) -> RowDraft {
+        RowDraft {
+            row_index: 0,
+            fields: vec![
+                ("id".into(), TextInput::with_text("1", false), true),
+                (column.into(), TextInput::with_text(buffer, true), false),
+            ],
+            message: None,
+            field_search: TextInput::new(false),
+        }
+    }
+
+    #[test]
+    fn editing_one_key_of_a_compact_json_column_writes_compact_json() {
+        let stored = Value::Json(r#"{"beta":2,"alpha":1}"#.into());
+        let buffer = value_editor_text(&stored).replace("\"beta\": 2", "\"beta\": 3");
+        let draft = draft_with("flags", &buffer);
+
+        let pending = draft
+            .to_pending(&[Value::Int(1), stored])
+            .unwrap()
+            .expect("one change");
+        let change = &pending.changes[0];
+
+        assert_eq!(
+            change.new_value,
+            Value::Json(r#"{"beta":3,"alpha":1}"#.into()),
+            "the write must keep the stored layout and key order"
+        );
+        assert!(
+            change.old_text.contains('\n') && change.new_text.contains('\n'),
+            "both diff sides are expanded, so the diff shows one key and not one line"
+        );
+    }
+
+    /// A `text` column holding JSON is expanded for editing like a `json` one,
+    /// so it has to be put back compact too -- `text` keeps whitespace verbatim.
+    #[test]
+    fn a_text_column_holding_json_also_keeps_its_layout() {
+        let stored = Value::Text(r#"{"on":false}"#.into());
+        let buffer = value_editor_text(&stored).replace("false", "true");
+        let draft = draft_with("settings", &buffer);
+
+        let pending = draft
+            .to_pending(&[Value::Int(1), stored])
+            .unwrap()
+            .expect("one change");
+        assert_eq!(
+            pending.changes[0].new_value,
+            Value::Text(r#"{"on":true}"#.into())
+        );
+    }
+
+    #[test]
+    fn plain_text_is_not_touched_by_the_json_layout_rules() {
+        let stored = Value::Text("hello".into());
+        let draft = draft_with("note", "hello there");
+
+        let pending = draft
+            .to_pending(&[Value::Int(1), stored])
+            .unwrap()
+            .expect("one change");
+        assert_eq!(
+            pending.changes[0].new_value,
+            Value::Text("hello there".into())
+        );
+    }
+
+    /// Leaving a row and coming back must return the buffer as typed. It used
+    /// to restore a re-serialized copy, silently reformatting the user's JSON.
+    #[test]
+    fn revisiting_a_row_restores_the_text_that_was_typed() {
+        let stored = Value::Json(r#"{"a":1}"#.into());
+        let typed = r#"{"a":2}"#;
+        let pending = draft_with("blob", typed)
+            .to_pending(&[Value::Int(1), stored.clone()])
+            .unwrap()
+            .expect("one change");
+
+        let mut reopened = draft_with("blob", &value_editor_text(&stored));
+        reopened.apply_pending(&pending);
+        assert_eq!(reopened.fields[1].1.text(), typed);
+    }
+
+    /// A settings blob of the shape these columns really hold: mixed key
+    /// styles, a nested object, and an array of objects.
+    const SETTINGS: &str = r#"{
+  "currency": "GTQ",
+  "ghost_mode": false,
+  "clean_chat_after": 180,
+  "ordering-flow-id": "1558815002402718",
+  "pickup_auto_report": {
+    "wa": true,
+    "app": true,
+    "web": true,
+    "call": true
+  },
+  "catalog_meal_schedules": {
+    "desayuno": [
+      {
+        "fin": "10:50",
+        "Sunday": true,
+        "inicio": "07:00"
+      },
+      {
+        "fin": "10:50",
+        "inicio": "07:45",
+        "Thursday": true
+      }
+    ]
+  },
+  "minimum_purchase_on_delivery": 70,
+  "teta-for-scheduled-orders-pickup": 0
+}"#;
+
+    /// The whole point of the layout work, measured end to end on a document
+    /// big enough for a whole-blob rewrite to be obvious.
+    ///
+    /// A `jsonb` column arrives compact (`JsonValue::to_string`), is expanded
+    /// to edit, and must go back changed only where the user typed -- both in
+    /// the bytes bound to the UPDATE and in what the change bubble draws.
+    fn assert_one_key_edit(find: &str, replace: &str, expect_diff_rows: usize) {
+        let parsed: serde_json::Value = serde_json::from_str(SETTINGS).unwrap();
+        let stored = Value::Json(serde_json::to_string(&parsed).unwrap());
+
+        let seed = value_editor_text(&stored);
+        assert!(seed.contains('\n'), "a compact column expands to edit");
+        assert!(seed.contains(find), "`{find}` should be in the buffer");
+        let buffer = seed.replacen(find, replace, 1);
+
+        let draft = draft_with("settings", &buffer);
+        let pending = draft
+            .to_pending(&[Value::Int(1), stored.clone()])
+            .unwrap()
+            .expect("one change");
+        let change = &pending.changes[0];
+
+        // The bubble diffs the two normalized sides, and must report the edit
+        // rather than all ~28 lines of the document.
+        let rows = crate::text_diff::line_diff(&change.old_text, &change.new_text)
+            .expect("small enough to diff");
+        assert_eq!(
+            rows.len(),
+            expect_diff_rows,
+            "expected a {expect_diff_rows}-row diff, got {rows:#?}"
+        );
+
+        // The write stays compact, and differs from the stored bytes only in
+        // the region the edit touched.
+        let written = change.new_value.to_text();
+        assert!(!written.contains('\n'), "a compact column is written compact");
+
+        let old = stored.to_text();
+        let prefix = old
+            .as_bytes()
+            .iter()
+            .zip(written.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let suffix = old.as_bytes()[prefix..]
+            .iter()
+            .rev()
+            .zip(written.as_bytes()[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let rewritten = old.len() - prefix - suffix;
+        assert!(
+            rewritten < 64,
+            "only the edited span may be rewritten, but {rewritten} bytes of \
+             {} changed: {:?}",
+            old.len(),
+            &old[prefix..old.len() - suffix]
+        );
+    }
+
+    #[test]
+    fn editing_a_number_deep_in_a_settings_blob_rewrites_only_that_number() {
+        assert_one_key_edit("\"clean_chat_after\": 180", "\"clean_chat_after\": 240", 2);
+    }
+
+    #[test]
+    fn editing_a_value_inside_a_nested_array_rewrites_only_that_value() {
+        assert_one_key_edit(
+            "\"fin\": \"10:50\",\n        \"inicio\": \"07:45\"",
+            "\"fin\": \"11:50\",\n        \"inicio\": \"07:45\"",
+            2,
+        );
+    }
+
+    /// A run of changed lines groups removals above additions, the way a
+    /// unified diff does -- not one interleaved pair per line.
+    #[test]
+    fn flipping_four_flags_in_a_nested_object_shows_four_of_each() {
+        assert_one_key_edit(
+            "\"wa\": true,\n    \"app\": true,\n    \"web\": true,\n    \"call\": true",
+            "\"wa\": false,\n    \"app\": false,\n    \"web\": false,\n    \"call\": false",
+            8,
+        );
     }
 
     #[test]
