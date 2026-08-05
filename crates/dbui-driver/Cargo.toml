@@ -1,0 +1,21 @@
+[package]
+name = "dbui-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The DatabaseDriver port and its PostgreSQL and MySQL adapters."
+
+# sqlx stops here. No crate further out (`dbui-app`, `dbui-ui`) depends on it,
+# so a change of client library is confined to this crate.
+[dependencies]
+dbui-domain = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+
+# `tests/live.rs` needs a runtime of its own to await the adapters. It is the
+# only thing in this crate that does; the app supplies one in production.
+[dev-dependencies]
+tokio = { workspace = true }

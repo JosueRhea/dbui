@@ -1,0 +1,1724 @@
+//! The root view: all UI state, and the handlers that move it.
+//!
+//! GPUI is confined to this crate, and the mutable state of the window is
+//! confined to this file. The components in `components/` are `impl DbUi`
+//! blocks that only render -- they read state and attach listeners, they do not
+//! define it. When a task lands, exactly one of the methods here folds it in.
+
+use crate::components::{ConnectionForm, DetailInput, FormAction};
+use crate::components::palette::{Palette, PaletteKind};
+use crate::tabs::{upsert_pending, RowDraft, Tabs, WorkspaceTab};
+use crate::theme::{metrics, Theme};
+use dbui_app::commands;
+use dbui_app::domain::{
+    Column, ConnectionId, Page, QueryOutcome, QueryResult, ResultSet, TableRef,
+};
+use dbui_app::{store, ConnectionStatus, DbRuntime, RowUpdate, Workspace};
+use gpui::{
+    div, prelude::*, px, Context, FocusHandle, KeyDownEvent, SharedString, Window,
+};
+
+/// Which surface the keyboard is talking to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    Editor,
+    Grid,
+    Detail,
+    Filter,
+    PageSize,
+}
+
+/// Focus target inside the filter strip (Tab cycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterFocus {
+    Where,
+    Apply,
+    Clear,
+}
+
+impl FilterFocus {
+    const ORDER: [FilterFocus; 3] = [FilterFocus::Where, FilterFocus::Apply, FilterFocus::Clear];
+
+    fn cycle(self, backward: bool) -> Self {
+        let index = Self::ORDER
+            .iter()
+            .position(|item| *item == self)
+            .unwrap_or(0);
+        let next = if backward {
+            (index + Self::ORDER.len() - 1) % Self::ORDER.len()
+        } else {
+            (index + 1) % Self::ORDER.len()
+        };
+        Self::ORDER[next]
+    }
+}
+
+/// Keyboard / click cursor in the sidebar tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarItem {
+    Schema {
+        connection: ConnectionId,
+        name: String,
+    },
+    Table {
+        connection: ConnectionId,
+        table: TableRef,
+    },
+}
+
+/// Where the rows on screen came from.
+///
+/// Kept because the two cases behave differently afterwards: a table can be
+/// paged and refreshed, a query can only be re-run.
+#[derive(Clone)]
+pub enum ResultSource {
+    Table {
+        table: TableRef,
+        page: Page,
+        total_rows: Option<i64>,
+        where_clause: String,
+    },
+    Query {
+        sql: String,
+    },
+}
+
+/// A result set, plus everything derived from it that the grid would otherwise
+/// recompute every frame.
+pub struct ResultView {
+    pub set: ResultSet,
+    /// Per-column pixel widths, measured once when the rows arrive.
+    pub widths: Vec<f32>,
+    pub source: ResultSource,
+    pub summary: String,
+    /// Column metadata, when the rows came from a table rather than a query.
+    pub structure: Vec<Column>,
+}
+
+impl ResultView {
+    fn new(set: ResultSet, source: ResultSource, summary: String, structure: Vec<Column>) -> Self {
+        let widths = column_widths(&set);
+        Self {
+            set,
+            widths,
+            source,
+            summary,
+            structure,
+        }
+    }
+}
+
+/// Estimate a starting width for each column.
+///
+/// Only the first rows are sampled: with 500 rows and 40 columns, measuring
+/// everything is 20,000 string renders on the way to a number the user can
+/// drag anyway. The header is always included so a wide name is never clipped
+/// by a narrow column of values.
+fn column_widths(set: &ResultSet) -> Vec<f32> {
+    const SAMPLE: usize = 200;
+
+    set.columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let mut widest = column.name.chars().count();
+            for row in set.rows.iter().take(SAMPLE) {
+                if let Some(value) = row.get(index) {
+                    widest = widest.max(value.to_cell(64).chars().count());
+                }
+            }
+            (widest as f32 * metrics::char_width() + metrics::cell_padding())
+                .clamp(metrics::column_min_width(), metrics::column_max_width())
+        })
+        .collect()
+}
+
+/// A message for the status bar.
+#[derive(Clone)]
+pub enum Status {
+    Idle,
+    Busy(SharedString),
+    Info(SharedString),
+    Error(SharedString),
+}
+
+impl Status {
+    pub fn info(text: impl Into<SharedString>) -> Self {
+        Status::Info(text.into())
+    }
+
+    pub fn error(text: impl Into<SharedString>) -> Self {
+        Status::Error(text.into())
+    }
+
+    pub fn busy(text: impl Into<SharedString>) -> Self {
+        Status::Busy(text.into())
+    }
+}
+
+pub struct DbUi {
+    pub(crate) runtime: DbRuntime,
+    pub(crate) workspace: Workspace,
+    pub(crate) theme: Theme,
+    pub(crate) focus_handle: FocusHandle,
+
+    pub(crate) focus: Focus,
+    pub(crate) tabs: Tabs,
+    pub(crate) detail_open: bool,
+    /// Which draft field / search box is focused in the detail sidebar.
+    pub(crate) detail_input: Option<DetailInput>,
+    /// Which control in the filter strip owns the keyboard, if any.
+    pub(crate) filter_focus: Option<FilterFocus>,
+    pub(crate) page_size_focus: bool,
+    pub(crate) status: Status,
+    /// In-flight table/SQL loads. Lets status clear when background tabs finish
+    /// without stomping a newer busy message on the active tab.
+    pub(crate) loads_in_flight: u32,
+    /// The cell the user last clicked, shown in full in the status bar --
+    /// a grid cell is truncated, and the whole value has to be readable
+    /// somewhere.
+    pub(crate) selected_cell: Option<(usize, usize)>,
+
+    pub(crate) modal: Option<ConnectionForm>,
+    /// Titlebar connection switcher dropdown.
+    pub(crate) connection_picker_open: bool,
+    /// ⌘P / ⌘⇧P overlay; owns keys while open.
+    pub(crate) palette: Option<Palette>,
+    /// Arrow-key cursor in the sidebar list.
+    pub(crate) sidebar_cursor: Option<SidebarItem>,
+    /// Theme id to restore if the theme picker is dismissed.
+    pub(crate) theme_prev: Option<String>,
+}
+
+impl DbUi {
+    pub fn new(runtime: DbRuntime, workspace: Workspace, focus_handle: FocusHandle) -> Self {
+        Self {
+            runtime,
+            workspace,
+            theme: Theme::default(),
+            focus_handle,
+            focus: Focus::Sidebar,
+            tabs: Tabs::default(),
+            detail_open: false,
+            detail_input: None,
+            filter_focus: None,
+            page_size_focus: false,
+            status: Status::Idle,
+            loads_in_flight: 0,
+            selected_cell: None,
+            modal: None,
+            connection_picker_open: false,
+            palette: None,
+            sidebar_cursor: None,
+            theme_prev: None,
+        }
+    }
+
+    pub fn apply_theme_id(&mut self, id: &str) {
+        self.theme = Theme::named(id);
+    }
+
+    pub fn apply_zoom_pct(&mut self, pct: u32) {
+        metrics::set_zoom_pct(pct);
+    }
+
+    pub fn persist_prefs(&mut self, cx: &mut Context<Self>) {
+        let prefs = store::Prefs {
+            theme: self.theme.id.to_string(),
+            zoom_pct: metrics::zoom_pct(),
+        };
+        match store::prefs_path().and_then(|path| store::save_prefs(&path, &prefs)) {
+            Ok(()) => {}
+            Err(error) => {
+                self.status = Status::error(format!("Could not save prefs: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn persist_theme(&mut self, cx: &mut Context<Self>) {
+        let prefs = store::Prefs {
+            theme: self.theme.id.to_string(),
+            zoom_pct: metrics::zoom_pct(),
+        };
+        match store::prefs_path().and_then(|path| store::save_prefs(&path, &prefs)) {
+            Ok(()) => {
+                self.status = Status::info(format!("Theme: {}", self.theme.label));
+            }
+            Err(error) => {
+                self.status = Status::error(format!("Could not save theme: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn zoom_delta(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let pct = match direction {
+            1 => metrics::zoom_in(),
+            -1 => metrics::zoom_out(),
+            _ => metrics::zoom_reset(),
+        };
+        self.persist_prefs(cx);
+        self.status = Status::info(format!("Zoom: {pct}%"));
+        cx.notify();
+    }
+
+    /// Surface a failure that happened before the window existed.
+    pub fn report_startup_error(&mut self, message: impl Into<SharedString>) {
+        self.status = Status::Error(message.into());
+    }
+
+    // -- tabs ---------------------------------------------------------------
+
+    pub(crate) fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.items.len() || index == self.tabs.active {
+            return;
+        }
+        self.stash_current_draft(cx);
+        self.tabs.activate(index);
+        self.selected_cell = None;
+        self.detail_input = None;
+        self.filter_focus = None;
+        self.page_size_focus = false;
+        if let Some(tab) = self.tabs.active() {
+            if let Some(table) = tab.table_ref() {
+                self.workspace.open_table = Some(table.clone());
+            } else {
+                self.workspace.open_table = None;
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.items.len() {
+            return;
+        }
+        self.tabs.close(index);
+        self.selected_cell = None;
+        self.detail_input = None;
+        self.filter_focus = None;
+        self.page_size_focus = false;
+        self.workspace.open_table = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.table_ref().cloned());
+        if self.tabs.items.is_empty() {
+            self.workspace.open_table = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        if self.tabs.items.is_empty() {
+            return;
+        }
+        self.close_tab(self.tabs.active, cx);
+    }
+
+    pub(crate) fn next_tab(&mut self, cx: &mut Context<Self>) {
+        let len = self.tabs.items.len();
+        if len < 2 {
+            return;
+        }
+        self.activate_tab((self.tabs.active + 1) % len, cx);
+    }
+
+    pub(crate) fn prev_tab(&mut self, cx: &mut Context<Self>) {
+        let len = self.tabs.items.len();
+        if len < 2 {
+            return;
+        }
+        let prev = if self.tabs.active == 0 {
+            len - 1
+        } else {
+            self.tabs.active - 1
+        };
+        self.activate_tab(prev, cx);
+    }
+
+    /// Select tab by 1-based number. `9` jumps to the last tab (browser-style).
+    pub(crate) fn select_tab_number(&mut self, number: u8, cx: &mut Context<Self>) {
+        let len = self.tabs.items.len();
+        if len == 0 || !(1..=9).contains(&number) {
+            return;
+        }
+        let index = if number == 9 {
+            len - 1
+        } else {
+            let index = (number as usize) - 1;
+            if index >= len {
+                return;
+            }
+            index
+        };
+        self.activate_tab(index, cx);
+    }
+
+    pub(crate) fn toggle_detail(&mut self, cx: &mut Context<Self>) {
+        self.detail_open = !self.detail_open;
+        cx.notify();
+    }
+
+    /// Tab order in the detail sidebar: search, then visible non-PK fields.
+    fn detail_tab_targets(&self) -> Vec<DetailInput> {
+        let draft = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            })
+            | Some(WorkspaceTab::Sql {
+                draft: Some(draft), ..
+            }) => draft,
+            _ => return Vec::new(),
+        };
+        let search = draft.field_search.text().to_ascii_lowercase();
+        let mut targets = vec![DetailInput::Search];
+        for (index, (name, _, is_pk)) in draft.fields.iter().enumerate() {
+            if *is_pk {
+                continue;
+            }
+            if !search.is_empty() && !name.to_ascii_lowercase().contains(&search) {
+                continue;
+            }
+            targets.push(DetailInput::Field(index));
+        }
+        targets
+    }
+
+    fn cycle_detail_focus(&mut self, backward: bool, cx: &mut Context<Self>) {
+        let targets = self.detail_tab_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let current = self.detail_input.unwrap_or(DetailInput::Search);
+        let index = targets
+            .iter()
+            .position(|target| *target == current)
+            .unwrap_or(0);
+        let next = if backward {
+            (index + targets.len() - 1) % targets.len()
+        } else {
+            (index + 1) % targets.len()
+        };
+        self.detail_input = Some(targets[next]);
+        self.focus = Focus::Detail;
+        cx.notify();
+    }
+
+    pub(crate) fn open_sql_tab(&mut self, cx: &mut Context<Self>) {
+        self.tabs.open_sql();
+        self.focus = Focus::Editor;
+        cx.notify();
+    }
+
+    // -- connections ------------------------------------------------------
+
+    pub(crate) fn connect(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        let Some(entry) = self.workspace.get_mut(id) else {
+            return;
+        };
+        if entry.status.is_connected() || entry.status.is_busy() {
+            return;
+        }
+
+        let config = entry.config.clone();
+        entry.status = ConnectionStatus::Connecting;
+        self.status = Status::busy(format!("Connecting to {}…", config.summary()));
+
+        let task = commands::connect(&self.runtime, config);
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                let Some(outcome) = landed else { return };
+                match outcome {
+                    Ok((driver, catalog)) => {
+                        let version = driver.server_version().to_string();
+                        if let Some(entry) = this.workspace.get_mut(id) {
+                            entry.status = ConnectionStatus::Connected(driver);
+                            entry.expanded = catalog
+                                .schemas
+                                .first()
+                                .map(|schema| vec![schema.name.clone()])
+                                .unwrap_or_default();
+                            entry.catalog = Some(catalog);
+                        }
+                        this.workspace.activate(id);
+                        this.status = Status::info(format!("Connected — {version}"));
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        if let Some(entry) = this.workspace.get_mut(id) {
+                            entry.status = ConnectionStatus::Failed(message.clone());
+                        }
+                        this.status = Status::error(message);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn disconnect(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        let Some(entry) = self.workspace.get_mut(id) else {
+            return;
+        };
+        if let Some(driver) = entry.status.driver().cloned() {
+            commands::disconnect(&self.runtime, driver);
+        }
+        entry.disconnect();
+
+        if self.workspace.active_id() == Some(id) {
+            self.tabs = Tabs::default();
+            self.workspace.open_table = None;
+            self.selected_cell = None;
+        }
+        self.status = Status::info("Disconnected");
+        cx.notify();
+    }
+
+    pub(crate) fn select_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        let was_active = self.workspace.active_id() == Some(id);
+        self.workspace.activate(id);
+        if !was_active {
+            self.tabs = Tabs::default();
+            self.selected_cell = None;
+            self.detail_input = None;
+            self.filter_focus = None;
+            self.workspace.open_table = None;
+            self.sidebar_cursor = None;
+        }
+        self.focus = Focus::Sidebar;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_schema(&mut self, id: ConnectionId, schema: &str, cx: &mut Context<Self>) {
+        if let Some(entry) = self.workspace.get_mut(id) {
+            entry.toggle_schema(schema);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some(driver) = self.workspace.active_driver() else {
+            return;
+        };
+        let Some(id) = self.workspace.active_id() else {
+            return;
+        };
+
+        self.status = Status::busy("Refreshing…");
+        let task = commands::refresh_catalog(&self.runtime, driver);
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                match landed {
+                    Some(Ok(catalog)) => {
+                        if let Some(entry) = this.workspace.get_mut(id) {
+                            entry.catalog = Some(catalog);
+                        }
+                        this.status = Status::info("Catalog refreshed");
+                    }
+                    Some(Err(error)) => this.status = Status::error(error.to_string()),
+                    None => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // -- tables and queries -----------------------------------------------
+
+    pub(crate) fn open_table_tab(&mut self, table: TableRef, cx: &mut Context<Self>) {
+        self.tabs.open_table(table.clone());
+        self.workspace.open_table = Some(table);
+        self.selected_cell = None;
+        self.load_active_table(cx);
+    }
+
+    fn load_active_table(&mut self, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.tabs.active_id() else {
+            return;
+        };
+        self.load_table(tab_id, cx);
+    }
+
+    fn load_table(&mut self, tab_id: crate::tabs::TabId, cx: &mut Context<Self>) {
+        let Some(driver) = self.workspace.active_driver() else {
+            self.status = Status::error("Not connected");
+            cx.notify();
+            return;
+        };
+
+        let (table, page, where_clause) = match self.tabs.get_mut(tab_id) {
+            Some(WorkspaceTab::Table {
+                table,
+                page,
+                where_clause,
+                ..
+            }) => (table.clone(), *page, where_clause.clone()),
+            _ => return,
+        };
+
+        let load_seq = match self.tabs.get_mut(tab_id) {
+            Some(tab) => tab.bump_load_seq(),
+            None => return,
+        };
+
+        self.loads_in_flight = self.loads_in_flight.saturating_add(1);
+        if self.tabs.active_id() == Some(tab_id) {
+            self.status = Status::busy(format!("Loading {}…", table.qualified()));
+        }
+
+        let task =
+            commands::open_table(&self.runtime, driver, table.clone(), page, where_clause.clone());
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                this.finish_tab_load(tab_id, load_seq, |this, is_current, is_active| {
+                    match landed {
+                        Some(Ok(contents)) if is_current => {
+                            let summary = table_summary(&contents);
+                            if let Some(WorkspaceTab::Table {
+                                result,
+                                page,
+                                page_size_draft,
+                                where_clause,
+                                selected_row,
+                                draft,
+                                ..
+                            }) = this.tabs.get_mut(tab_id)
+                            {
+                                *page = contents.page;
+                                *page_size_draft = crate::text_input::TextInput::with_text(
+                                    contents.page.limit.to_string(),
+                                    false,
+                                );
+                                *where_clause = contents.where_clause.clone();
+                                *selected_row = None;
+                                *draft = None;
+                                *result = Some(ResultView::new(
+                                    contents.rows,
+                                    ResultSource::Table {
+                                        table: contents.table,
+                                        page: contents.page,
+                                        total_rows: contents.total_rows,
+                                        where_clause: contents.where_clause,
+                                    },
+                                    summary,
+                                    contents.columns,
+                                ));
+                            }
+                            if is_active {
+                                this.status = Status::Idle;
+                                this.focus = Focus::Grid;
+                            }
+                        }
+                        Some(Err(error)) if is_current && is_active => {
+                            this.status = Status::error(error.to_string());
+                        }
+                        _ => {}
+                    }
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Book-keep an async tab load: drop the in-flight count and clear a stale
+    /// busy status when nothing else is loading.
+    fn finish_tab_load(
+        &mut self,
+        tab_id: crate::tabs::TabId,
+        load_seq: u64,
+        apply: impl FnOnce(&mut Self, bool, bool),
+    ) {
+        let is_current = self.tabs.load_is_current(tab_id, load_seq);
+        let is_active = self.tabs.active_id() == Some(tab_id);
+        apply(self, is_current, is_active);
+        self.loads_in_flight = self.loads_in_flight.saturating_sub(1);
+        if self.loads_in_flight == 0 && matches!(self.status, Status::Busy(_)) {
+            self.status = Status::Idle;
+        }
+    }
+
+    /// Move the active table tab's window by a page.
+    pub(crate) fn page(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let next = match self.tabs.active() {
+            Some(WorkspaceTab::Table { result, page, .. }) => {
+                let current = result
+                    .as_ref()
+                    .and_then(|view| match &view.source {
+                        ResultSource::Table { page, .. } => Some(*page),
+                        _ => None,
+                    })
+                    .unwrap_or(*page);
+                if forward {
+                    current.next()
+                } else {
+                    current.previous()
+                }
+            }
+            _ => return,
+        };
+
+        let Some(WorkspaceTab::Table { page, result, .. }) = self.tabs.active_mut() else {
+            return;
+        };
+        let current = result
+            .as_ref()
+            .and_then(|view| match &view.source {
+                ResultSource::Table { page, .. } => Some(*page),
+                _ => None,
+            })
+            .unwrap_or(*page);
+        if next == current {
+            return;
+        }
+        *page = next;
+        self.load_active_table(cx);
+    }
+
+    pub(crate) fn run_query(&mut self, cx: &mut Context<Self>) {
+        let sql = match self.tabs.active() {
+            Some(WorkspaceTab::Sql { editor, .. }) => editor.text().trim().to_string(),
+            _ => return,
+        };
+        if sql.is_empty() {
+            return;
+        }
+
+        let Some(driver) = self.workspace.active_driver() else {
+            self.status = Status::error("Not connected");
+            cx.notify();
+            return;
+        };
+
+        let Some((tab_id, load_seq)) = self.tabs.begin_active_load() else {
+            return;
+        };
+
+        self.workspace.open_table = None;
+        self.selected_cell = None;
+        self.loads_in_flight = self.loads_in_flight.saturating_add(1);
+        self.status = Status::busy("Running…");
+
+        let task = commands::run_query(&self.runtime, driver, sql.clone());
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                this.finish_tab_load(tab_id, load_seq, |this, is_current, is_active| {
+                    match landed {
+                        Some(Ok(result)) if is_current => {
+                            this.absorb_query_result(tab_id, result, sql, is_active);
+                        }
+                        Some(Err(error)) if is_current && is_active => {
+                            this.status = Status::error(error.to_string());
+                        }
+                        _ => {}
+                    }
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn absorb_query_result(
+        &mut self,
+        tab_id: crate::tabs::TabId,
+        result: QueryResult,
+        sql: String,
+        is_active: bool,
+    ) {
+        let summary = result.summary();
+        match result.outcome {
+            QueryOutcome::Rows(set) => {
+                if let Some(WorkspaceTab::Sql {
+                    result: tab_result,
+                    selected_row,
+                    draft,
+                    ..
+                }) = self.tabs.get_mut(tab_id)
+                {
+                    *selected_row = None;
+                    *draft = None;
+                    *tab_result = Some(ResultView::new(
+                        set,
+                        ResultSource::Query { sql },
+                        summary.clone(),
+                        Vec::new(),
+                    ));
+                }
+                if is_active {
+                    self.focus = Focus::Grid;
+                    self.status = Status::Idle;
+                }
+            }
+            QueryOutcome::Affected(_) => {
+                if is_active {
+                    self.status = Status::info(summary);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn refresh_result(&mut self, cx: &mut Context<Self>) {
+        match self.tabs.active() {
+            Some(WorkspaceTab::Table { .. }) => self.load_active_table(cx),
+            Some(WorkspaceTab::Sql { .. }) => self.run_query(cx),
+            None => self.refresh_catalog(cx),
+        }
+    }
+
+    pub(crate) fn set_table_pane(
+        &mut self,
+        pane: crate::tabs::TablePane,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(WorkspaceTab::Table { pane: tab_pane, .. }) = self.tabs.active_mut() {
+            *tab_pane = pane;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_filters_open(&mut self, cx: &mut Context<Self>) {
+        if let Some(WorkspaceTab::Table {
+            filters_open,
+            where_draft,
+            where_clause,
+            ..
+        }) = self.tabs.active_mut()
+        {
+            *filters_open = !*filters_open;
+            if *filters_open && where_draft.text().is_empty() && !where_clause.is_empty() {
+                *where_draft = crate::text_input::TextInput::with_text(where_clause.clone(), false);
+            }
+            if *filters_open {
+                self.filter_focus = Some(FilterFocus::Where);
+                self.focus = Focus::Filter;
+            } else {
+                self.filter_focus = None;
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_columns_open(&mut self, cx: &mut Context<Self>) {
+        if let Some(WorkspaceTab::Table { columns_open, .. }) = self.tabs.active_mut() {
+            *columns_open = !*columns_open;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_column_hidden(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(WorkspaceTab::Table { hidden_columns, .. }) = self.tabs.active_mut() {
+            if hidden_columns.contains(name) {
+                hidden_columns.remove(name);
+            } else {
+                hidden_columns.insert(name.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn apply_filters(&mut self, cx: &mut Context<Self>) {
+        if let Some(WorkspaceTab::Table {
+            where_clause,
+            where_draft,
+            page,
+            ..
+        }) = self.tabs.active_mut()
+        {
+            *where_clause = where_draft.text().trim().to_string();
+            page.offset = 0;
+        }
+        self.filter_focus = None;
+        self.load_active_table(cx);
+    }
+
+    pub(crate) fn clear_filters(&mut self, cx: &mut Context<Self>) {
+        if let Some(WorkspaceTab::Table {
+            where_clause,
+            where_draft,
+            page,
+            ..
+        }) = self.tabs.active_mut()
+        {
+            where_clause.clear();
+            where_draft.clear();
+            *page = Page {
+                limit: page.limit,
+                offset: 0,
+            };
+        }
+        self.filter_focus = None;
+        self.load_active_table(cx);
+    }
+
+    pub(crate) fn apply_page_size(&mut self, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Table {
+            page,
+            page_size_draft,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+
+        let raw = page_size_draft.text().trim().to_string();
+        let Ok(parsed) = raw.parse::<u32>() else {
+            *page_size_draft = crate::text_input::TextInput::with_text(page.limit.to_string(), false);
+            self.status = Status::error("Page size must be a number");
+            self.page_size_focus = false;
+            cx.notify();
+            return;
+        };
+
+        let limit = parsed.clamp(1, 5_000);
+        if limit != parsed {
+            *page_size_draft = crate::text_input::TextInput::with_text(limit.to_string(), false);
+        }
+        page.limit = limit;
+        page.offset = 0;
+        self.page_size_focus = false;
+        self.focus = Focus::Grid;
+        self.load_active_table(cx);
+    }
+
+    pub(crate) fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        // Stash the current dirty draft into the batch before switching.
+        self.stash_current_draft(cx);
+
+        match self.tabs.active_mut() {
+            Some(WorkspaceTab::Table {
+                selected_row,
+                draft,
+                result,
+                pending_edits,
+                ..
+            }) => {
+                *selected_row = Some(row);
+                let mut next = result.as_ref().and_then(|view| {
+                    view.set.rows.get(row).map(|values| {
+                        RowDraft::from_row(
+                            row,
+                            &view.set.columns,
+                            &values.0,
+                            &view.structure,
+                        )
+                    })
+                });
+
+                let restore = next.as_ref().and_then(|next_draft| {
+                    let view = result.as_ref()?;
+                    let values = view.set.rows.get(row)?;
+                    let pk = next_draft.pk_values(&values.0).ok()?;
+                    pending_edits
+                        .iter()
+                        .find(|edit| edit.matches_pk(&pk))
+                        .cloned()
+                });
+                if let (Some(next_draft), Some(pending)) = (next.as_mut(), restore) {
+                    next_draft.apply_pending(&pending);
+                }
+
+                *draft = next;
+                self.detail_open = true;
+                self.detail_input = None;
+                self.focus = Focus::Detail;
+            }
+            Some(WorkspaceTab::Sql {
+                selected_row,
+                result,
+                draft,
+                ..
+            }) => {
+                *selected_row = Some(row);
+                *draft = result.as_ref().and_then(|view| {
+                    view.set
+                        .rows
+                        .get(row)
+                        .map(|values| RowDraft::from_sql_row(row, &view.set.columns, &values.0))
+                });
+                self.detail_open = true;
+                self.detail_input = None;
+                self.focus = Focus::Detail;
+            }
+            None => {}
+        }
+        self.selected_cell = None;
+        cx.notify();
+    }
+
+    /// Fold the open draft into `pending_edits` when it has unsaved field changes.
+    fn stash_current_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Table {
+            draft,
+            result,
+            pending_edits,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+        let Some(draft_ref) = draft.as_ref() else {
+            return;
+        };
+        let Some(view) = result.as_ref() else {
+            return;
+        };
+        let Some(values) = view.set.rows.get(draft_ref.row_index) else {
+            return;
+        };
+
+        match draft_ref.to_pending(&values.0) {
+            Ok(Some(edit)) => upsert_pending(pending_edits, edit),
+            Ok(None) => {}
+            Err(message) => {
+                if let Some(draft) = draft.as_mut() {
+                    draft.message = Some((false, message));
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn select_cell(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        self.select_row(row, cx);
+        self.selected_cell = Some((row, column));
+        self.focus = Focus::Grid;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_change_bubble(&mut self, cx: &mut Context<Self>) {
+        if let Some(WorkspaceTab::Table {
+            change_bubble_expanded,
+            ..
+        }) = self.tabs.active_mut()
+        {
+            *change_bubble_expanded = !*change_bubble_expanded;
+        }
+        cx.notify();
+    }
+
+    /// Effective batch: pending edits plus the current dirty draft (if any).
+    pub(crate) fn collect_batch_edits(&self) -> Vec<crate::tabs::PendingRowEdit> {
+        let Some(WorkspaceTab::Table {
+            draft,
+            result,
+            pending_edits,
+            ..
+        }) = self.tabs.active()
+        else {
+            return Vec::new();
+        };
+
+        let mut batch = pending_edits.clone();
+        if let (Some(draft), Some(view)) = (draft.as_ref(), result.as_ref()) {
+            if let Some(values) = view.set.rows.get(draft.row_index) {
+                if let Ok(Some(edit)) = draft.to_pending(&values.0) {
+                    upsert_pending(&mut batch, edit);
+                }
+            }
+        }
+        batch
+    }
+
+    pub(crate) fn discard_pending_edits(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.tabs.active(),
+            Some(WorkspaceTab::Table { saving: true, .. })
+        ) {
+            return;
+        }
+        if let Some(WorkspaceTab::Table {
+            draft,
+            result,
+            pending_edits,
+            change_bubble_expanded,
+            ..
+        }) = self.tabs.active_mut()
+        {
+            pending_edits.clear();
+            *change_bubble_expanded = false;
+            if let (Some(draft), Some(view)) = (draft.as_mut(), result.as_ref()) {
+                if let Some(values) = view.set.rows.get(draft.row_index) {
+                    draft.reset_to(&values.0);
+                }
+            }
+        }
+        self.status = Status::info("Changes discarded");
+        cx.notify();
+    }
+
+    pub(crate) fn save_pending_edits(&mut self, cx: &mut Context<Self>) {
+        let Some(driver) = self.workspace.active_driver() else {
+            self.status = Status::error("Not connected");
+            cx.notify();
+            return;
+        };
+
+        if matches!(
+            self.tabs.active(),
+            Some(WorkspaceTab::Table { saving: true, .. })
+        ) {
+            return;
+        }
+
+        // Fold the open draft in first so Save catches in-progress edits.
+        self.stash_current_draft(cx);
+
+        let (table, batch, tab_id) = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                id,
+                table,
+                pending_edits,
+                ..
+            }) => (table.clone(), pending_edits.clone(), *id),
+            _ => return,
+        };
+
+        if batch.is_empty() {
+            return;
+        }
+
+        if let Some(WorkspaceTab::Table { saving, .. }) = self.tabs.get_mut(tab_id) {
+            *saving = true;
+        }
+        self.status = Status::busy(format!("Saving {} change(s)…", batch.len()));
+        cx.notify();
+
+        let runtime = self.runtime.clone();
+        let rows: Vec<RowUpdate> = batch
+            .iter()
+            .map(|edit| RowUpdate {
+                pk: edit.pk.clone(),
+                changes: edit
+                    .changes
+                    .iter()
+                    .map(|c| (c.column.clone(), c.new_value.clone()))
+                    .collect(),
+            })
+            .collect();
+
+        cx.spawn(async move |this, cx| {
+            let landed = commands::update_rows(&runtime, driver, table, rows).await;
+
+            this.update(cx, |this, cx| {
+                if let Some(WorkspaceTab::Table { saving, .. }) = this.tabs.get_mut(tab_id) {
+                    *saving = false;
+                }
+                let is_active = this.tabs.active_id() == Some(tab_id);
+                match landed {
+                    Some(Ok(saved)) => {
+                        if let Some(WorkspaceTab::Table {
+                            pending_edits,
+                            change_bubble_expanded,
+                            draft,
+                            ..
+                        }) = this.tabs.get_mut(tab_id)
+                        {
+                            pending_edits.clear();
+                            *change_bubble_expanded = false;
+                            if let Some(draft) = draft.as_mut() {
+                                draft.message = Some((true, "Saved".into()));
+                            }
+                        }
+                        if is_active {
+                            this.status = Status::info(format!("Saved {saved} change(s)"));
+                        }
+                        this.load_table(tab_id, cx);
+                    }
+                    Some(Err(error)) => {
+                        // Transaction rolled back — leave every pending edit in place.
+                        if is_active {
+                            this.status = Status::error(error.to_string());
+                        }
+                        cx.notify();
+                    }
+                    None => cx.notify(),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Move the selected result row by `delta` (−1 up, +1 down).
+    pub(crate) fn move_selected_row(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(view) = self.tabs.active().and_then(|tab| tab.result()) else {
+            return;
+        };
+        let row_count = view.set.rows.len();
+        if row_count == 0 {
+            return;
+        }
+
+        let current = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.selected_row())
+            .or_else(|| self.selected_cell.map(|(row, _)| row));
+
+        let next = match current {
+            None if delta > 0 => 0,
+            None => return,
+            Some(row) if delta < 0 => row.saturating_sub(delta.unsigned_abs()),
+            Some(row) => (row + delta as usize).min(row_count - 1),
+        };
+
+        if current == Some(next) {
+            return;
+        }
+
+        let stay_on_grid = self.focus == Focus::Grid;
+        let column = self.selected_cell.map(|(_, column)| column);
+
+        self.select_row(next, cx);
+        if stay_on_grid {
+            if let Some(column) = column {
+                self.selected_cell = Some((next, column));
+            }
+            self.focus = Focus::Grid;
+            cx.notify();
+        }
+    }
+
+    // -- the connection form ----------------------------------------------
+
+    pub(crate) fn open_new_connection(&mut self, cx: &mut Context<Self>) {
+        self.connection_picker_open = false;
+        self.modal = Some(ConnectionForm::new());
+        self.focus = Focus::Sidebar;
+        cx.notify();
+    }
+
+    pub(crate) fn edit_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        self.connection_picker_open = false;
+        if let Some(entry) = self.workspace.get(id) {
+            self.modal = Some(ConnectionForm::editing(entry.config.clone()));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_connection_picker(&mut self, cx: &mut Context<Self>) {
+        self.connection_picker_open = !self.connection_picker_open;
+        cx.notify();
+    }
+
+    pub(crate) fn close_connection_picker(&mut self, cx: &mut Context<Self>) {
+        if self.connection_picker_open {
+            self.connection_picker_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn pick_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        self.connection_picker_open = false;
+        self.select_connection(id, cx);
+        if !self
+            .workspace
+            .get(id)
+            .map(|entry| entry.status.is_connected())
+            .unwrap_or(false)
+        {
+            self.connect(id, cx);
+        }
+    }
+
+    pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
+        self.modal = None;
+        cx.notify();
+    }
+
+    pub(crate) fn save_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.modal.as_mut() else {
+            return;
+        };
+        let config = form.to_config();
+
+        let problems = config.validate();
+        if !problems.is_empty() {
+            form.set_message(false, problems.join(", "));
+            cx.notify();
+            return;
+        }
+
+        let id = config.id;
+        let existing = self.workspace.get(id).is_some();
+        if existing {
+            if let Some(entry) = self.workspace.get_mut(id) {
+                entry.config = config;
+                if entry.status.is_connected() {
+                    entry.disconnect();
+                }
+            }
+        } else {
+            self.workspace.add(config);
+        }
+
+        self.modal = None;
+        self.persist_connections();
+        self.connect(id, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn test_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.modal.as_mut() else {
+            return;
+        };
+        let config = form.to_config();
+
+        let problems = config.validate();
+        if !problems.is_empty() {
+            form.set_message(false, problems.join(", "));
+            cx.notify();
+            return;
+        }
+
+        form.testing = true;
+        form.set_message(true, "Testing…");
+
+        let task = commands::test_connection(&self.runtime, config);
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(form) = this.modal.as_mut() {
+                    form.testing = false;
+                    match landed {
+                        Some(Ok(version)) => {
+                            form.set_message(true, format!("Connected — {version}"))
+                        }
+                        Some(Err(error)) => form.set_message(false, error.to_string()),
+                        None => form.set_message(false, "Test cancelled"),
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn remove_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if let Some(entry) = self.workspace.get(id) {
+            if let Some(driver) = entry.status.driver().cloned() {
+                commands::disconnect(&self.runtime, driver);
+            }
+        }
+        self.workspace.remove(id);
+        store::delete_password(id);
+        self.tabs = Tabs::default();
+        self.persist_connections();
+        cx.notify();
+    }
+
+    fn persist_connections(&mut self) {
+        let configs = self.workspace.configs();
+        let result = store::connections_path().and_then(|path| store::save(&path, &configs));
+        if let Err(error) = result {
+            self.status = Status::error(format!("Could not save connections: {error}"));
+        }
+    }
+
+    // -- keyboard ----------------------------------------------------------
+
+    pub(crate) fn on_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let key = keystroke.key.as_str();
+        let command = keystroke.modifiers.platform;
+        let shift = keystroke.modifiers.shift;
+
+        if self.palette.is_some() {
+            self.handle_palette_key(keystroke, cx);
+            return;
+        }
+
+        if self.modal.is_some() {
+            match key {
+                "escape" => self.close_modal(cx),
+                "enter" if !command => {
+                    let action = self
+                        .modal
+                        .as_ref()
+                        .map(|form| form.focused_action())
+                        .unwrap_or(FormAction::Save);
+                    match action {
+                        FormAction::Cancel => self.close_modal(cx),
+                        FormAction::Test => self.test_connection(cx),
+                        FormAction::Field | FormAction::Save => self.save_connection(cx),
+                    }
+                }
+                _ => {
+                    if let Some(form) = self.modal.as_mut() {
+                        form.handle_key(keystroke, cx);
+                    }
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
+        if self.connection_picker_open {
+            if key == "escape" {
+                self.close_connection_picker(cx);
+            }
+            return;
+        }
+
+        // ⌃⇥ / ⌃⇧⇥ — claim before any surface that might treat Tab as indent.
+        if key == "tab" && keystroke.modifiers.control {
+            if shift {
+                self.prev_tab(cx);
+            } else {
+                self.next_tab(cx);
+            }
+            return;
+        }
+
+        // Global ⌘ shortcuts (also registered as GPUI actions for menus).
+        if command {
+            match key {
+                "p" if shift => {
+                    self.open_palette(PaletteKind::Actions, cx);
+                    return;
+                }
+                "t" if shift => {
+                    self.open_palette(PaletteKind::Themes, cx);
+                    return;
+                }
+                "p" => {
+                    self.open_palette(PaletteKind::GoToTable, cx);
+                    return;
+                }
+                "f" => {
+                    self.cmd_find(cx);
+                    return;
+                }
+                "enter" => {
+                    self.run_query(cx);
+                    return;
+                }
+                "n" => {
+                    self.open_new_connection(cx);
+                    return;
+                }
+                "r" => {
+                    self.refresh_result(cx);
+                    return;
+                }
+                "e" => {
+                    self.open_sql_tab(cx);
+                    return;
+                }
+                "w" => {
+                    self.close_active_tab(cx);
+                    return;
+                }
+                "k" => {
+                    if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
+                        editor.clear();
+                    }
+                    cx.notify();
+                    return;
+                }
+                "[" => {
+                    self.page(false, cx);
+                    return;
+                }
+                "]" => {
+                    self.page(true, cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.focus == Focus::Detail {
+            if key == "tab" && !command {
+                self.cycle_detail_focus(shift, cx);
+                return;
+            }
+            // Row chrome (no field focused): ↑/↓ walk the grid selection.
+            if !command && self.detail_input.is_none() {
+                match key {
+                    "up" => {
+                        self.move_selected_row(-1, cx);
+                        return;
+                    }
+                    "down" => {
+                        self.move_selected_row(1, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            let handled = match self.tabs.active_mut() {
+                Some(WorkspaceTab::Table {
+                    draft: Some(draft), ..
+                })
+                | Some(WorkspaceTab::Sql {
+                    draft: Some(draft), ..
+                }) => match self.detail_input {
+                    Some(DetailInput::Search) => draft.field_search.handle_key(keystroke, cx),
+                    Some(DetailInput::Field(index)) => draft
+                        .fields
+                        .get_mut(index)
+                        .map(|(_, input, _)| input.handle_key(keystroke, cx))
+                        .unwrap_or(false),
+                    None => false,
+                },
+                _ => false,
+            };
+            if handled {
+                cx.notify();
+                return;
+            }
+        }
+
+        if self.focus == Focus::Filter {
+            if key == "tab" && !command {
+                let current = self.filter_focus.unwrap_or(FilterFocus::Where);
+                self.filter_focus = Some(current.cycle(shift));
+                cx.notify();
+                return;
+            }
+            match self.filter_focus {
+                Some(FilterFocus::Apply) => {
+                    if key == "enter" && !command {
+                        self.apply_filters(cx);
+                    }
+                    return;
+                }
+                Some(FilterFocus::Clear) => {
+                    if key == "enter" && !command {
+                        self.clear_filters(cx);
+                    }
+                    return;
+                }
+                Some(FilterFocus::Where) | None => {
+                    if key == "enter" && !command {
+                        self.apply_filters(cx);
+                        return;
+                    }
+                    if let Some(WorkspaceTab::Table { where_draft, .. }) = self.tabs.active_mut() {
+                        if where_draft.handle_key(keystroke, cx) {
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.focus == Focus::PageSize && self.page_size_focus {
+            if key == "enter" && !command {
+                self.apply_page_size(cx);
+                return;
+            }
+            if let Some(WorkspaceTab::Table { page_size_draft, .. }) = self.tabs.active_mut() {
+                if page_size_draft.handle_key(keystroke, cx) {
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        if self.focus == Focus::Editor {
+            if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
+                if editor.handle_key(keystroke, cx) {
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        if self.focus == Focus::Sidebar && !command {
+            match key {
+                "up" => {
+                    self.sidebar_move(-1, cx);
+                    return;
+                }
+                "down" => {
+                    self.sidebar_move(1, cx);
+                    return;
+                }
+                "left" => {
+                    self.sidebar_expand(false, cx);
+                    return;
+                }
+                "right" => {
+                    self.sidebar_expand(true, cx);
+                    return;
+                }
+                "enter" => {
+                    self.sidebar_activate(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.focus == Focus::Grid && !command {
+            match key {
+                "up" => {
+                    self.move_selected_row(-1, cx);
+                    return;
+                }
+                "down" => {
+                    self.move_selected_row(1, cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if key == "escape" {
+            self.focus = Focus::Sidebar;
+            self.detail_input = None;
+            self.filter_focus = None;
+            self.page_size_focus = false;
+            cx.notify();
+        }
+    }
+}
+
+fn table_summary(contents: &dbui_app::TableContents) -> String {
+    let shown = contents.rows.rows.len();
+    let base = match contents.total_rows {
+        Some(total) => format!(
+            "Rows {}–{} of {}",
+            contents.page.offset + 1,
+            contents.page.offset + shown as u64,
+            total
+        ),
+        None => format!("{shown} rows"),
+    };
+    if contents.where_clause.trim().is_empty() {
+        base
+    } else {
+        format!("{base} · filtered")
+    }
+}
+
+impl Render for DbUi {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle);
+        }
+        window.set_rem_size(metrics::rem_size());
+
+        let modal = self.modal.is_some().then(|| self.render_modal(cx));
+        let palette = self.render_palette(cx);
+        let change_bubble = self.render_change_bubble(cx);
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(self.theme.background)
+            .text_color(self.theme.text)
+            .font_family(metrics::UI_FONT)
+            .text_size(metrics::text_size())
+            .key_context("DbUi")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key))
+            .on_action(cx.listener(|this, _: &crate::NewConnection, _window, cx| {
+                this.open_new_connection(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::GoToTable, _window, cx| {
+                this.open_palette(PaletteKind::GoToTable, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::CommandPalette, _window, cx| {
+                this.open_palette(PaletteKind::Actions, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::ChooseTheme, _window, cx| {
+                this.open_palette(PaletteKind::Themes, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::Find, _window, cx| {
+                this.cmd_find(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| {
+                this.open_sql_tab(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| {
+                this.refresh_result(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::RunQuery, _window, cx| {
+                this.run_query(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::CloseTab, _window, cx| {
+                this.close_active_tab(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::NextTab, _window, cx| {
+                this.next_tab(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::PrevTab, _window, cx| {
+                this.prev_tab(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab1, _window, cx| {
+                this.select_tab_number(1, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab2, _window, cx| {
+                this.select_tab_number(2, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab3, _window, cx| {
+                this.select_tab_number(3, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab4, _window, cx| {
+                this.select_tab_number(4, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab5, _window, cx| {
+                this.select_tab_number(5, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab6, _window, cx| {
+                this.select_tab_number(6, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab7, _window, cx| {
+                this.select_tab_number(7, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab8, _window, cx| {
+                this.select_tab_number(8, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectTab9, _window, cx| {
+                this.select_tab_number(9, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::ZoomIn, _window, cx| {
+                this.zoom_delta(1, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::ZoomOut, _window, cx| {
+                this.zoom_delta(-1, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::ZoomReset, _window, cx| {
+                this.zoom_delta(0, cx)
+            }))
+            .child(self.render_titlebar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(self.render_sidebar(window, cx))
+                    .child(self.render_main(window, cx))
+                    .child(self.render_detail_sidebar(cx)),
+            )
+            .children(change_bubble)
+            .child(self.render_status_bar(cx))
+            .children(modal)
+            .children(palette)
+    }
+}

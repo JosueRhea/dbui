@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dbui",
+    "crates/dbui-domain",
+    "crates/dbui-driver",
+    "crates/dbui-app",
+    "crates/dbui-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+# The dependency graph is a straight line inward: ui -> app -> driver -> domain.
+# Nothing lists a crate to its left, and `cargo build` is what enforces it --
+# see ARCHITECTURE.md for what each layer is allowed to know.
+[workspace.dependencies]
+dbui-domain = { path = "crates/dbui-domain" }
+dbui-driver = { path = "crates/dbui-driver" }
+dbui-app = { path = "crates/dbui-app" }
+dbui-ui = { path = "crates/dbui-ui" }
+
+gpui = "0.2"
+
+# `tls-rustls-ring` keeps the TLS stack in Rust; a native-tls build would drag
+# in OpenSSL and make the release build depend on the host's copy of it.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "mysql",
+    # MySQL 8 defaults to `caching_sha2_password`, which needs either TLS or an
+    # RSA public-key exchange to send the password. Without this feature every
+    # connection to a stock MySQL 8 with TLS disabled fails outright -- which is
+    # exactly what a local development server looks like.
+    "mysql-rsa",
+    "chrono",
+    "uuid",
+    "json",
+    "bigdecimal",
+    "rust_decimal",
+    "ipnetwork",
+    "mac_address",
+    "bit-vec",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+async-trait = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# gpui is large and its debug build is slow enough to feel it at runtime, so it
+# is optimized even in dev builds. Our own crates stay unoptimized so that
+# incremental rebuilds remain fast.
+[profile.dev.package.gpui]
+opt-level = 2
+[profile.dev.package."*"]
+opt-level = 2

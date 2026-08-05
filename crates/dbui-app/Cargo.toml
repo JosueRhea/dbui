@@ -1,0 +1,24 @@
+[package]
+name = "dbui-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Application layer: workspace state, use cases, and the tokio bridge."
+
+# No gpui here. This crate must stay runnable from a test or a CLI, which is
+# what keeps the use cases free of rendering concerns.
+[dependencies]
+dbui-domain = { workspace = true }
+dbui-driver = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+keyring = { version = "3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }

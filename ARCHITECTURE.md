@@ -1,0 +1,195 @@
+# Architecture
+
+The workspace is four crates in a line. Dependencies point one way only:
+
+```
+dbui  ──▶  dbui-ui  ──▶  dbui-app  ──▶  dbui-driver  ──▶  dbui-domain
+(bin)      (gpui)        (use cases)    (sqlx)            (no deps)
+```
+
+`cargo build` is what enforces it. A crate cannot reach past its neighbour
+because the manifest does not list it, so the boundaries are not a convention
+anyone has to remember.
+
+## The layers
+
+### `dbui-domain` — the model
+
+Connections, catalog, values, result sets. No I/O, no async, no database
+client, no UI. Its only dependency is `serde`, and that is only so the same
+structs can be persisted verbatim.
+
+This is where both adapters and the UI agree on what a column, a cell and a
+table *are*. `Value` is the important one: every engine-native type is widened
+into it, so a `BIGINT` from MySQL and an `int8` from Postgres reach the grid as
+the same thing.
+
+**Test rule:** everything here is a pure function, so everything here is unit
+tested.
+
+### `dbui-driver` — the port and its adapters
+
+One trait, `DatabaseDriver`, and two implementations of it. Everything
+engine-specific lives here and nowhere else:
+
+- connection options and TLS modes
+- introspection SQL (`pg_catalog` vs `information_schema`)
+- decoding wire values into `Value`
+- turning a `sqlx::Error` into a sentence worth showing someone
+
+`dbui_driver::connect` is the only function in the codebase that names a
+concrete adapter. Everyone else holds an `Arc<dyn DatabaseDriver>`.
+
+**Adding SQLite** means: a `Driver` variant, an adapter module, one arm in
+`connect`. The UI does not change.
+
+### `dbui-app` — use cases and state
+
+The whole application minus its pixels. It owns:
+
+- `DbRuntime` — the tokio runtime, and the only way to reach the database
+- `commands` — one function per use case, each returning a `Task` to await
+- `Workspace` — what connections exist and what is known about each
+- `store` — saved connections on disk
+
+No `gpui`. That is the constraint that keeps the use cases free of rendering
+concerns, and it means all of this is reachable from a plain `#[test]`.
+
+### `dbui-ui` — the front-end
+
+Opens a window, draws the state `dbui-app` holds, turns clicks and keys back
+into use cases. All mutable window state lives in `root.rs` on `DbUi`; the
+modules under `components/` are `impl DbUi` blocks that only render.
+
+That split is deliberate. Widgets that own state are how a UI ends up with two
+answers to the same question.
+
+## Threading
+
+GPUI renders on the main thread and its executor is not `Send`. sqlx needs a
+tokio reactor. Rather than make one drive the other:
+
+```
+main thread                       tokio worker threads
+───────────                       ────────────────────
+cx.spawn(async { ... })
+  task.await  ◀── oneshot ──────  driver.execute(sql).await
+  this.update(cx, ...)
+```
+
+`DbRuntime::spawn` puts the work on tokio and hands back a `Task<T>` — a future
+over a oneshot channel — which the UI awaits inside `cx.spawn`. A query in
+flight never blocks a frame, and a task that is dropped (window closed) simply
+resolves to `None`.
+
+Every database call goes through `DbRuntime::spawn`. Nothing else may block the
+main thread on I/O.
+
+## Decisions worth knowing
+
+**Values are widened, not passed through.** The grid never sees a driver-native
+type. A type this build has no decoder for becomes `Value::Unsupported` carrying
+its type name — a result set with one odd column still shows the other forty.
+
+**Exact numerics stay strings.** `NUMERIC` and `DECIMAL` become
+`Value::Decimal(String)`, never `f64`. Those columns are usually money, and
+rounding them on the way to a screen is a display bug that looks like a data
+bug.
+
+**Identifiers are quoted, never bound.** SQL parameters cannot be identifiers,
+so generated statements have to paste table names in. Every one goes through
+`TableRef::quoted`, which escapes by doubling the quote character. There is a
+test that a hostile table name cannot break out.
+
+**Paging probes with `limit + 1`.** Fetching one row more than asked for and
+discarding it answers "is there more?" without a second `COUNT(*)` round trip.
+
+**Passwords are not written to disk.** `ConnectionConfig::password` is
+`skip_serializing`. Wiring in the OS keychain later means changing `store.rs`
+and nothing else.
+
+## Testing
+
+Three layers of test, matching the three kinds of thing that can be wrong.
+
+**Unit tests** live beside the code they cover, in the crate they belong to.
+Everything in `dbui-domain` is a pure function, so everything in it is tested:
+identifier quoting, statement classification, paging arithmetic, value
+rendering. Same for `Workspace` and `store`.
+
+**End-to-end UI tests** (`crates/dbui-ui/src/e2e.rs`) open a real GPUI window
+through `TestAppContext` and dispatch real keystrokes. They are in-crate rather
+than in `tests/` so they can read `pub(crate)` state without widening the public
+API for the benefit of tests.
+
+They exist because of a bug no unit test could have caught: focus set at
+construction is lost if the window is not key yet, `on_key_down` then never
+fires, and the app draws perfectly with every shortcut dead.
+`shortcuts_survive_the_window_losing_focus` blurs the window and types, which
+fails without the re-focus in `Render::render` and passes with it. The rest of
+the suite passes either way — the test platform's window *is* key at
+construction — so that one test is the only thing standing between this and a
+silent regression.
+
+One wrinkle worth knowing: `Keystroke::parse("a")` sets `key` but leaves
+`key_char` empty, and typed text is read from `key_char` (the only field that is
+right for shifted keys and non-US layouts). Tests spell typing as `a->a`, which
+is the harness's way of saying the platform delivered that character. The
+`typing()` helper does it.
+
+**Live tests** (`crates/dbui-driver/tests/live.rs`) talk to real servers. They
+are the only tests that can prove the introspection SQL parses, the decoders
+match what the wire sends, and the generated statements are accepted — none of
+which can be faked convincingly, so nothing there is mocked.
+
+They are opt-in behind `DBUI_LIVE_TESTS=1` so a checkout with no servers stays
+green, but with the flag set an unreachable server *fails*: silently skipping
+when someone asked for them defeats the point. Each test builds fixtures in a
+schema named after itself, because cargo runs them in parallel and a shared
+fixture breaks twice over — two tests racing to create it, and one test's
+`DELETE` changing another's row count.
+
+### What the live tests caught
+
+Every one of these is invisible to a unit test, and two of them are the kind of
+bug a user meets in the first five minutes:
+
+- **MySQL 8 could not connect at all.** It defaults to `caching_sha2_password`,
+  which needs TLS or an RSA key exchange to send the password. sqlx gates that
+  behind `mysql-rsa`; without it every TLS-disabled connection fails — which is
+  what every local development server looks like.
+- **`numeric(10,2)` rendered as `0.1000`.** Postgres stores numerics in
+  base-10000 groups and sqlx's `BigDecimal` conversion reports a scale rounded
+  up to a multiple of four digits. `rust_decimal` honours the wire's display
+  scale, so money columns now show the scale they were declared with;
+  `BigDecimal` stays as the fallback for numerics too large for it.
+- **`text[]` did not decode.** sqlx names array types by element with a `[]`
+  suffix (`TEXT[]`), not the `_text` spelling `pg_type` uses internally. The
+  decoder matched the wrong one and every array fell through to
+  `Value::Unsupported` — which is at least how the failure stayed legible.
+- **`TINYINT(1)` is reported as `BOOLEAN`.** sqlx tells us `BOOLEAN` for a
+  column MySQL stores as `TINYINT(1)`, and there is no way to distinguish "I
+  meant true/false" from "I meant a one-digit integer". It decodes as a number:
+  a `TINYINT(1)` can hold 7, and rendering that as `true` would be the editor
+  lying about what is stored.
+
+## Known limits
+
+These are deliberate omissions in a starter, not oversights:
+
+- **The text editor is minimal.** `text_input.rs` has no selection, undo, or
+  IME, and its vertical motion does not keep a goal column. The caret is drawn
+  by splitting the line rather than by measuring glyphs — correct in any font,
+  but the reason it cannot do selection.
+- **Grid text is `div`-per-cell.** Fine at viewport scale, wrong long-term: the
+  grid should be a custom `Element` painting shaped glyph runs.
+- **No editing of data.** The grid is read-only; there is no `UPDATE`
+  round-trip, which is what needs primary-key awareness (already introspected)
+  and a dirty-row model.
+- **One statement per run.** `execute` sends what is in the editor as a single
+  statement; there is no splitter for `a; b; c`.
+- **Column widths are estimated**, not measured, from a 200-row sample.
+- **The live tests cover the two engines' common ground**, not their corners:
+  no `INTERVAL`, ranges, enums, `BIT`, spatial types, or generated columns. The
+  decoders have arms for several of those; they are untested until a fixture
+  exercises them.

@@ -1,0 +1,25 @@
+[package]
+name = "dbui-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPUI front-end: window, layout, and input handling."
+
+# Note what is absent: no sqlx, no tokio, no dbui-driver. The UI reaches the
+# database only through dbui-app's use cases.
+[dependencies]
+dbui-app = { workspace = true }
+gpui = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+
+# `test-support` is what exposes `TestAppContext` and `#[gpui::test]`, which
+# `src/e2e.rs` drives a real window with. Its extra platform features are
+# target-gated to Linux/FreeBSD in gpui's own manifest, so this costs nothing
+# on macOS.
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

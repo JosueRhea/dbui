@@ -1,0 +1,13 @@
+[package]
+name = "dbui-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Database-agnostic domain model: connections, catalog, values, result sets."
+
+# The center of the graph. serde is here only so the same structs can be
+# persisted verbatim -- there is deliberately no database client, no async
+# runtime and no UI toolkit in this crate.
+[dependencies]
+serde = { workspace = true }
