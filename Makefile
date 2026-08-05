@@ -37,6 +37,10 @@ SLICES   := $(foreach t,$(TARGETS),target/$(t)/release/dbui)
 # downloaded.
 TEAM_ID        := D7HN42D467
 NOTARY_PROFILE ?= dbui-notary
+# Must match CFBundleIdentifier in packaging/Info.plist.in: signing debug builds
+# under the same identifier gives them the same code identity as the shipped
+# app, so both are the same "application" as far as the keychain is concerned.
+BUNDLE_ID      := com.gzenit.dbui
 CODESIGN_ID    ?= $(shell security find-identity -v -p codesigning 2>/dev/null \
                     | awk -F'"' '/Developer ID Application/{print $$2; exit}')
 
@@ -49,7 +53,7 @@ else
 NOTARY_AUTH := --keychain-profile "$(NOTARY_PROFILE)"
 endif
 
-.PHONY: all run test fmt clippy check-version icon universal bundle sign \
+.PHONY: all run sign-dev test fmt clippy check-version icon universal bundle sign \
         notarize dmg notarize-dmg zip-app checksums release-macos publish \
         verify clean
 
@@ -57,8 +61,28 @@ all: bundle
 
 # -- development ----------------------------------------------------------
 
-run:
-	@cargo run -p dbui
+run: sign-dev
+	@target/debug/dbui
+
+# Cargo leaves the debug binary ad-hoc (linker) signed, and an ad-hoc
+# signature's designated requirement is the binary's own hash -- which changes
+# on every rebuild. The keychain matches that requirement when deciding whether
+# an app may read a secret, so each rebuild looks like a different application
+# and re-prompts for every saved connection password. Re-signing with the
+# Developer ID identity under a fixed identifier makes the requirement
+# identity-based, and one "Always Allow" then holds across rebuilds.
+#
+# The first run after switching still prompts once per existing secret, because
+# those ACLs were granted to the old ad-hoc hashes.
+sign-dev:
+	@cargo build -p dbui
+	@if [ -n "$(CODESIGN_ID)" ]; then \
+	    echo "  SIGN  target/debug/dbui ($(BUNDLE_ID))"; \
+	    codesign --force --identifier $(BUNDLE_ID) \
+	        --sign "$(CODESIGN_ID)" target/debug/dbui; \
+	else \
+	    echo "  SIGN  skipped (no Developer ID cert -- expect keychain prompts every rebuild)"; \
+	fi
 
 test:
 	@cargo test --workspace
