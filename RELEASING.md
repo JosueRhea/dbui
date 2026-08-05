@@ -4,8 +4,10 @@ A release is one universal (Intel + Apple Silicon) `.app`, signed with a
 Developer ID certificate, notarized by Apple, and stapled — so a downloaded copy
 opens with no Gatekeeper warning, no right-click, no `xattr -d`.
 
-Two ways to cut one: from your Mac, or from a pushed tag. Both run the same
-`make` targets, so they produce the same artifacts.
+Releases are currently cut **from a Mac**, because notarization needs the
+Developer ID certificate and the repository has no signing secrets yet. The
+GitHub workflow runs the same `make` targets and is ready to take over — see
+[Releasing from a tag](#releasing-from-a-tag).
 
 ## What gets published
 
@@ -52,7 +54,9 @@ profile from another project, `make notarize NOTARY_PROFILE=<name>` reuses it.
 ## Releasing from your Mac
 
 ```sh
-make release-macos
+# 1. bump [workspace.package] version in Cargo.toml, commit, push
+make release-macos            # build, sign, notarize, staple, package
+make publish TAG=v0.1.0       # create the GitHub release from build/
 ```
 
 Builds both slices, `lipo`s them together, bundles, signs, notarizes the app,
@@ -70,13 +74,18 @@ archs: x86_64 arm64
 `source=Notarized Developer ID` is the line to look for. `Unnotarized Developer
 ID` means the signature is good but the notary step did not run.
 
-Then attach `build/dbui-*.dmg`, `build/dbui-*.zip` and a `SHA256SUMS` to a
-GitHub release.
+`make publish` then uploads the three artifacts and creates the release. It
+builds nothing — it only uploads what `release-macos` left behind, and it
+re-checks `spctl` first, so it cannot publish an unnotarized build by accident.
 
 ## Releasing from a tag
 
-Push a tag and the `release` workflow does all of the above on a macOS runner
-and creates the GitHub release itself.
+The `release` workflow does all of the above on a macOS runner and creates the
+release itself. It is **manual-only** right now: without the signing secrets a
+tag-triggered run can do nothing but fail, so the `push:` trigger is commented
+out in `.github/workflows/release.yml`.
+
+To switch over: add the four secrets below, uncomment that trigger, and then
 
 ```sh
 # 1. bump the version in Cargo.toml ([workspace.package] version)
@@ -86,7 +95,8 @@ git push origin v0.2.0
 ```
 
 The tag must match `Cargo.toml`. `make check-version` runs first and fails the
-build if it does not, before anything expensive happens.
+build if it does not, before anything expensive happens. Actions is free for
+this repository while it stays public, including the macOS runners.
 
 ### Repository secrets
 
