@@ -47,7 +47,24 @@ impl PendingRowEdit {
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
-    a.to_text() == b.to_text() && a.is_null() == b.is_null()
+    match (a, b) {
+        (Value::Default, Value::Default) => true,
+        (Value::Default, _) | (_, Value::Default) => false,
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => {
+            let left = a.to_text();
+            let right = b.to_text();
+            // Compact DB JSON and the pretty-printed editor form must not
+            // register as a change — that was why Discard looked broken.
+            left == right || json_format::texts_equivalent(&left, &right)
+        }
+    }
+}
+
+/// How a value appears in the change bubble / draft editors.
+fn display_change_text(value: &Value) -> String {
+    value_editor_text(value)
 }
 
 /// Editable draft of one selected row in the detail sidebar.
@@ -105,12 +122,16 @@ impl RowDraft {
             if *is_pk {
                 return false;
             }
-            let current = input.text();
-            let original = originals
-                .get(i)
-                .map(value_editor_text)
-                .unwrap_or_default();
-            !json_format::texts_equivalent(current, &original)
+            let Some(original) = originals.get(i) else {
+                return false;
+            };
+            match parse_draft_value(input.text(), original) {
+                Ok(parsed) => !values_equal(&parsed, original),
+                Err(_) => {
+                    let original_text = value_editor_text(original);
+                    !json_format::texts_equivalent(input.text(), &original_text)
+                }
+            }
         })
     }
 
@@ -133,18 +154,15 @@ impl RowDraft {
             };
             let parsed = parse_draft_value(input.text(), original)?;
             if *is_pk {
-                label_parts.push(format!("{name}={}", parsed.to_text()));
+                label_parts.push(format!("{name}={}", display_change_text(&parsed)));
                 pk.push((name.clone(), parsed));
-            } else {
-                let old_text = value_editor_text(original);
-                if !json_format::texts_equivalent(input.text(), &old_text) {
-                    changes.push(FieldChange {
-                        column: name.clone(),
-                        old_text,
-                        new_text: input.text().to_string(),
-                        new_value: parsed,
-                    });
-                }
+            } else if !values_equal(&parsed, original) {
+                changes.push(FieldChange {
+                    column: name.clone(),
+                    old_text: display_change_text(original),
+                    new_text: display_change_text(&parsed),
+                    new_value: parsed,
+                });
             }
         }
 
@@ -170,7 +188,7 @@ impl RowDraft {
                 .iter_mut()
                 .find(|(name, _, _)| name == &change.column)
             {
-                *input = TextInput::with_text(json_format::display_text(&change.new_text), true);
+                *input = TextInput::with_text(change.new_text.clone(), true);
             }
         }
     }
@@ -203,12 +221,61 @@ impl RowDraft {
 }
 
 /// Text shown / edited in a detail field (pretty JSON when applicable).
+///
+/// Special write tokens are visible as themselves: SQL `NULL`, empty string as
+/// `EMPTY`, and `DEFAULT`. A cell whose real content is one of those words is
+/// shown quoted so it round-trips instead of becoming the token.
 fn value_editor_text(value: &Value) -> String {
-    if value.is_null() {
-        "NULL".to_string()
-    } else {
-        json_format::display_text(&value.to_text())
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Default => "DEFAULT".to_string(),
+        Value::Text(s) if s.is_empty() => "EMPTY".to_string(),
+        Value::Text(s) if is_special_token(s) => quote_draft_literal(s),
+        other => {
+            let text = other.to_text();
+            if is_special_token(&text) {
+                quote_draft_literal(&text)
+            } else {
+                json_format::display_text(&text)
+            }
+        }
     }
+}
+
+fn is_special_token(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_uppercase().as_str(),
+        "NULL" | "EMPTY" | "DEFAULT"
+    )
+}
+
+fn quote_draft_literal(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Strip a single layer of `'…'` or `"…"` quotes, honouring backslash escapes.
+fn unquote_draft_literal(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = bytes[0];
+    if (quote != b'\'' && quote != b'"') || bytes[bytes.len() - 1] != quote {
+        return None;
+    }
+    let mut out = String::with_capacity(bytes.len() - 2);
+    let mut chars = text[1..text.len() - 1].chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(escaped) => out.push(escaped),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(out)
 }
 
 pub fn upsert_pending(pending: &mut Vec<PendingRowEdit>, edit: PendingRowEdit) {
@@ -437,14 +504,67 @@ impl Tabs {
 
 /// Parse a sidebar draft string back into a [`Value`], using the original
 /// cell as a type hint.
+///
+/// Non-normal values are typed as tokens (case-insensitive):
+/// - `NULL` → SQL NULL
+/// - `EMPTY` → empty string
+/// - `DEFAULT` → column default (`SET col = DEFAULT`)
+///
+/// A value that is literally one of those words is entered quoted
+/// (`"NULL"`, `'EMPTY'`).
 pub fn parse_draft_value(text: &str, original: &Value) -> Result<Value, String> {
     let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("NULL") || trimmed.is_empty() && original.is_null() {
-        return Ok(Value::Null);
+
+    if let Some(inner) = unquote_draft_literal(trimmed) {
+        return parse_typed_literal(&inner, original);
     }
+
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Ok(Value::Null);
     }
+    if trimmed.eq_ignore_ascii_case("DEFAULT") {
+        return Ok(Value::Default);
+    }
+    if trimmed.eq_ignore_ascii_case("EMPTY") {
+        return empty_for(original);
+    }
+    if trimmed.is_empty() {
+        // Cleared buffer: keep NULL as NULL, otherwise treat like EMPTY for
+        // text-shaped columns and ask for an explicit token elsewhere.
+        return match original {
+            Value::Null => Ok(Value::Null),
+            Value::Text(_)
+            | Value::Json(_)
+            | Value::Uuid(_)
+            | Value::Temporal(_)
+            | Value::Decimal(_) => empty_for(original),
+            _ => Err(
+                "use NULL, EMPTY, or DEFAULT — or type a value (quote specials like \"NULL\")"
+                    .into(),
+            ),
+        };
+    }
+
+    parse_typed_literal(trimmed, original)
+}
+
+fn empty_for(original: &Value) -> Result<Value, String> {
+    match original {
+        Value::Json(_) => Ok(Value::Json(String::new())),
+        Value::Uuid(_) => Ok(Value::Uuid(String::new())),
+        Value::Temporal(_) => Ok(Value::Temporal(String::new())),
+        Value::Decimal(_) => Ok(Value::Decimal(String::new())),
+        Value::Text(_) | Value::Null | Value::Default => Ok(Value::Text(String::new())),
+        Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Bytes(_)
+        | Value::Array(_)
+        | Value::Unsupported(_) => Err("EMPTY is only valid for text-like columns".into()),
+    }
+}
+
+fn parse_typed_literal(trimmed: &str, original: &Value) -> Result<Value, String> {
     match original {
         Value::Bool(_) => match trimmed.to_ascii_lowercase().as_str() {
             "true" | "t" | "1" => Ok(Value::Bool(true)),
@@ -460,8 +580,7 @@ pub fn parse_draft_value(text: &str, original: &Value) -> Result<Value, String> 
             .map(Value::Float)
             .map_err(|_| format!("expected a number, got {trimmed:?}")),
         Value::Decimal(_) => Ok(Value::Decimal(trimmed.to_string())),
-        Value::Null => {
-            // Untyped null: treat as text unless it looks numeric/bool.
+        Value::Null | Value::Default => {
             if let Ok(i) = trimmed.parse::<i64>() {
                 Ok(Value::Int(i))
             } else {
@@ -515,5 +634,90 @@ mod tests {
             tabs.get_mut(a),
             Some(WorkspaceTab::Table { .. })
         ));
+    }
+
+    #[test]
+    fn draft_tokens_cover_null_empty_and_default() {
+        assert_eq!(
+            parse_draft_value("NULL", &Value::Text("x".into())).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_draft_value("empty", &Value::Text("x".into())).unwrap(),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            parse_draft_value("DEFAULT", &Value::Int(1)).unwrap(),
+            Value::Default
+        );
+        assert_eq!(
+            parse_draft_value("\"NULL\"", &Value::Text("x".into())).unwrap(),
+            Value::Text("NULL".into())
+        );
+        assert!(parse_draft_value("EMPTY", &Value::Int(1)).is_err());
+    }
+
+    #[test]
+    fn editor_text_makes_specials_visible_and_round_trips() {
+        assert_eq!(value_editor_text(&Value::Null), "NULL");
+        assert_eq!(value_editor_text(&Value::Text(String::new())), "EMPTY");
+        assert_eq!(value_editor_text(&Value::Text("NULL".into())), "\"NULL\"");
+        assert_eq!(
+            parse_draft_value(
+                &value_editor_text(&Value::Text("EMPTY".into())),
+                &Value::Text("x".into())
+            )
+            .unwrap(),
+            Value::Text("EMPTY".into())
+        );
+    }
+
+    #[test]
+    fn empty_buffer_is_not_dirty_when_cell_was_already_empty() {
+        let draft = RowDraft {
+            row_index: 0,
+            fields: vec![(
+                "name".into(),
+                TextInput::with_text("", true),
+                false,
+            )],
+            message: None,
+            field_search: TextInput::new(false),
+        };
+        assert!(!draft.is_dirty(&[Value::Text(String::new())]));
+        assert!(!draft.is_dirty(&[Value::Null]));
+    }
+
+    #[test]
+    fn pretty_json_is_not_a_pending_change() {
+        let compact = Value::Json(r#"{"Hello":"World"}"#.into());
+        let pretty = value_editor_text(&compact);
+        assert!(pretty.contains('\n'), "editor should pretty-print JSON");
+        let draft = RowDraft {
+            row_index: 0,
+            fields: vec![("feature_flags".into(), TextInput::with_text(pretty, true), false)],
+            message: None,
+            field_search: TextInput::new(false),
+        };
+        assert!(!draft.is_dirty(&[compact.clone()]));
+        assert!(draft.to_pending(&[compact]).unwrap().is_none());
+    }
+
+    #[test]
+    fn discard_style_reset_leaves_json_clean() {
+        let compact = Value::Json(r#"{"Hello":"World"}"#.into());
+        let mut draft = RowDraft {
+            row_index: 0,
+            fields: vec![(
+                "feature_flags".into(),
+                TextInput::with_text(r#"{"Hello":"Changed"}"#, true),
+                false,
+            )],
+            message: None,
+            field_search: TextInput::new(false),
+        };
+        assert!(draft.is_dirty(&[compact.clone()]));
+        draft.reset_to(&[compact.clone()]);
+        assert!(!draft.is_dirty(&[compact]));
     }
 }

@@ -6,7 +6,10 @@ use crate::json_format::{self, JsonStyle};
 use crate::root::DbUi;
 use crate::tabs::WorkspaceTab;
 use crate::theme::{metrics, Theme};
-use gpui::{div, prelude::*, px, AnyElement, Context, SharedString};
+use dbui_app::domain::Value;
+use gpui::{
+    deferred, div, prelude::*, px, AnyElement, Context, SharedString,
+};
 
 const DETAIL_WIDTH_BASE: f32 = 280.;
 const STRIP_WIDTH_BASE: f32 = 24.;
@@ -40,19 +43,27 @@ impl DbUi {
                 );
         }
 
+        let open_menu = self.detail_value_menu;
         let body = match self.tabs.active() {
             Some(WorkspaceTab::Table {
                 draft,
                 selected_row,
+                result,
                 ..
             })
             | Some(WorkspaceTab::Sql {
                 draft,
                 selected_row,
+                result,
                 ..
             }) => {
                 if let Some(draft) = draft.as_ref() {
-                    render_table_draft(draft, self.detail_input, theme, cx)
+                    let originals = result
+                        .as_ref()
+                        .and_then(|view| view.set.rows.get(draft.row_index))
+                        .map(|row| row.0.as_slice())
+                        .unwrap_or(&[]);
+                    render_table_draft(draft, originals, open_menu, self.detail_input, theme, cx)
                 } else if selected_row.is_some() {
                     caption("Loading row…", theme).into_any_element()
                 } else {
@@ -131,6 +142,8 @@ fn empty_selection(theme: &Theme) -> AnyElement {
 
 fn render_table_draft(
     draft: &crate::tabs::RowDraft,
+    originals: &[Value],
+    open_menu: Option<usize>,
     detail_input: Option<DetailInput>,
     theme: &Theme,
     cx: &mut Context<DbUi>,
@@ -147,6 +160,8 @@ fn render_table_draft(
         })
         .map(|(index, (name, input, is_pk))| {
             let focused = detail_input == Some(DetailInput::Field(index));
+            let original = originals.get(index);
+            let allow_empty = original.map(allows_empty_token).unwrap_or(true);
             div()
                 .id(("detail-field", index))
                 .w_full()
@@ -154,16 +169,15 @@ fn render_table_draft(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(
-                    div()
-                        .text_color(if *is_pk {
-                            theme.warning
-                        } else {
-                            theme.text_muted
-                        })
-                        .text_size(metrics::text_size_small())
-                        .child(SharedString::from(name.clone())),
-                )
+                .child(field_header(
+                    index,
+                    name,
+                    *is_pk,
+                    open_menu == Some(index),
+                    allow_empty,
+                    theme,
+                    cx,
+                ))
                 .child(if *is_pk {
                     read_only_field(input.text(), true, theme).into_any_element()
                 } else {
@@ -208,6 +222,148 @@ fn render_table_draft(
         .into_any_element()
 }
 
+fn field_header(
+    index: usize,
+    name: &str,
+    is_pk: bool,
+    menu_open: bool,
+    allow_empty: bool,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
+    let label_color = if is_pk {
+        theme.warning
+    } else {
+        theme.text_muted
+    };
+
+    let mut header = div()
+        .relative()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .text_color(label_color)
+                .text_size(metrics::text_size_small())
+                .child(SharedString::from(name.to_string())),
+        );
+
+    if !is_pk {
+        header = header.child(
+            div()
+                .id(("detail-value-menu-btn", index))
+                .px_1()
+                .rounded_sm()
+                .text_size(metrics::text_size_small())
+                .text_color(if menu_open {
+                    theme.text
+                } else {
+                    theme.text_faint
+                })
+                .cursor_pointer()
+                .hover(|btn| btn.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_detail_value_menu(index, cx);
+                }))
+                .child("▾"),
+        );
+    }
+
+    if menu_open && !is_pk {
+        header = header.child(special_value_menu(index, allow_empty, theme, cx));
+    }
+
+    header.into_any_element()
+}
+
+fn special_value_menu(
+    index: usize,
+    allow_empty: bool,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
+    let mut rows: Vec<AnyElement> = Vec::new();
+    let items: &[(&'static str, &str, bool)] = &[
+        ("NULL", "SQL NULL", true),
+        ("EMPTY", "Empty string", allow_empty),
+        ("DEFAULT", "Column default", true),
+    ];
+    for (item_index, &(token, hint, enabled)) in items.iter().enumerate() {
+        if !enabled {
+            continue;
+        }
+        rows.push(
+            div()
+                .id(("detail-value-menu-item", index * 8 + item_index))
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .hover(|row| row.bg(theme.hover))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.set_detail_special_value(index, token, cx);
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .font_family(metrics::MONO_FONT)
+                                .text_color(theme.text)
+                                .child(token),
+                        )
+                        .child(
+                            div()
+                                .text_size(metrics::text_size_small())
+                                .text_color(theme.text_faint)
+                                .child(hint),
+                        ),
+                )
+                .into_any_element(),
+        );
+    }
+
+    deferred(
+        div()
+            .id(("detail-value-menu", index))
+            .absolute()
+            .top_full()
+            .right_0()
+            .mt_1()
+            .min_w(px(160.))
+            .flex()
+            .flex_col()
+            .py_1()
+            .rounded_md()
+            .bg(theme.elevated)
+            .border_1()
+            .border_color(theme.border)
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.close_detail_value_menu(cx);
+            }))
+            .children(rows),
+    )
+    .into_any_element()
+}
+
+fn allows_empty_token(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Text(_)
+            | Value::Json(_)
+            | Value::Uuid(_)
+            | Value::Temporal(_)
+            | Value::Decimal(_)
+            | Value::Null
+            | Value::Default
+    )
+}
+
 fn read_only_field(text: &str, muted: bool, theme: &Theme) -> AnyElement {
     let display = json_format::display_text(text);
     let color = if muted {
@@ -247,7 +403,8 @@ fn read_only_field(text: &str, muted: bool, theme: &Theme) -> AnyElement {
     let lines: Vec<&str> = display.split('\n').collect();
     let visible = lines.len().min(8).max(1);
     let line_h = px(18.);
-    let height = px(18. * visible as f32 + 8.);
+    // Lines + `py_1` + `border_1`; without the border the last line was clipped.
+    let height = px(18. * visible as f32 + 8. + 2.);
 
     let mut consumed = 0usize;
     let painted: Vec<AnyElement> = lines

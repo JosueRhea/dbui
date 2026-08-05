@@ -9,6 +9,21 @@ run a query, read the result. What it does not have yet is listed under
 [Known limits](ARCHITECTURE.md#known-limits), and the layering is set up so
 those are additions rather than rewrites.
 
+## Install
+
+Download the latest `.dmg` from
+[Releases](https://github.com/JosueRhea/dbui/releases) and drag dbui to
+Applications.
+
+One download covers both Intel and Apple Silicon — the binary is universal, so
+there is no wrong choice to make. Builds are signed and notarized by Apple, so
+it opens normally: no right-click-to-open, no `xattr` incantation.
+
+dbui updates itself. It checks for a newer release on launch and offers it in
+the status bar; nothing downloads or installs without a click. See
+[RELEASING.md](RELEASING.md#the-updater) for what it verifies before it will
+replace itself.
+
 ## Develop locally
 
 **Requirements**

@@ -203,7 +203,8 @@ fn single_line_text_field(
                         .child(render_single_line(input, focused, empty, placeholder, theme)),
                 ),
         )
-        .child(hit_canvas(hit_slot, px(8.), px(0.)))
+        // `px_2` scales with the rem, so the inset has to as well.
+        .child(hit_canvas(hit_slot, px(8. * metrics::zoom()), px(0.)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -340,7 +341,12 @@ fn multiline_text_field(
                 })
                 .child(render_multiline(input, focused, empty, placeholder, theme, char_w)),
         )
-        .child(hit_canvas(hit_slot, px(8.), px(4.)))
+        // Matches `px_2` / `py_1`, so the measured viewport is the scrollport.
+        .child(hit_canvas(
+            hit_slot,
+            px(8. * metrics::zoom()),
+            px(4. * metrics::zoom()),
+        ))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, _window, cx| {

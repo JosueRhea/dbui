@@ -1,0 +1,131 @@
+# Build, notarize and publish a macOS release.
+#
+# Triggered by pushing a tag like `v0.1.0`. The tag must match the version in
+# Cargo.toml -- `make check-version` fails the build otherwise, before anything
+# expensive runs.
+#
+# Produces one universal (Intel + Apple Silicon) build, published as:
+#   dbui-<version>-universal.dmg   what people download
+#   dbui-<version>-universal.zip   what the in-app updater downloads
+#   SHA256SUMS
+#
+# Required repository secrets -- see RELEASING.md for how to produce each:
+#   MACOS_CERT_P12         base64 of the "Developer ID Application" .p12
+#   MACOS_CERT_PASSWORD    the password that .p12 was exported with
+#   APPLE_ID               Apple ID of the notarytool account
+#   APPLE_APP_PASSWORD     app-specific password for that Apple ID
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a release be re-run from the Actions tab without moving the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    # macos-14 is Apple Silicon. It cross-compiles the x86_64 slice natively --
+    # clang takes -arch for either, so no extra toolchain is needed.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the tag matches Cargo.toml
+        run: make check-version TAG=${{ steps.tag.outputs.tag }}
+
+      # Fail here rather than 20 minutes later inside codesign, where the error
+      # is a keychain message that says nothing about what is missing.
+      - name: Check the signing secrets exist
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          missing=()
+          for name in MACOS_CERT_P12 MACOS_CERT_PASSWORD APPLE_ID APPLE_APP_PASSWORD; do
+            [ -n "${!name:-}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]}."
+            echo "::error::A release cannot be signed or notarized without them."
+            echo "::error::See RELEASING.md for how to produce each one."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      # A throwaway keychain holding just the signing identity. The runner is
+      # destroyed afterwards, but unlocking the login keychain would still be
+      # the wrong shape -- this keychain exists only for this job.
+      - name: Import the signing certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          # Random, and never leaves the job: nothing needs to reopen this.
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Without this the keychain re-locks after five minutes of idle and
+          # codesign starts failing partway through a long build.
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          # Let codesign use the key without an interactive prompt there is
+          # nobody present to answer.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Build, sign, notarize and package
+        env:
+          # Switches the Makefile from a stored keychain profile (which a CI
+          # runner has no way to hold) to Apple ID credentials.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: make release-macos TAG=${{ steps.tag.outputs.tag }}
+
+      - name: Checksums
+        run: |
+          cd build
+          shasum -a 256 dbui-*-universal.dmg dbui-*-universal.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: dbui ${{ steps.tag.outputs.tag }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            build/dbui-*-universal.dmg
+            build/dbui-*-universal.zip
+            build/SHA256SUMS

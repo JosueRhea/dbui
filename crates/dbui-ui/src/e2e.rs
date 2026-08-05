@@ -508,17 +508,24 @@ fn detail_search_does_not_move_vertically_while_typing(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
 
-    let mut seen: Vec<(f32, f32)> = Vec::new();
-    for c in "nnnnnnnnnn".chars() {
+    // Long enough to overflow the field and start panning horizontally.
+    let mut seen: Vec<(f32, f32, f32)> = Vec::new();
+    for c in "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn".chars() {
         cx.simulate_keystrokes(&format!("{c}->{c}"));
         cx.run_until_parked();
-        let bounds = view.read_with(cx, |this, _| {
+        let probe = view.read_with(cx, |this, _| {
             let WorkspaceTab::Sql { draft, .. } = this.tabs.active().unwrap() else {
                 unreachable!()
             };
-            painted_bounds(&draft.as_ref().unwrap().field_search)
+            let input = &draft.as_ref().unwrap().field_search;
+            let bounds = painted_bounds(input);
+            (
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.height),
+                f32::from(input.scroll_handle().offset().y),
+            )
         });
-        seen.push((bounds.origin.y.into(), bounds.size.height.into()));
+        seen.push(probe);
     }
 
     let first = seen[0];
@@ -527,8 +534,23 @@ fn detail_search_does_not_move_vertically_while_typing(cx: &mut TestAppContext) 
         drift.is_empty(),
         "detail search moved vertically while typing: first {first:?}, later {drift:?}",
     );
+
+    // …and the horizontal follow that panning is there for still happened.
+    let panned = view.read_with(cx, |this, _| {
+        let WorkspaceTab::Sql { draft, .. } = this.tabs.active().unwrap() else {
+            unreachable!()
+        };
+        f32::from(draft.as_ref().unwrap().field_search.scroll_handle().offset().x)
+    });
+    assert!(panned < 0., "a long value must pan to keep the caret in view");
 }
 
+/// The bounce, measured where it lives.
+///
+/// A detail field that fits its own text must have no vertical scroll range.
+/// When the field's height left out the 1px border top and bottom, the
+/// scrollport came out 2px shorter than the single line inside it, and
+/// `ensure_caret_visible` flipped the offset 0 → -2 → 0 on every keystroke.
 #[gpui::test]
 fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
     use crate::components::text_field::InputTarget;
@@ -540,7 +562,7 @@ fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    let mut seen: Vec<(f32, f32, f32)> = Vec::new();
+    let mut seen: Vec<(f32, f32)> = Vec::new();
     for c in "abcdefghijklmnopqrstuvwxyz0123456789".chars() {
         cx.simulate_keystrokes(&format!("{c}->{c}"));
         cx.run_until_parked();
@@ -548,15 +570,63 @@ fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
             let WorkspaceTab::Sql { draft, .. } = this.tabs.active().unwrap() else {
                 unreachable!()
             };
-            let input = &draft.as_ref().unwrap().fields[1].1;
-            let handle = input.scroll_handle();
+            let handle = draft.as_ref().unwrap().fields[1].1.scroll_handle();
             (
                 f32::from(handle.max_offset().height),
                 f32::from(handle.offset().y),
-                f32::from(painted_bounds(input).size.height),
             )
         });
         seen.push(probe);
     }
-    panic!("max_y / offset_y / hit_h per keystroke: {seen:?}");
+
+    let moved: Vec<_> = seen.iter().filter(|(max, y)| *max != 0. || *y != 0.).collect();
+    assert!(
+        moved.is_empty(),
+        "a one-line detail field scrolled vertically while typing \
+         (max_offset.height, offset.y): {moved:?}",
+    );
 }
+
+/// A field taller than its window still scrolls -- the fix above must not have
+/// pinned the vertical offset for everyone.
+#[gpui::test]
+fn a_long_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
+    use crate::components::text_field::InputTarget;
+
+    let long = (1..=20).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+    let (view, cx) = open_detail_draft(cx, &[("id", "1", true), ("body", long.as_str(), false)]);
+
+    view.update(cx, |this, cx| {
+        this.focus_input(InputTarget::DetailField(1), cx);
+    });
+    cx.run_until_parked();
+
+    let read = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |this, _| {
+            let WorkspaceTab::Sql { draft, .. } = this.tabs.active().unwrap() else {
+                unreachable!()
+            };
+            let handle = draft.as_ref().unwrap().fields[1].1.scroll_handle();
+            (
+                f32::from(handle.max_offset().height),
+                f32::from(handle.offset().y),
+            )
+        })
+    };
+
+    // The caret sits at the end of the text, so the first keystroke scrolls the
+    // field down to it; the ones after must leave it exactly where it is.
+    cx.simulate_keystrokes("x->x");
+    cx.run_until_parked();
+    let (max_y, first) = read(cx);
+    assert!(max_y > 0., "20 lines in an 8-line box must be scrollable");
+    assert!(first < 0., "the caret's line must be scrolled into view: {first}");
+
+    for _ in 0..8 {
+        cx.simulate_keystrokes("x->x");
+        cx.run_until_parked();
+        let (_, y) = read(cx);
+        assert_eq!(y, first, "typing on the last line must not re-scroll");
+    }
+}
+

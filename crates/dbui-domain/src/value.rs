@@ -30,6 +30,8 @@ pub enum Value {
     /// A type this build has no decoder for. Carries the engine's own type
     /// name so the grid can say *what* it could not read instead of "?".
     Unsupported(String),
+    /// Write-only: `SET col = DEFAULT`. Never produced by a decoder.
+    Default,
 }
 
 impl Value {
@@ -52,6 +54,7 @@ impl Value {
             Value::Json(_) | Value::Array(_) => ValueKind::Structured,
             Value::Temporal(_) => ValueKind::Temporal,
             Value::Unsupported(_) => ValueKind::Unsupported,
+            Value::Default => ValueKind::Unsupported,
         }
     }
 
@@ -76,6 +79,7 @@ impl Value {
                 format!("[{}]", inner.join(", "))
             }
             Value::Unsupported(type_name) => format!("<{type_name}>"),
+            Value::Default => "DEFAULT".into(),
         }
     }
 

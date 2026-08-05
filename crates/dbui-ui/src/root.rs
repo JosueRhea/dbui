@@ -168,6 +168,8 @@ pub struct DbUi {
     pub(crate) detail_open: bool,
     /// Which draft field / search box is focused in the detail sidebar.
     pub(crate) detail_input: Option<DetailInput>,
+    /// Field index whose special-value menu (NULL / EMPTY / DEFAULT) is open.
+    pub(crate) detail_value_menu: Option<usize>,
     /// Which control in the filter strip owns the keyboard, if any.
     pub(crate) filter_focus: Option<FilterFocus>,
     pub(crate) page_size_focus: bool,
@@ -189,6 +191,8 @@ pub struct DbUi {
     pub(crate) sidebar_cursor: Option<SidebarItem>,
     /// Theme id to restore if the theme picker is dismissed.
     pub(crate) theme_prev: Option<String>,
+    /// Where the self-update flow has got to; drawn as a status-bar chip.
+    pub(crate) update: crate::update::UpdateState,
 }
 
 impl DbUi {
@@ -202,6 +206,7 @@ impl DbUi {
             tabs: Tabs::default(),
             detail_open: false,
             detail_input: None,
+            detail_value_menu: None,
             filter_focus: None,
             page_size_focus: false,
             status: Status::Idle,
@@ -212,6 +217,7 @@ impl DbUi {
             palette: None,
             sidebar_cursor: None,
             theme_prev: None,
+            update: crate::update::UpdateState::default(),
         }
     }
 
@@ -279,6 +285,7 @@ impl DbUi {
         self.tabs.activate(index);
         self.selected_cell = None;
         self.detail_input = None;
+        self.detail_value_menu = None;
         self.filter_focus = None;
         self.page_size_focus = false;
         if let Some(tab) = self.tabs.active() {
@@ -298,6 +305,7 @@ impl DbUi {
         self.tabs.close(index);
         self.selected_cell = None;
         self.detail_input = None;
+        self.detail_value_menu = None;
         self.filter_focus = None;
         self.page_size_focus = false;
         self.workspace.open_table = self
@@ -486,6 +494,7 @@ impl DbUi {
             self.tabs = Tabs::default();
             self.selected_cell = None;
             self.detail_input = None;
+            self.detail_value_menu = None;
             self.filter_focus = None;
             self.workspace.open_table = None;
             self.sidebar_cursor = None;
@@ -933,6 +942,7 @@ impl DbUi {
                 *draft = next;
                 self.detail_open = true;
                 self.detail_input = None;
+                self.detail_value_menu = None;
                 self.focus = Focus::Detail;
             }
             Some(WorkspaceTab::Sql {
@@ -950,6 +960,7 @@ impl DbUi {
                 });
                 self.detail_open = true;
                 self.detail_input = None;
+                self.detail_value_menu = None;
                 self.focus = Focus::Detail;
             }
             None => {}
@@ -1198,6 +1209,29 @@ impl DbUi {
         self.connection_picker_open = false;
         self.modal = Some(ConnectionForm::new());
         self.focus = Focus::Sidebar;
+        cx.notify();
+    }
+
+    /// Pull PostgreSQL / MySQL connections out of TablePlus's plist + keychain.
+    pub(crate) fn import_tableplus_connections(&mut self, cx: &mut Context<Self>) {
+        self.connection_picker_open = false;
+        let existing = self.workspace.configs();
+        match dbui_app::import_from_tableplus(&existing) {
+            Ok(report) => {
+                let summary = report.summary();
+                let added = report.imported.len();
+                for config in report.imported {
+                    self.workspace.add(config);
+                }
+                if added > 0 {
+                    self.persist_connections();
+                }
+                self.status = Status::info(summary);
+            }
+            Err(error) => {
+                self.status = Status::error(error.to_string());
+            }
+        }
         cx.notify();
     }
 
@@ -1587,12 +1621,70 @@ impl DbUi {
         }
 
         if key == "escape" {
+            if self.detail_value_menu.is_some() {
+                self.detail_value_menu = None;
+                cx.notify();
+                return;
+            }
             self.focus = Focus::Sidebar;
             self.detail_input = None;
+            self.detail_value_menu = None;
             self.filter_focus = None;
             self.page_size_focus = false;
             cx.notify();
         }
+    }
+
+    pub(crate) fn toggle_detail_value_menu(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.detail_value_menu = if self.detail_value_menu == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
+        self.detail_input = Some(DetailInput::Field(index));
+        self.focus = Focus::Detail;
+        cx.notify();
+    }
+
+    pub(crate) fn close_detail_value_menu(&mut self, cx: &mut Context<Self>) {
+        if self.detail_value_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Apply a special write token (`NULL` / `EMPTY` / `DEFAULT`) to a detail field.
+    pub(crate) fn set_detail_special_value(
+        &mut self,
+        index: usize,
+        token: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let applied = match self.tabs.active_mut() {
+            Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            })
+            | Some(WorkspaceTab::Sql {
+                draft: Some(draft), ..
+            }) => {
+                if let Some((_, input, is_pk)) = draft.fields.get_mut(index) {
+                    if *is_pk {
+                        false
+                    } else {
+                        input.set_text(token);
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        self.detail_value_menu = None;
+        if applied {
+            self.detail_input = Some(DetailInput::Field(index));
+            self.focus = Focus::Detail;
+        }
+        cx.notify();
     }
 }
 

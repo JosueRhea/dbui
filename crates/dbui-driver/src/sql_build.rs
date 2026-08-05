@@ -88,13 +88,15 @@ pub fn update_sql(
     let mut sets = Vec::new();
     for (name, value) in changes {
         let col = driver.quote_identifier(name);
-        if value.is_null() {
-            sets.push(format!("{col} = NULL"));
-        } else {
-            let ph = placeholder(driver, param);
-            param += 1;
-            sets.push(format!("{col} = {ph}"));
-            binds.push(value_to_bind(value));
+        match value {
+            Value::Null => sets.push(format!("{col} = NULL")),
+            Value::Default => sets.push(format!("{col} = DEFAULT")),
+            _ => {
+                let ph = placeholder(driver, param);
+                param += 1;
+                sets.push(format!("{col} = {ph}"));
+                binds.push(value_to_bind(value));
+            }
         }
     }
 
@@ -131,7 +133,7 @@ fn placeholder(driver: Driver, index: usize) -> String {
 
 fn value_to_bind(value: &Value) -> String {
     match value {
-        Value::Null => String::new(),
+        Value::Null | Value::Default => String::new(),
         other => other.to_text(),
     }
 }
@@ -177,5 +179,25 @@ mod tests {
         .unwrap();
         assert!(ok.sql.starts_with("UPDATE "));
         assert_eq!(ok.binds.len(), 2);
+    }
+
+    #[test]
+    fn update_emits_null_empty_and_default_without_binds() {
+        let table = TableRef::new("public", "t");
+        let ok = update_sql(
+            Driver::Postgres,
+            &table,
+            &[
+                ("a".into(), Value::Null),
+                ("b".into(), Value::Text(String::new())),
+                ("c".into(), Value::Default),
+            ],
+            &[("id".into(), Value::Int(1))],
+        )
+        .unwrap();
+        assert!(ok.sql.contains("\"a\" = NULL"));
+        assert!(ok.sql.contains("\"b\" = $1"));
+        assert!(ok.sql.contains("\"c\" = DEFAULT"));
+        assert_eq!(ok.binds, vec![String::new(), "1".into()]);
     }
 }

@@ -16,9 +16,24 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
+plist = { workspace = true }
+# The updater talks to the GitHub releases API. rustls rather than native-tls
+# so the release build does not depend on the host's OpenSSL -- the same reason
+# sqlx is built with `tls-rustls-ring`.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "charset",
+    "http2",
+] }
+sha2 = "0.10"
 keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "windows-native",
     "sync-secret-service",
     "crypto-rust",
 ] }
+
+[dev-dependencies]
+# The updater's live tests drive async code directly.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

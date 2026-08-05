@@ -37,6 +37,7 @@ impl Palette {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionId {
     NewConnection,
+    ImportTablePlus,
     ConnectActive,
     DisconnectActive,
     RefreshCatalog,
@@ -104,6 +105,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::NewConnection,
         label: "New Connection",
         shortcut: Some("⌘N"),
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::ImportTablePlus,
+        label: "Import from TablePlus",
+        shortcut: None,
         section: "Connection",
     },
     ActionDef {
@@ -545,6 +552,7 @@ impl DbUi {
 
         match id {
             ActionId::NewConnection
+            | ActionId::ImportTablePlus
             | ActionId::GoToTable
             | ActionId::FocusSidebar
             | ActionId::ChangeTheme
@@ -598,6 +606,7 @@ impl DbUi {
     fn run_action(&mut self, id: ActionId, cx: &mut Context<Self>) {
         match id {
             ActionId::NewConnection => self.open_new_connection(cx),
+            ActionId::ImportTablePlus => self.import_tableplus_connections(cx),
             ActionId::ConnectActive => {
                 if let Some(id) = self.workspace.active_id() {
                     self.connect(id, cx);

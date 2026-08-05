@@ -10,6 +10,7 @@ mod root;
 mod tabs;
 mod text_input;
 mod theme;
+mod update;
 
 #[cfg(target_os = "macos")]
 mod mac_window;
@@ -111,6 +112,10 @@ pub fn run() {
                 if let Some(message) = load_error {
                     view.report_startup_error(message);
                 }
+                // Ask GitHub whether there is anything newer. Fire-and-forget:
+                // it resolves into the status-bar chip, and a machine that is
+                // offline never hears about it.
+                view.check_for_update(cx);
                 view
             })
         })

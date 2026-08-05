@@ -2,10 +2,12 @@
 
 use crate::root::{DbUi, ResultSource, Status};
 use crate::theme::metrics;
+use crate::update::UpdateAction;
 use gpui::{div, prelude::*, Context, Rgba, SharedString};
 
 impl DbUi {
-    pub(crate) fn render_status_bar(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let update = self.update_chip();
         let theme = &self.theme;
 
         let (message, color): (SharedString, Rgba) = match &self.status {
@@ -45,6 +47,28 @@ impl DbUi {
             .text_size(metrics::text_size_small())
             .child(div().text_color(color).child(message))
             .child(div().flex_1())
+            // Left of the other trailing items: an update is about the app, not
+            // about what is on screen, so it should not sit between a value and
+            // the row count it belongs to.
+            .children(update.map(|(label, action)| {
+                let idle = action == UpdateAction::None;
+                div()
+                    .id("update-chip")
+                    .px_2()
+                    .rounded_md()
+                    .text_color(if idle { theme.text_muted } else { theme.accent })
+                    .when(!idle, |chip| {
+                        chip.cursor_pointer()
+                            .hover(|chip| chip.bg(theme.hover))
+                            .on_click(cx.listener(move |this, _, _window, cx| match action {
+                                UpdateAction::Download => this.download_update(cx),
+                                UpdateAction::Install => this.install_update(cx),
+                                UpdateAction::Retry => this.check_for_update(cx),
+                                UpdateAction::None => {}
+                            }))
+                    })
+                    .child(SharedString::from(label))
+            }))
             .when(truncated, |bar| {
                 bar.child(
                     div()
