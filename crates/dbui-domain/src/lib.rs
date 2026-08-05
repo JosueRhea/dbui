@@ -12,9 +12,11 @@
 pub mod catalog;
 pub mod connection;
 pub mod query;
+pub mod sql_split;
 pub mod value;
 
 pub use catalog::{Catalog, Column, Schema, Table, TableKind, TableRef};
 pub use connection::{ConnectionConfig, ConnectionId, Driver, TlsMode};
 pub use query::{ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row};
+pub use sql_split::{split_statements, statement_at};
 pub use value::{Value, ValueKind};

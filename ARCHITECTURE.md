@@ -177,17 +177,16 @@ bug a user meets in the first five minutes:
 
 These are deliberate omissions in a starter, not oversights:
 
-- **The text editor is minimal.** `text_input.rs` has no selection, undo, or
-  IME, and its vertical motion does not keep a goal column. The caret is drawn
-  by splitting the line rather than by measuring glyphs — correct in any font,
-  but the reason it cannot do selection.
+- **The text editor has no IME**, and vertical motion does not keep a goal
+  column. The caret is drawn by splitting the line rather than by measuring
+  glyphs — correct in a monospace font, but not a substitute for shaped text.
+  Selection, undo, SQL highlighting, statement-aware run, and catalog
+  autocomplete are implemented on top of that model.
 - **Grid text is `div`-per-cell.** Fine at viewport scale, wrong long-term: the
   grid should be a custom `Element` painting shaped glyph runs.
-- **No editing of data.** The grid is read-only; there is no `UPDATE`
-  round-trip, which is what needs primary-key awareness (already introspected)
-  and a dirty-row model.
-- **One statement per run.** `execute` sends what is in the editor as a single
-  statement; there is no splitter for `a; b; c`.
+- **Multi-statement results share one grid.** Run-all executes statements in
+  order and keeps the last row-producing result; there are no per-statement
+  result tabs.
 - **Column widths are estimated**, not measured, from a 200-row sample.
 - **The live tests cover the two engines' common ground**, not their corners:
   no `INTERVAL`, ranges, enums, `BIT`, spatial types, or generated columns. The

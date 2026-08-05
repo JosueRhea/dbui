@@ -44,6 +44,7 @@ enum ActionId {
     RefreshResult,
     OpenSql,
     RunQuery,
+    RunAllQueries,
     GoToTable,
     ToggleFilters,
     ToggleColumns,
@@ -145,6 +146,12 @@ const ACTIONS: &[ActionDef] = &[
         section: "Query",
     },
     ActionDef {
+        id: ActionId::RunAllQueries,
+        label: "Run All Queries",
+        shortcut: Some("⌘⇧↵"),
+        section: "Query",
+    },
+    ActionDef {
         id: ActionId::ClearSql,
         label: "Clear SQL Editor",
         shortcut: Some("⌘K"),
@@ -215,8 +222,14 @@ const ACTIONS: &[ActionDef] = &[
 
 enum PaletteRow {
     Table(TableRef),
-    Action { id: ActionId, enabled: bool },
-    Theme { id: &'static str, label: &'static str },
+    Action {
+        id: ActionId,
+        enabled: bool,
+    },
+    Theme {
+        id: &'static str,
+        label: &'static str,
+    },
 }
 
 impl PaletteRow {
@@ -448,12 +461,7 @@ impl DbUi {
                 }
                 return true;
             }
-            if let Some(row) = rows.get(
-                self.palette
-                    .as_ref()
-                    .map(|p| p.selected)
-                    .unwrap_or(0),
-            ) {
+            if let Some(row) = rows.get(self.palette.as_ref().map(|p| p.selected).unwrap_or(0)) {
                 self.run_palette_row(row, cx);
             }
             return true;
@@ -573,7 +581,7 @@ impl DbUi {
             }
             ActionId::DisconnectActive | ActionId::RefreshCatalog => connected,
             ActionId::RefreshResult => connected && (is_table || is_sql),
-            ActionId::RunQuery | ActionId::ClearSql => is_sql,
+            ActionId::RunQuery | ActionId::RunAllQueries | ActionId::ClearSql => is_sql,
             ActionId::ToggleFilters
             | ActionId::ToggleColumns
             | ActionId::PagePrev
@@ -624,6 +632,7 @@ impl DbUi {
             ActionId::NextTab => self.next_tab(cx),
             ActionId::PrevTab => self.prev_tab(cx),
             ActionId::RunQuery => self.run_query(cx),
+            ActionId::RunAllQueries => self.run_all_queries(cx),
             ActionId::GoToTable => self.open_palette(PaletteKind::GoToTable, cx),
             ActionId::ToggleFilters => self.toggle_filters_open(cx),
             ActionId::ToggleColumns => self.toggle_columns_open(cx),
@@ -823,20 +832,15 @@ impl DbUi {
                                 .px_3()
                                 .pt_1()
                                 .pb_1()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .child(text_field(
-                                            "palette-query",
-                                            query,
-                                            InputTarget::PaletteQuery,
-                                            true,
-                                            Some(placeholder),
-                                            theme,
-                                            cx,
-                                        )),
-                                )
+                                .child(div().flex_1().min_w(px(0.)).child(text_field(
+                                    "palette-query",
+                                    query,
+                                    InputTarget::PaletteQuery,
+                                    true,
+                                    Some(placeholder),
+                                    theme,
+                                    cx,
+                                )))
                                 .child(
                                     div()
                                         .id("palette-close")
@@ -907,7 +911,13 @@ fn palette_row(
         .cursor_pointer()
         .when(selected, |r| r.bg(theme.selection))
         .when(!enabled, |r| r.text_color(theme.text_faint))
-        .hover(|r| r.bg(if selected { theme.selection } else { theme.hover }))
+        .hover(|r| {
+            r.bg(if selected {
+                theme.selection
+            } else {
+                theme.hover
+            })
+        })
         .on_click(on_click)
         .child(icon)
         .child(div().flex_1().min_w(px(0.)).child(label))

@@ -153,15 +153,7 @@ pub fn styles_on_line(
     spans: &[(usize, usize, JsonStyle)],
     line_range: &std::ops::Range<usize>,
 ) -> Vec<(usize, usize, JsonStyle)> {
-    let mut out = Vec::new();
-    for &(start, end, style) in spans {
-        let lo = start.max(line_range.start);
-        let hi = end.min(line_range.end);
-        if lo < hi {
-            out.push((lo - line_range.start, hi - line_range.start, style));
-        }
-    }
-    out
+    crate::highlight::styles_on_line(spans, line_range)
 }
 
 fn tokenize(text: &str) -> Vec<(usize, usize, JsonStyle)> {

@@ -5,8 +5,11 @@
 //! here -- nothing underneath it knows a window exists.
 
 mod components;
+mod highlight;
 mod json_format;
 mod root;
+mod sql_complete;
+mod sql_format;
 mod tabs;
 mod text_diff;
 mod text_input;
@@ -64,6 +67,7 @@ pub fn run() {
             KeyBinding::new("cmd-e", OpenSql, Some("DbUi")),
             KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
             KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
+            KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
             // ⌘W is handled in `DbUi::on_key` so it isn't stolen / double-fired.
             KeyBinding::new("cmd-shift-]", NextTab, Some("DbUi")),
             KeyBinding::new("cmd-shift-[", PrevTab, Some("DbUi")),
@@ -100,6 +104,7 @@ pub fn run() {
         let runtime = runtime.clone();
         let theme_id = prefs.theme.clone();
         let zoom_pct = prefs.zoom_pct;
+        let editor_height_px = prefs.sql_editor_height_px;
 
         cx.open_window(options, |window, cx| {
             cx.new(|cx| {
@@ -110,6 +115,7 @@ pub fn run() {
                 let mut view = DbUi::new(runtime, workspace, focus);
                 view.apply_theme_id(&theme_id);
                 view.apply_zoom_pct(zoom_pct);
+                view.apply_editor_height_px(editor_height_px);
                 if let Some(message) = load_error {
                     view.report_startup_error(message);
                 }
@@ -161,6 +167,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New SQL Tab", OpenSql),
                 MenuItem::action("Run Query", RunQuery),
+                MenuItem::action("Run All Queries", RunAllQueries),
                 MenuItem::action("Refresh", Refresh),
             ],
         },
@@ -179,6 +186,7 @@ gpui::actions!(
         OpenSql,
         Refresh,
         RunQuery,
+        RunAllQueries,
         CloseTab,
         NextTab,
         PrevTab,

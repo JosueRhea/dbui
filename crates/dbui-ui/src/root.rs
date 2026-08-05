@@ -5,8 +5,9 @@
 //! blocks that only render -- they read state and attach listeners, they do not
 //! define it. When a task lands, exactly one of the methods here folds it in.
 
-use crate::components::{ConnectionForm, DetailInput, FormAction};
 use crate::components::palette::{Palette, PaletteKind};
+use crate::components::{ConnectionForm, DetailInput, FormAction};
+use crate::sql_complete::CompletionPopup;
 use crate::tabs::{upsert_pending, RowDraft, Tabs, WorkspaceTab};
 use crate::theme::{metrics, Theme};
 use dbui_app::commands;
@@ -18,6 +19,7 @@ use gpui::{
     div, prelude::*, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
     MouseUpEvent, Pixels, SharedString, Window,
 };
+use std::collections::HashMap;
 
 /// Which surface the keyboard is talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +202,14 @@ pub struct DbUi {
     pub(crate) change_bubble_height: Pixels,
     /// Live drag: `(pointer y, height)` as they were when the edge was grabbed.
     pub(crate) change_bubble_drag: Option<(Pixels, Pixels)>,
+    /// SQL editor pane height (dragged by the strip under the editor).
+    pub(crate) editor_height: Pixels,
+    /// Live drag for the SQL editor resize: `(pointer y, height)`.
+    pub(crate) editor_drag: Option<(Pixels, Pixels)>,
+    /// Open SQL autocomplete popup, if any.
+    pub(crate) completion: Option<CompletionPopup>,
+    /// Cached `driver.columns` results keyed by `(schema, table)`.
+    pub(crate) column_cache: HashMap<(String, String), Vec<Column>>,
 }
 
 /// Starting height of the diff area, and the range the drag is allowed.
@@ -208,11 +218,20 @@ const BUBBLE_HEIGHT_MIN: f32 = 48.;
 /// Past this the bubble is eating the grid it is describing.
 const BUBBLE_HEIGHT_MAX_FRACTION: f32 = 0.7;
 
+pub(crate) const EDITOR_HEIGHT_DEFAULT: f32 = 150.;
+const EDITOR_HEIGHT_MIN: f32 = 80.;
+const EDITOR_HEIGHT_MAX_FRACTION: f32 = 0.6;
+
 /// Resolve a drag into a height. `rise` is how far the edge was pulled upward,
 /// which is the direction that makes the panel bigger.
 fn bubble_height_for(start_height: Pixels, rise: Pixels, viewport_height: Pixels) -> Pixels {
     let max = (f32::from(viewport_height) * BUBBLE_HEIGHT_MAX_FRACTION).max(BUBBLE_HEIGHT_MIN);
     px((f32::from(start_height) + f32::from(rise)).clamp(BUBBLE_HEIGHT_MIN, max))
+}
+
+fn editor_height_for(start_height: Pixels, delta: Pixels, viewport_height: Pixels) -> Pixels {
+    let max = (f32::from(viewport_height) * EDITOR_HEIGHT_MAX_FRACTION).max(EDITOR_HEIGHT_MIN);
+    px((f32::from(start_height) + f32::from(delta)).clamp(EDITOR_HEIGHT_MIN, max))
 }
 
 impl DbUi {
@@ -240,6 +259,10 @@ impl DbUi {
             update: crate::update::UpdateState::default(),
             change_bubble_height: px(BUBBLE_HEIGHT_DEFAULT),
             change_bubble_drag: None,
+            editor_height: px(EDITOR_HEIGHT_DEFAULT),
+            editor_drag: None,
+            completion: None,
+            column_cache: HashMap::new(),
         }
     }
 
@@ -271,6 +294,31 @@ impl DbUi {
         }
     }
 
+    pub(crate) fn begin_editor_drag(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        self.editor_drag = Some((y, self.editor_height));
+        cx.notify();
+    }
+
+    pub(crate) fn drag_editor(&mut self, y: Pixels, window: &Window, cx: &mut Context<Self>) {
+        let Some((start_y, start_height)) = self.editor_drag else {
+            return;
+        };
+        // Dragging the bottom edge downward grows the editor.
+        self.editor_height =
+            editor_height_for(start_height, y - start_y, window.viewport_size().height);
+        cx.notify();
+    }
+
+    pub(crate) fn end_editor_drag(&mut self, cx: &mut Context<Self>) {
+        if self.editor_drag.take().is_some() {
+            self.persist_prefs(cx);
+        }
+    }
+
+    pub fn apply_editor_height_px(&mut self, px_value: u32) {
+        self.editor_height = px((px_value as f32).clamp(EDITOR_HEIGHT_MIN, 600.));
+    }
+
     pub fn apply_theme_id(&mut self, id: &str) {
         self.theme = Theme::named(id);
     }
@@ -283,6 +331,7 @@ impl DbUi {
         let prefs = store::Prefs {
             theme: self.theme.id.to_string(),
             zoom_pct: metrics::zoom_pct(),
+            sql_editor_height_px: f32::from(self.editor_height).round() as u32,
         };
         match store::prefs_path().and_then(|path| store::save_prefs(&path, &prefs)) {
             Ok(()) => {}
@@ -297,6 +346,7 @@ impl DbUi {
         let prefs = store::Prefs {
             theme: self.theme.id.to_string(),
             zoom_pct: metrics::zoom_pct(),
+            sql_editor_height_px: f32::from(self.editor_height).round() as u32,
         };
         match store::prefs_path().and_then(|path| store::save_prefs(&path, &prefs)) {
             Ok(()) => {
@@ -358,10 +408,7 @@ impl DbUi {
         self.detail_value_menu = None;
         self.filter_focus = None;
         self.page_size_focus = false;
-        self.workspace.open_table = self
-            .tabs
-            .active()
-            .and_then(|tab| tab.table_ref().cloned());
+        self.workspace.open_table = self.tabs.active().and_then(|tab| tab.table_ref().cloned());
         if self.tabs.items.is_empty() {
             self.workspace.open_table = None;
         }
@@ -633,13 +680,20 @@ impl DbUi {
             self.status = Status::busy(format!("Loading {}…", table.qualified()));
         }
 
-        let task =
-            commands::open_table(&self.runtime, driver, table.clone(), page, where_clause.clone());
+        let task = commands::open_table(
+            &self.runtime,
+            driver,
+            table.clone(),
+            page,
+            where_clause.clone(),
+        );
         cx.spawn(async move |this, cx| {
             let landed = task.await;
             this.update(cx, |this, cx| {
-                this.finish_tab_load(tab_id, load_seq, |this, is_current, is_active| {
-                    match landed {
+                this.finish_tab_load(
+                    tab_id,
+                    load_seq,
+                    |this, is_current, is_active| match landed {
                         Some(Ok(contents)) if is_current => {
                             let summary = table_summary(&contents);
                             if let Some(WorkspaceTab::Table {
@@ -681,8 +735,8 @@ impl DbUi {
                             this.status = Status::error(error.to_string());
                         }
                         _ => {}
-                    }
-                });
+                    },
+                );
                 cx.notify();
             })
             .ok();
@@ -745,11 +799,141 @@ impl DbUi {
     }
 
     pub(crate) fn run_query(&mut self, cx: &mut Context<Self>) {
-        let sql = match self.tabs.active() {
-            Some(WorkspaceTab::Sql { editor, .. }) => editor.text().trim().to_string(),
-            _ => return,
+        let Some(sql) = self.resolve_run_sql() else {
+            return;
         };
-        if sql.is_empty() {
+        self.dispatch_statements(vec![sql], cx);
+    }
+
+    pub(crate) fn run_all_queries(&mut self, cx: &mut Context<Self>) {
+        let Some(statements) = self.resolve_run_all_sql() else {
+            return;
+        };
+        self.dispatch_statements(statements, cx);
+    }
+
+    /// Open or refresh the SQL autocomplete popup at the caret.
+    pub(crate) fn trigger_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+            return;
+        };
+        let sql = editor.text().to_string();
+        let caret = editor.cursor();
+        let request = crate::sql_complete::request_at(&sql, caret);
+        let catalog = self
+            .workspace
+            .active()
+            .and_then(|entry| entry.catalog.as_ref());
+
+        if let Some(table) = crate::sql_complete::pending_column_fetch(
+            &request,
+            catalog,
+            &self.column_cache,
+            &sql,
+            caret,
+        ) {
+            self.fetch_columns_for_completion(table, cx);
+        }
+
+        let catalog = self
+            .workspace
+            .active()
+            .and_then(|entry| entry.catalog.as_ref());
+        self.completion =
+            crate::sql_complete::build_popup(&request, catalog, &self.column_cache, &sql, caret);
+        cx.notify();
+    }
+
+    fn fetch_columns_for_completion(&mut self, table: TableRef, cx: &mut Context<Self>) {
+        let Some(driver) = self.workspace.active_driver() else {
+            return;
+        };
+        let task = commands::fetch_columns(&self.runtime, driver, table);
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(Ok((table, columns))) = landed {
+                    this.column_cache
+                        .insert((table.schema.clone(), table.name.clone()), columns);
+                    // Rebuild the popup now that columns are available.
+                    if this.focus == Focus::Editor {
+                        this.trigger_completion(cx);
+                    } else {
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn accept_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(popup) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = popup.current().cloned() else {
+            return;
+        };
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() else {
+            return;
+        };
+        editor.replace_range(popup.replace_range, &item.label);
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_completion(&mut self, cx: &mut Context<Self>) {
+        if self.completion.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// ⌘↵ target: selection if present, else the statement under the caret.
+    pub(crate) fn resolve_run_sql(&self) -> Option<String> {
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+            return None;
+        };
+        if let Some(selected) = editor.selected_text() {
+            let trimmed = selected.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            return Some(trimmed.to_string());
+        }
+        let text = editor.text();
+        let range = dbui_app::domain::statement_at(text, editor.cursor())?;
+        let stmt = text[range].trim();
+        if stmt.is_empty() {
+            None
+        } else {
+            Some(stmt.to_string())
+        }
+    }
+
+    /// ⌘⇧↵ target: every statement in the selection, or the whole buffer.
+    pub(crate) fn resolve_run_all_sql(&self) -> Option<Vec<String>> {
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+            return None;
+        };
+        let scope = if let Some(selected) = editor.selected_text() {
+            selected
+        } else {
+            editor.text()
+        };
+        let statements: Vec<String> = dbui_app::domain::split_statements(scope)
+            .into_iter()
+            .map(|range| scope[range].trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if statements.is_empty() {
+            None
+        } else {
+            Some(statements)
+        }
+    }
+
+    fn dispatch_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
+        if statements.is_empty() {
             return;
         }
 
@@ -768,21 +952,23 @@ impl DbUi {
         self.loads_in_flight = self.loads_in_flight.saturating_add(1);
         self.status = Status::busy("Running…");
 
-        let task = commands::run_query(&self.runtime, driver, sql.clone());
+        let task = commands::run_queries(&self.runtime, driver, statements);
         cx.spawn(async move |this, cx| {
             let landed = task.await;
             this.update(cx, |this, cx| {
-                this.finish_tab_load(tab_id, load_seq, |this, is_current, is_active| {
-                    match landed {
-                        Some(Ok(result)) if is_current => {
-                            this.absorb_query_result(tab_id, result, sql, is_active);
+                this.finish_tab_load(
+                    tab_id,
+                    load_seq,
+                    |this, is_current, is_active| match landed {
+                        Some(Ok(batch)) if is_current => {
+                            this.absorb_batch_result(tab_id, batch, is_active);
                         }
                         Some(Err(error)) if is_current && is_active => {
                             this.status = Status::error(error.to_string());
                         }
                         _ => {}
-                    }
-                });
+                    },
+                );
                 cx.notify();
             })
             .ok();
@@ -790,13 +976,35 @@ impl DbUi {
         .detach();
     }
 
+    fn absorb_batch_result(
+        &mut self,
+        tab_id: crate::tabs::TabId,
+        batch: commands::BatchQueryResult,
+        is_active: bool,
+    ) {
+        let summary = batch.summary();
+        if let Some(result) = batch.last_rows {
+            self.absorb_query_result(tab_id, result, is_active);
+            if is_active && batch.results.len() > 1 {
+                self.status = Status::info(summary);
+            }
+            return;
+        }
+
+        // No row-producing statement: keep any existing grid, surface the
+        // batch / last affected summary on the status bar.
+        if is_active {
+            self.status = Status::info(summary);
+        }
+    }
+
     fn absorb_query_result(
         &mut self,
         tab_id: crate::tabs::TabId,
         result: QueryResult,
-        sql: String,
         is_active: bool,
     ) {
+        let sql = result.statement.clone();
         let summary = result.summary();
         match result.outcome {
             QueryOutcome::Rows(set) => {
@@ -837,11 +1045,7 @@ impl DbUi {
         }
     }
 
-    pub(crate) fn set_table_pane(
-        &mut self,
-        pane: crate::tabs::TablePane,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn set_table_pane(&mut self, pane: crate::tabs::TablePane, cx: &mut Context<Self>) {
         if let Some(WorkspaceTab::Table { pane: tab_pane, .. }) = self.tabs.active_mut() {
             *tab_pane = pane;
         }
@@ -934,7 +1138,8 @@ impl DbUi {
 
         let raw = page_size_draft.text().trim().to_string();
         let Ok(parsed) = raw.parse::<u32>() else {
-            *page_size_draft = crate::text_input::TextInput::with_text(page.limit.to_string(), false);
+            *page_size_draft =
+                crate::text_input::TextInput::with_text(page.limit.to_string(), false);
             self.status = Status::error("Page size must be a number");
             self.page_size_focus = false;
             cx.notify();
@@ -967,12 +1172,7 @@ impl DbUi {
                 *selected_row = Some(row);
                 let mut next = result.as_ref().and_then(|view| {
                     view.set.rows.get(row).map(|values| {
-                        RowDraft::from_row(
-                            row,
-                            &view.set.columns,
-                            &values.0,
-                            &view.structure,
-                        )
+                        RowDraft::from_row(row, &view.set.columns, &values.0, &view.structure)
                     })
                 });
 
@@ -1492,6 +1692,10 @@ impl DbUi {
                     self.cmd_find(cx);
                     return;
                 }
+                "enter" if shift => {
+                    self.run_all_queries(cx);
+                    return;
+                }
                 "enter" => {
                     self.run_query(cx);
                     return;
@@ -1613,7 +1817,10 @@ impl DbUi {
                 self.apply_page_size(cx);
                 return;
             }
-            if let Some(WorkspaceTab::Table { page_size_draft, .. }) = self.tabs.active_mut() {
+            if let Some(WorkspaceTab::Table {
+                page_size_draft, ..
+            }) = self.tabs.active_mut()
+            {
                 if page_size_draft.handle_key(keystroke, cx) {
                     cx.notify();
                     return;
@@ -1622,9 +1829,62 @@ impl DbUi {
         }
 
         if self.focus == Focus::Editor {
+            // Completion popup owns navigation while open.
+            if self.completion.is_some() {
+                match key {
+                    "escape" => {
+                        self.dismiss_completion(cx);
+                        return;
+                    }
+                    "up" if !command => {
+                        if let Some(popup) = self.completion.as_mut() {
+                            popup.select_delta(-1);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    "down" if !command => {
+                        if let Some(popup) = self.completion.as_mut() {
+                            popup.select_delta(1);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    "enter" | "tab" if !command => {
+                        self.accept_completion(cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            if key == " " && keystroke.modifiers.control {
+                self.trigger_completion(cx);
+                return;
+            }
+
+            // Tab accepts the selected completion when the popup is open;
+            // otherwise it falls through to the editor (indent).
+            if key == "tab" && !command && !shift && self.completion.is_some() {
+                self.accept_completion(cx);
+                return;
+            }
+
             if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
                 if editor.handle_key(keystroke, cx) {
-                    cx.notify();
+                    let should_refresh = self.completion.is_some()
+                        && !command
+                        && (key.len() == 1 || key == "backspace" || key == "delete");
+                    if should_refresh {
+                        self.trigger_completion(cx);
+                    } else if self.completion.is_some()
+                        && (key.len() == 1 || key == "backspace" || key == "delete")
+                    {
+                        // Unreachable when should_refresh is true; kept for clarity.
+                        self.dismiss_completion(cx);
+                    } else {
+                        cx.notify();
+                    }
                     return;
                 }
             }
@@ -1780,23 +2040,33 @@ impl Render for DbUi {
             .on_key_down(cx.listener(Self::on_key))
             // The pointer leaves the 5px grab strip on the first frame of a
             // drag, so the tracking lives on the root instead.
-            .when(self.change_bubble_drag.is_some(), |root| {
-                root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                    this.drag_change_bubble(event.position.y, window, cx);
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseUpEvent, _window, cx| {
-                        this.end_change_bubble_drag(cx)
-                    }),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseUpEvent, _window, cx| {
-                        this.end_change_bubble_drag(cx)
-                    }),
-                )
-            })
+            .when(
+                self.change_bubble_drag.is_some() || self.editor_drag.is_some(),
+                |root| {
+                    root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        if this.change_bubble_drag.is_some() {
+                            this.drag_change_bubble(event.position.y, window, cx);
+                        }
+                        if this.editor_drag.is_some() {
+                            this.drag_editor(event.position.y, window, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                            this.end_change_bubble_drag(cx);
+                            this.end_editor_drag(cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                            this.end_change_bubble_drag(cx);
+                            this.end_editor_drag(cx);
+                        }),
+                    )
+                },
+            )
             .on_action(cx.listener(|this, _: &crate::NewConnection, _window, cx| {
                 this.open_new_connection(cx)
             }))
@@ -1809,63 +2079,68 @@ impl Render for DbUi {
             .on_action(cx.listener(|this, _: &crate::ChooseTheme, _window, cx| {
                 this.open_palette(PaletteKind::Themes, cx)
             }))
-            .on_action(cx.listener(|this, _: &crate::Find, _window, cx| {
-                this.cmd_find(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| {
-                this.open_sql_tab(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| {
-                this.refresh_result(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::RunQuery, _window, cx| {
-                this.run_query(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::CloseTab, _window, cx| {
-                this.close_active_tab(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::NextTab, _window, cx| {
-                this.next_tab(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::PrevTab, _window, cx| {
-                this.prev_tab(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab1, _window, cx| {
-                this.select_tab_number(1, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab2, _window, cx| {
-                this.select_tab_number(2, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab3, _window, cx| {
-                this.select_tab_number(3, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab4, _window, cx| {
-                this.select_tab_number(4, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab5, _window, cx| {
-                this.select_tab_number(5, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab6, _window, cx| {
-                this.select_tab_number(6, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab7, _window, cx| {
-                this.select_tab_number(7, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab8, _window, cx| {
-                this.select_tab_number(8, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::SelectTab9, _window, cx| {
-                this.select_tab_number(9, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::ZoomIn, _window, cx| {
-                this.zoom_delta(1, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::ZoomOut, _window, cx| {
-                this.zoom_delta(-1, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::ZoomReset, _window, cx| {
-                this.zoom_delta(0, cx)
-            }))
+            .on_action(cx.listener(|this, _: &crate::Find, _window, cx| this.cmd_find(cx)))
+            .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| this.open_sql_tab(cx)))
+            .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| this.refresh_result(cx)))
+            .on_action(cx.listener(|this, _: &crate::RunQuery, _window, cx| this.run_query(cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::RunAllQueries, _window, cx| this.run_all_queries(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::CloseTab, _window, cx| this.close_active_tab(cx)),
+            )
+            .on_action(cx.listener(|this, _: &crate::NextTab, _window, cx| this.next_tab(cx)))
+            .on_action(cx.listener(|this, _: &crate::PrevTab, _window, cx| this.prev_tab(cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab1, _window, cx| {
+                    this.select_tab_number(1, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab2, _window, cx| {
+                    this.select_tab_number(2, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab3, _window, cx| {
+                    this.select_tab_number(3, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab4, _window, cx| {
+                    this.select_tab_number(4, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab5, _window, cx| {
+                    this.select_tab_number(5, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab6, _window, cx| {
+                    this.select_tab_number(6, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab7, _window, cx| {
+                    this.select_tab_number(7, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab8, _window, cx| {
+                    this.select_tab_number(8, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SelectTab9, _window, cx| {
+                    this.select_tab_number(9, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &crate::ZoomIn, _window, cx| this.zoom_delta(1, cx)))
+            .on_action(cx.listener(|this, _: &crate::ZoomOut, _window, cx| this.zoom_delta(-1, cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::ZoomReset, _window, cx| this.zoom_delta(0, cx)),
+            )
             .child(self.render_titlebar(cx))
             .child(
                 div()

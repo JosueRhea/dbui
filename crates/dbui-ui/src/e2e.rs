@@ -184,7 +184,10 @@ fn tab_walks_the_fields_and_wraps(cx: &mut TestAppContext) {
 
     view.update(cx, |view, _| {
         let config = view.modal.as_ref().unwrap().to_config();
-        assert_eq!(config.name, "wrapped", "tab should wrap past buttons back to Name");
+        assert_eq!(
+            config.name, "wrapped",
+            "tab should wrap past buttons back to Name"
+        );
         assert_eq!(config.host, "db.internal", "host stays put");
     });
 }
@@ -324,6 +327,48 @@ fn cmd_e_opens_the_sql_tab_and_cmd_k_clears_it(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn run_resolves_selection_then_statement_under_caret(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "SELECT 1; SELECT 2");
+        // Caret in the second statement.
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(12);
+        }
+        assert_eq!(view.resolve_run_sql().as_deref(), Some("SELECT 2"));
+
+        // Selection wins over caret.
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(0);
+            editor.select_to(8); // "SELECT 1"
+        }
+        assert_eq!(view.resolve_run_sql().as_deref(), Some("SELECT 1"));
+    });
+}
+
+#[gpui::test]
+fn run_all_splits_the_buffer(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "SELECT 1; SELECT 2");
+        assert_eq!(
+            view.resolve_run_all_sql().as_deref(),
+            Some(["SELECT 1".to_string(), "SELECT 2".to_string()].as_slice())
+        );
+    });
+
+    cx.simulate_keystrokes("cmd-shift-enter");
+    view.update(cx, |view, _| match &view.status {
+        Status::Error(message) => assert_eq!(message.as_ref(), "Not connected"),
+        other => panic!("expected not-connected error, got {}", describe(other)),
+    });
+}
+
+#[gpui::test]
 fn escape_hands_the_keyboard_back_to_the_sidebar(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
 
@@ -447,7 +492,9 @@ fn open_detail_draft<'a>(
     view.update(cx, |this, cx| {
         this.open_sql_tab(cx);
         if let Some(WorkspaceTab::Sql {
-            draft, selected_row, ..
+            draft,
+            selected_row,
+            ..
         }) = this.tabs.active_mut()
         {
             *selected_row = Some(0);
@@ -540,9 +587,20 @@ fn detail_search_does_not_move_vertically_while_typing(cx: &mut TestAppContext) 
         let WorkspaceTab::Sql { draft, .. } = this.tabs.active().unwrap() else {
             unreachable!()
         };
-        f32::from(draft.as_ref().unwrap().field_search.scroll_handle().offset().x)
+        f32::from(
+            draft
+                .as_ref()
+                .unwrap()
+                .field_search
+                .scroll_handle()
+                .offset()
+                .x,
+        )
     });
-    assert!(panned < 0., "a long value must pan to keep the caret in view");
+    assert!(
+        panned < 0.,
+        "a long value must pan to keep the caret in view"
+    );
 }
 
 /// The bounce, measured where it lives.
@@ -579,7 +637,10 @@ fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
         seen.push(probe);
     }
 
-    let moved: Vec<_> = seen.iter().filter(|(max, y)| *max != 0. || *y != 0.).collect();
+    let moved: Vec<_> = seen
+        .iter()
+        .filter(|(max, y)| *max != 0. || *y != 0.)
+        .collect();
     assert!(
         moved.is_empty(),
         "a one-line detail field scrolled vertically while typing \
@@ -593,7 +654,10 @@ fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
 fn a_long_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
     use crate::components::text_field::InputTarget;
 
-    let long = (1..=20).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+    let long = (1..=20)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let (view, cx) = open_detail_draft(cx, &[("id", "1", true), ("body", long.as_str(), false)]);
 
     view.update(cx, |this, cx| {
@@ -620,7 +684,10 @@ fn a_long_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let (max_y, first) = read(cx);
     assert!(max_y > 0., "20 lines in an 8-line box must be scrollable");
-    assert!(first < 0., "the caret's line must be scrolled into view: {first}");
+    assert!(
+        first < 0.,
+        "the caret's line must be scrolled into view: {first}"
+    );
 
     for _ in 0..8 {
         cx.simulate_keystrokes("x->x");
@@ -629,4 +696,3 @@ fn a_long_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
         assert_eq!(y, first, "typing on the last line must not re-scroll");
     }
 }
-

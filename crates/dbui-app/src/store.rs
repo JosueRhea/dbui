@@ -44,6 +44,9 @@ pub struct Prefs {
     /// UI zoom percentage (100 = default). Clamped to 50–200 on apply.
     #[serde(default = "default_zoom_pct")]
     pub zoom_pct: u32,
+    /// SQL editor pane height in CSS pixels (unzoomed).
+    #[serde(default = "default_sql_editor_height_px")]
+    pub sql_editor_height_px: u32,
 }
 
 fn default_theme_id() -> String {
@@ -54,11 +57,16 @@ fn default_zoom_pct() -> u32 {
     100
 }
 
+fn default_sql_editor_height_px() -> u32 {
+    150
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
             theme: default_theme_id(),
             zoom_pct: default_zoom_pct(),
+            sql_editor_height_px: default_sql_editor_height_px(),
         }
     }
 }

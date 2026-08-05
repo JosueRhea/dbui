@@ -12,7 +12,7 @@ pub mod tableplus;
 pub mod updater;
 pub mod workspace;
 
-pub use commands::{Outcome, TableContents};
+pub use commands::{BatchQueryResult, Outcome, TableContents};
 pub use runtime::{DbRuntime, Task};
 pub use tableplus::{import_from_tableplus, ImportReport, TablePlusError};
 pub use updater::{Update, UpdateError, Version};

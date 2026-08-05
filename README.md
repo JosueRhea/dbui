@@ -86,9 +86,10 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
   read from `pg_catalog` / `information_schema`.
 - **Table browser** — click a table for its rows, 500 at a time, with the
   primary key marked in the header and paging through the rest.
-- **Query editor** — write SQL, ⌘↵ to run. Statements that return rows fill the
-  grid; statements that do not report their affected-row count and leave the
-  grid alone.
+- **Query editor** — write SQL with highlighting and catalog autocomplete
+  (⌃Space). ⌘↵ runs the selection, or the statement under the caret; ⌘⇧↵ runs
+  every statement in order. Row-producing results fill the grid (run-all keeps
+  the last one); other statements report their affected-row count.
 - **Typed grid** — values are coloured by type, numbers right-align, NULL is
   visibly not the string `"NULL"`, and clicking a cell shows it in full in the
   status bar.
@@ -97,13 +98,15 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 
 | Key | |
 |---|---|
-| `⌘↵` | Run the query |
+| `⌘↵` | Run selection, or the statement under the caret |
+| `⌘⇧↵` | Run all statements (in the selection, or the whole buffer) |
+| `⌃Space` | SQL autocomplete |
 | `⌘N` | New connection |
 | `⌘R` | Refresh the result (or the catalog) |
-| `⌘E` | Show/hide the SQL editor |
+| `⌘E` | Open / focus the SQL editor |
 | `⌘K` | Clear the editor |
 | `⌘[` / `⌘]` | Previous / next page of a table |
-| `Esc` | Close the sheet, or leave the editor |
+| `Esc` | Close the sheet, dismiss autocomplete, or leave the editor |
 
 ## Layout
 

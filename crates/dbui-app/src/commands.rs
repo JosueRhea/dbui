@@ -7,7 +7,7 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ConnectionConfig, Page, QueryResult, ResultSet, TableRef, Value,
+    Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, TableRef, Value,
 };
 use dbui_driver::{DatabaseDriver, DriverError, RowUpdate};
 use std::sync::Arc;
@@ -96,6 +96,85 @@ pub fn run_query(
     sql: String,
 ) -> Task<Outcome<QueryResult>> {
     runtime.spawn(async move { driver.execute(&sql).await })
+}
+
+/// Load columns for one table (SQL autocomplete cache).
+pub fn fetch_columns(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+) -> Task<Outcome<(TableRef, Vec<Column>)>> {
+    runtime.spawn(async move {
+        let columns = driver.columns(&table).await?;
+        Ok((table, columns))
+    })
+}
+
+/// Run several statements in order. Stops on the first error.
+///
+/// The UI shows the last result that returned rows and a batch summary for the
+/// status bar.
+pub fn run_queries(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    statements: Vec<String>,
+) -> Task<Outcome<BatchQueryResult>> {
+    runtime.spawn(async move {
+        let mut results = Vec::with_capacity(statements.len());
+        let mut last_rows: Option<QueryResult> = None;
+        let mut total_elapsed = std::time::Duration::ZERO;
+
+        for sql in statements {
+            let result = driver.execute(&sql).await?;
+            total_elapsed += result.stats.elapsed;
+            if matches!(result.outcome, QueryOutcome::Rows(_)) {
+                last_rows = Some(result.clone());
+            }
+            results.push(result);
+        }
+
+        Ok(BatchQueryResult {
+            results,
+            last_rows,
+            total_elapsed,
+        })
+    })
+}
+
+/// Outcome of running more than one statement.
+pub struct BatchQueryResult {
+    pub results: Vec<QueryResult>,
+    /// Last statement that produced a row set, if any.
+    pub last_rows: Option<QueryResult>,
+    pub total_elapsed: std::time::Duration,
+}
+
+impl BatchQueryResult {
+    /// One-line status for a finished batch.
+    pub fn summary(&self) -> String {
+        let n = self.results.len();
+        let ms = self.total_elapsed.as_secs_f64() * 1000.0;
+        let stmt = if n == 1 { "statement" } else { "statements" };
+        if let Some(last) = self.results.last() {
+            match &last.outcome {
+                QueryOutcome::Rows(set) => {
+                    let plural = if set.rows.len() == 1 { "row" } else { "rows" };
+                    let truncated = if set.truncated { "+" } else { "" };
+                    format!(
+                        "{n} {stmt} · {}{} {plural} in {ms:.0} ms",
+                        set.rows.len(),
+                        truncated
+                    )
+                }
+                QueryOutcome::Affected(count) => {
+                    let plural = if *count == 1 { "row" } else { "rows" };
+                    format!("{n} {stmt} · {count} {plural} affected in {ms:.0} ms")
+                }
+            }
+        } else {
+            format!("{n} {stmt} in {ms:.0} ms")
+        }
+    }
 }
 
 /// Dial a config without keeping the connection -- the "Test" button.

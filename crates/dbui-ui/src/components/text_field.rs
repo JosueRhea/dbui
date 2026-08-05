@@ -2,7 +2,8 @@
 //!
 //! Single-line for filters / search / page size; multiline for detail cells.
 
-use crate::json_format::{self, JsonStyle};
+use crate::highlight;
+use crate::json_format;
 use crate::root::DbUi;
 use crate::text_input::{self, selection_on_line, TextInput};
 use crate::theme::{metrics, Theme};
@@ -59,7 +60,9 @@ impl DbUi {
                 _ => None,
             },
             InputTarget::PageSize => match self.tabs.active_mut() {
-                Some(WorkspaceTab::Table { page_size_draft, .. }) => Some(page_size_draft),
+                Some(WorkspaceTab::Table {
+                    page_size_draft, ..
+                }) => Some(page_size_draft),
                 _ => None,
             },
             InputTarget::PaletteQuery => self.palette.as_mut().map(|p| &mut p.query),
@@ -128,9 +131,27 @@ pub(crate) fn text_field(
     };
 
     if input.is_multiline() {
-        multiline_text_field(id, scroll_id, input, target, focused, placeholder, theme, cx)
+        multiline_text_field(
+            id,
+            scroll_id,
+            input,
+            target,
+            focused,
+            placeholder,
+            theme,
+            cx,
+        )
     } else {
-        single_line_text_field(id, scroll_id, input, target, focused, placeholder, theme, cx)
+        single_line_text_field(
+            id,
+            scroll_id,
+            input,
+            target,
+            focused,
+            placeholder,
+            theme,
+            cx,
+        )
     }
 }
 
@@ -200,7 +221,13 @@ fn single_line_text_field(
                         .h_full()
                         .flex()
                         .items_center()
-                        .child(render_single_line(input, focused, empty, placeholder, theme)),
+                        .child(render_single_line(
+                            input,
+                            focused,
+                            empty,
+                            placeholder,
+                            theme,
+                        )),
                 ),
         )
         // `px_2` scales with the rem, so the inset has to as well.
@@ -339,7 +366,14 @@ fn multiline_text_field(
                         })
                     }
                 })
-                .child(render_multiline(input, focused, empty, placeholder, theme, char_w)),
+                .child(render_multiline(
+                    input,
+                    focused,
+                    empty,
+                    placeholder,
+                    theme,
+                    char_w,
+                )),
         )
         // Matches `px_2` / `py_1`, so the measured viewport is the scrollport.
         .child(hit_canvas(
@@ -557,7 +591,7 @@ fn render_multiline(
                 .map(|spans| json_format::styles_on_line(spans, &line_range))
                 .unwrap_or_default();
 
-            let body = render_highlighted_line(
+            let body = highlight::render_highlighted_line(
                 line,
                 &line_styles,
                 selection_on_line(&selection, &line_range),
@@ -565,6 +599,7 @@ fn render_multiline(
                 caret_color,
                 theme,
                 line_h,
+                |style| style.color(theme),
             );
 
             div()
@@ -584,94 +619,5 @@ fn render_multiline(
         .flex_shrink_0()
         .w(content_w)
         .children(lines)
-        .into_any_element()
-}
-
-/// Paint one line as colored runs with in-flow caret and selection.
-fn render_highlighted_line(
-    line: &str,
-    styles: &[(usize, usize, JsonStyle)],
-    selection: Option<std::ops::Range<usize>>,
-    caret_at: Option<usize>,
-    caret_color: gpui::Rgba,
-    theme: &Theme,
-    line_h: gpui::Pixels,
-) -> AnyElement {
-    let caret_h = px(12. * metrics::zoom());
-
-    let style_at = |offset: usize| -> gpui::Rgba {
-        styles
-            .iter()
-            .find(|&&(start, end, _)| offset >= start && offset < end)
-            .map(|&(_, _, style)| style.color(theme))
-            .unwrap_or(theme.text)
-    };
-
-    let selected = |offset: usize| -> bool {
-        selection
-            .as_ref()
-            .is_some_and(|sel| offset >= sel.start && offset < sel.end)
-    };
-
-    let mut cuts = vec![0usize, line.len()];
-    for &(start, end, _) in styles {
-        cuts.push(start.min(line.len()));
-        cuts.push(end.min(line.len()));
-    }
-    if let Some(sel) = &selection {
-        cuts.push(sel.start.min(line.len()));
-        cuts.push(sel.end.min(line.len()));
-    }
-    if let Some(caret) = caret_at {
-        cuts.push(caret.min(line.len()));
-    }
-    cuts.retain(|&offset| offset <= line.len() && line.is_char_boundary(offset));
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    let mut runs: Vec<AnyElement> = Vec::new();
-    let caret_byte = caret_at.filter(|&c| c <= line.len());
-
-    for window in cuts.windows(2) {
-        let start = window[0];
-        let end = window[1];
-
-        if caret_byte == Some(start) {
-            runs.push(text_input::caret_element(caret_color, caret_h).into_any_element());
-        }
-
-        if start >= end {
-            continue;
-        }
-
-        let color = style_at(start);
-        let in_selection = selected(start);
-        let piece = SharedString::from(line[start..end].to_string());
-        runs.push(if in_selection {
-            div()
-                .bg(theme.selection)
-                .text_color(color)
-                .child(piece)
-                .into_any_element()
-        } else {
-            div().text_color(color).child(piece).into_any_element()
-        });
-    }
-
-    if line.is_empty() {
-        if caret_byte.is_some() {
-            runs.push(text_input::caret_element(caret_color, caret_h).into_any_element());
-        }
-    } else if caret_byte == Some(line.len()) {
-        runs.push(text_input::caret_element(caret_color, caret_h).into_any_element());
-    }
-
-    div()
-        .flex_shrink_0()
-        .h(line_h)
-        .flex()
-        .items_center()
-        .whitespace_nowrap()
-        .children(runs)
         .into_any_element()
 }

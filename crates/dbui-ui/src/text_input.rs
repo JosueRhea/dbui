@@ -9,9 +9,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use gpui::{
-    div, point, App, Bounds, ClipboardItem, Keystroke, Pixels, Point, ScrollHandle, px,
-};
+use gpui::{div, point, px, App, Bounds, ClipboardItem, Keystroke, Pixels, Point, ScrollHandle};
 
 const UNDO_LIMIT: usize = 100;
 
@@ -179,6 +177,14 @@ impl TextInput {
 
     pub fn has_selection(&self) -> bool {
         self.selection.start != self.selection.end
+    }
+
+    /// The selected slice, if the range is non-empty.
+    pub fn selected_text(&self) -> Option<&str> {
+        if !self.has_selection() {
+            return None;
+        }
+        self.value.get(self.selection.clone())
     }
 
     pub fn is_selecting(&self) -> bool {
@@ -428,6 +434,17 @@ impl TextInput {
         let range = self.selection.clone();
         self.value.replace_range(range.clone(), text);
         let cursor = range.start + text.len();
+        self.selection = cursor..cursor;
+        self.selection_reversed = false;
+    }
+
+    /// Replace an absolute byte range and leave the caret after the insert.
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str) {
+        let start = range.start.min(self.value.len());
+        let end = range.end.min(self.value.len()).max(start);
+        self.push_undo();
+        self.value.replace_range(start..end, text);
+        let cursor = start + text.len();
         self.selection = cursor..cursor;
         self.selection_reversed = false;
     }
@@ -1017,20 +1034,15 @@ pub fn selection_on_line(
 /// `items_center` keeps it on the glyph box (not painted below the field).
 pub fn caret_element(color: gpui::Rgba, height: Pixels) -> impl gpui::IntoElement {
     use gpui::prelude::*;
-    div()
-        .w(px(0.))
-        .h(height)
-        .flex_shrink_0()
-        .relative()
-        .child(
-            div()
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .w(px(1.5))
-                .h(height)
-                .bg(color),
-        )
+    div().w(px(0.)).h(height).flex_shrink_0().relative().child(
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .w(px(1.5))
+            .h(height)
+            .bg(color),
+    )
 }
 
 /// Re-export for callers that place the caret from a click.
@@ -1236,11 +1248,14 @@ mod tests {
             assert_eq!(field.text(), "ab");
             assert_eq!(field.cursor(), 1);
 
-            field.handle_key(&{
-                let mut k = cmd("z");
-                k.modifiers.shift = true;
-                k
-            }, cx);
+            field.handle_key(
+                &{
+                    let mut k = cmd("z");
+                    k.modifiers.shift = true;
+                    k
+                },
+                cx,
+            );
             assert_eq!(field.text(), "aXb");
         });
     }

@@ -1,7 +1,9 @@
 //! The center column: tab bar, filters, content, and bottom bar.
 
 use super::{button, caption};
+use crate::highlight;
 use crate::root::{DbUi, Focus};
+use crate::sql_format;
 use crate::tabs::{TablePane, WorkspaceTab};
 use crate::text_input::{self, selection_on_line};
 use crate::theme::metrics;
@@ -220,22 +222,34 @@ impl DbUi {
 
     /// The SQL editor on the active SQL tab.
     fn render_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = &self.theme;
         let focused = self.focus == Focus::Editor;
-        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() else {
+        let editor_height = self.editor_height;
+        let dragging = self.editor_drag.is_some();
+        let completion = self.completion.clone();
+
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
             return div().id("editor-empty").into_any_element();
         };
 
         let layout = editor.layout();
         let empty = editor.is_empty();
         let selection = layout.selection.clone();
+        let caret_line = layout.caret_line;
         let cursor = editor.cursor();
         let input_has_selection = editor.has_selection();
         let hit_slot = editor.hit_bounds_slot();
+        let sql_spans = sql_format::highlight_spans(editor.text());
+        let lines_owned: Vec<String> = layout.lines.iter().map(|l| (*l).to_string()).collect();
+        let theme = &self.theme;
+        let line_h = metrics::editor_line_height();
+        let caret_color = if focused {
+            theme.accent
+        } else {
+            theme.text_faint
+        };
 
         let mut consumed = 0usize;
-        let lines: Vec<AnyElement> = layout
-            .lines
+        let lines: Vec<AnyElement> = lines_owned
             .iter()
             .enumerate()
             .map(|(index, line)| {
@@ -244,10 +258,36 @@ impl DbUi {
                 let line_range = line_start..line_end;
                 consumed = line_end + 1;
 
-                let row = div()
+                let show_caret =
+                    focused && !input_has_selection && cursor >= line_start && cursor <= line_end;
+                let caret_col = cursor.saturating_sub(line_start).min(line.len());
+                let line_styles = highlight::styles_on_line(&sql_spans, &line_range);
+
+                let body = highlight::render_highlighted_line(
+                    line,
+                    &line_styles,
+                    selection_on_line(&selection, &line_range),
+                    show_caret.then_some(caret_col),
+                    caret_color,
+                    theme,
+                    line_h,
+                    |style| style.color(theme),
+                );
+
+                let body = if empty && index == caret_line {
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(body)
+                        .child(div().text_color(theme.text_faint).child("SELECT * FROM …"))
+                } else {
+                    div().child(body)
+                };
+
+                div()
                     .flex()
                     .items_center()
-                    .h(metrics::editor_line_height())
+                    .h(line_h)
                     .child(
                         div()
                             .w(px(32.))
@@ -256,77 +296,19 @@ impl DbUi {
                             .text_color(theme.text_faint)
                             .text_size(metrics::text_size_small())
                             .child(SharedString::from((index + 1).to_string())),
-                    );
-
-                let caret_color = if focused {
-                    theme.accent
-                } else {
-                    theme.text_faint
-                };
-
-                let show_caret =
-                    focused && !input_has_selection && cursor >= line_start && cursor <= line_end;
-                let caret_col = cursor.saturating_sub(line_start).min(line.len());
-
-                let body = if let Some(sel) = selection_on_line(&selection, &line_range) {
-                    let before = &line[..sel.start];
-                    let selected = &line[sel.clone()];
-                    let after = &line[sel.end..];
-
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(SharedString::from(before.to_string()))
-                        .child(
-                            div()
-                                .bg(theme.selection)
-                                .flex()
-                                .items_center()
-                                .child(SharedString::from(selected.to_string())),
-                        )
-                        .child(SharedString::from(after.to_string()))
-                        .when(empty && index == layout.caret_line, |r| {
-                            r.child(
-                                div()
-                                    .text_color(theme.text_faint)
-                                    .child("SELECT * FROM …"),
-                            )
-                        })
-                } else if show_caret {
-                    let (before, after) = line.split_at(caret_col);
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(SharedString::from(before.to_string()))
-                        .child(text_input::caret_element(caret_color, px(15.)))
-                        .child(SharedString::from(after.to_string()))
-                        .when(empty && index == layout.caret_line, |r| {
-                            r.child(
-                                div()
-                                    .text_color(theme.text_faint)
-                                    .child("SELECT * FROM …"),
-                            )
-                        })
-                } else {
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(SharedString::from(line.to_string()))
-                };
-
-                row.child(body).into_any_element()
+                    )
+                    .child(body)
+                    .into_any_element()
             })
             .collect();
 
         div()
             .id("editor")
             .flex_shrink_0()
-            .h(px(150.))
+            .h(editor_height)
             .flex()
             .flex_col()
             .bg(theme.background)
-            .border_b_1()
-            .border_color(theme.border)
             .child(
                 div()
                     .flex()
@@ -337,8 +319,25 @@ impl DbUi {
                     .pb_1()
                     .child(caption("SQL", theme))
                     .child(
-                        button("run-query", "Run  ⌘↵", theme, true)
-                            .on_click(cx.listener(|this, _, _window, cx| this.run_query(cx))),
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                button(
+                                    "run-query",
+                                    if input_has_selection {
+                                        "Run selection  ⌘↵"
+                                    } else {
+                                        "Run  ⌘↵"
+                                    },
+                                    theme,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _window, cx| this.run_query(cx))),
+                            )
+                            .child(button("run-all", "Run all  ⌘⇧↵", theme, false).on_click(
+                                cx.listener(|this, _, _window, cx| this.run_all_queries(cx)),
+                            )),
                     ),
             )
             .child(
@@ -358,9 +357,8 @@ impl DbUi {
                             move |bounds, _, _| {
                                 let mut bounds = bounds;
                                 bounds.origin.x += text_input::editor_gutter();
-                                bounds.size.width = (bounds.size.width
-                                    - text_input::editor_gutter())
-                                .max(px(0.));
+                                bounds.size.width =
+                                    (bounds.size.width - text_input::editor_gutter()).max(px(0.));
                                 if hit_slot.get() != Some(bounds) {
                                     hit_slot.set(Some(bounds));
                                 }
@@ -374,6 +372,7 @@ impl DbUi {
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _window, cx| {
                             this.focus = Focus::Editor;
+                            this.dismiss_completion(cx);
                             let Some(WorkspaceTab::Sql { editor, .. }) = this.tabs.active_mut()
                             else {
                                 return;
@@ -384,11 +383,7 @@ impl DbUi {
                                 metrics::editor_line_height(),
                                 text_input::char_width(),
                             );
-                            editor.click_at(
-                                offset,
-                                event.modifiers.shift,
-                                event.click_count,
-                            );
+                            editor.click_at(offset, event.modifiers.shift, event.click_count);
                             if event.click_count <= 1 {
                                 editor.begin_selecting();
                             } else {
@@ -431,8 +426,107 @@ impl DbUi {
                             cx.notify();
                         }),
                     )
-                    .children(lines),
+                    .children(lines)
+                    .children(completion.map(|popup| render_completion_popup(&popup, theme, cx))),
             )
+            .child(editor_resize_handle(dragging, theme, cx))
             .into_any_element()
     }
+}
+
+fn editor_resize_handle(
+    dragging: bool,
+    theme: &crate::theme::Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
+    div()
+        .id("sql-editor-resize")
+        .w_full()
+        .h(px(5.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_row_resize()
+        .border_b_1()
+        .border_color(theme.border)
+        .when(dragging, |strip| strip.bg(theme.accent))
+        .hover(|strip| strip.bg(theme.hover))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                this.begin_editor_drag(event.position.y, cx);
+            }),
+        )
+        .child(
+            div()
+                .w(px(28.))
+                .h(px(2.))
+                .rounded_full()
+                .bg(theme.text_faint),
+        )
+        .into_any_element()
+}
+
+fn render_completion_popup(
+    popup: &crate::sql_complete::CompletionPopup,
+    theme: &crate::theme::Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
+    let selected = popup.selected;
+    let rows: Vec<AnyElement> = popup
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let selected = index == selected;
+            let label = SharedString::from(item.label.clone());
+            let kind = SharedString::from(item.kind.label());
+            div()
+                .id(("completion-row", index))
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .py_0p5()
+                .when(selected, |row| row.bg(theme.selection))
+                .hover(|row| row.bg(theme.hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(popup) = this.completion.as_mut() {
+                            popup.selected = index;
+                        }
+                        this.accept_completion(cx);
+                    }),
+                )
+                .child(div().text_color(theme.text).child(label))
+                .child(
+                    div()
+                        .text_color(theme.text_faint)
+                        .text_size(metrics::text_size_small())
+                        .child(kind),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .id("sql-completion")
+        .absolute()
+        .left(px(40.))
+        .bottom(px(4.))
+        .min_w(px(220.))
+        .max_h(px(180.))
+        .overflow_y_scroll()
+        .bg(theme.elevated)
+        .border_1()
+        .border_color(theme.border)
+        .rounded_md()
+        .shadow_md()
+        .py_1()
+        .font_family(metrics::MONO_FONT)
+        .text_size(metrics::text_size_small())
+        .children(rows)
+        .into_any_element()
 }
