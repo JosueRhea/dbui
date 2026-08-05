@@ -16,10 +16,13 @@
 #   APPLE_APP_PASSWORD     app-specific password for that Apple ID
 name: release
 
+# Manual for now. Until the four secrets below exist a tag-triggered run can
+# only fail, and releases are currently cut locally with `make release-macos &&
+# make publish TAG=vX.Y.Z`. To go back to releasing by pushing a tag, add the
+# secrets and uncomment the `push:` trigger.
 on:
-  push:
-    tags: ["v*"]
-  # Lets a release be re-run from the Actions tab without moving the tag.
+  # push:
+  #   tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:

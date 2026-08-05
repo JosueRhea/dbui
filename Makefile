@@ -50,7 +50,8 @@ NOTARY_AUTH := --keychain-profile "$(NOTARY_PROFILE)"
 endif
 
 .PHONY: all run test fmt clippy check-version icon universal bundle sign \
-        notarize dmg notarize-dmg zip-app release-macos verify clean
+        notarize dmg notarize-dmg zip-app checksums release-macos publish \
+        verify clean
 
 all: bundle
 
@@ -227,8 +228,36 @@ release-macos: check-version bundle
 	@$(MAKE) --no-print-directory dmg
 	@$(MAKE) --no-print-directory notarize-dmg
 	@$(MAKE) --no-print-directory zip-app
+	@$(MAKE) --no-print-directory checksums
 	@$(MAKE) --no-print-directory verify
 	@echo "  DONE  $(DMG) + $(ZIP) (notarized + stapled, universal)"
+
+# The updater checks the download against this before it installs anything, so
+# a release without it downgrades to signature-checking alone.
+checksums:
+	@echo "  SUMS  $(BUILD)/SHA256SUMS"
+	@cd $(BUILD) && shasum -a 256 $(notdir $(DMG)) $(notdir $(ZIP)) > SHA256SUMS
+	@sed 's/^/        /' $(BUILD)/SHA256SUMS
+
+# Publish the artifacts already sitting in build/ as a GitHub release, from
+# here rather than from a runner. `release-macos` has to have run first --
+# this uploads, it does not build, so it cannot publish something unnotarized
+# by accident.
+#
+#   make publish TAG=v0.1.0
+publish:
+	@test -n "$(TAG)" || (echo "ERROR: pass TAG, e.g. make publish TAG=v$(VERSION)"; exit 1)
+	@$(MAKE) --no-print-directory check-version TAG=$(TAG)
+	@test -f $(DMG) && test -f $(ZIP) && test -f $(BUILD)/SHA256SUMS || \
+	    (echo "ERROR: no release artifacts -- run 'make release-macos' first"; exit 1)
+	@# Refuse to publish a build Gatekeeper would reject. Catching it here is
+	@# the difference between a bad release and no release.
+	@spctl --assess --type execute $(APP) >/dev/null 2>&1 || \
+	    (echo "ERROR: $(APP) is not notarized -- run 'make release-macos'"; exit 1)
+	@echo "  PUBLISH $(TAG)"
+	@gh release create $(TAG) $(DMG) $(ZIP) $(BUILD)/SHA256SUMS \
+	    --title "dbui $(TAG)" --generate-notes
+	@echo "  ->    $$(gh release view $(TAG) --json url -q .url)"
 
 # What a user's machine will conclude about the build. `spctl` is the same
 # assessment Gatekeeper runs on first open, so a pass here means a pass there.
