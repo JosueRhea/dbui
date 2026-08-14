@@ -49,8 +49,10 @@ The whole application minus its pixels. It owns:
 
 - `DbRuntime` — the tokio runtime, and the only way to reach the database
 - `commands` — one function per use case, each returning a `Task` to await
-- `Workspace` — what connections exist and what is known about each
+- `Workspace` — what connections exist, which are open as tabs, and what is
+  known about each
 - `store` — saved connections on disk
+- `session` — which connection tabs were open, and what each had open in them
 
 No `gpui`. That is the constraint that keeps the use cases free of rendering
 concerns, and it means all of this is reachable from a plain `#[test]`.
@@ -107,6 +109,43 @@ discarding it answers "is there more?" without a second `COUNT(*)` round trip.
 **Passwords are not written to disk.** `ConnectionConfig::password` is
 `skip_serializing`. Wiring in the OS keychain later means changing `store.rs`
 and nothing else.
+
+**Connection tabs are two lists, not one.** `Workspace` keeps `entries` (every
+saved connection) apart from `open` (the ones with a tab, in tab order). Tab
+order is the user's arrangement and has nothing to do with the order
+connections were created in, and closing a tab must not delete a server. Both
+invariants — every open id names an entry, `active` is always one of them —
+are maintained inside `Workspace` rather than trusted to callers.
+
+**Each connection tab owns its table tabs.** The front connection's `Tabs` live
+on `DbUi::tabs` and every other one's in `DbUi::stashed_tabs`; switching is a
+swap between the two. Keeping the active set in the same field it always
+occupied is what let the ~60 places that say `self.tabs` stay as they were —
+a `HashMap` lookup at each would have been the same behaviour spelled worse.
+
+**The session is a cache, and is treated like one.** `session.json` is separate
+from `connections.json` because losing the former is cosmetic and losing the
+latter is not; a session that will not parse opens an empty tab bar rather than
+taking the launch down with it. Every id in it is checked against the saved
+connections on load, so a deleted connection cannot leave a tab pointing at a
+server that is gone. It stores the *question* each tab was asking — table,
+filter, hidden columns, SQL text — and never the rows, which would show
+yesterday's data under a live heading.
+
+**The session is written by rename, not in place.** It is saved on every tab
+click, and a plain write truncates before it fills: a crash — or a concurrent
+read — during that window sees half a file. Writing a temp file and renaming it
+over the old one is atomic on the same filesystem, so a reader gets one whole
+session or the other.
+
+**Restoring reconnects one connection, not all of them.** Only the tab that was
+in front dials out; the rest connect when clicked. Coming back from lunch is
+not a reason to reach for every server the user has ever saved, including the
+production one they left open last week.
+
+**`DBUI_CONFIG_DIR` overrides the configuration directory.** It is what lets a
+second profile exist side by side, and what keeps the UI tests — which persist
+a session as they click around — out of the developer's own configuration.
 
 ## Testing
 

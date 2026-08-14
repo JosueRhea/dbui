@@ -12,9 +12,11 @@ use crate::tabs::{upsert_pending, RowDraft, Tabs, WorkspaceTab};
 use crate::theme::{metrics, Theme};
 use dbui_app::commands;
 use dbui_app::domain::{
-    Column, ConnectionId, Page, QueryOutcome, QueryResult, ResultSet, TableRef,
+    Catalog, Column, ConnectionId, Page, QueryOutcome, QueryResult, ResultSet, TableRef,
 };
-use dbui_app::{store, ConnectionStatus, DbRuntime, RowUpdate, Workspace};
+use dbui_app::{
+    session, store, ConnectionStatus, DbRuntime, RowUpdate, SavedConnectionTab, Session, Workspace,
+};
 use gpui::{
     div, prelude::*, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
     MouseUpEvent, Pixels, SharedString, Window,
@@ -167,7 +169,12 @@ pub struct DbUi {
     pub(crate) focus_handle: FocusHandle,
 
     pub(crate) focus: Focus,
+    /// The front connection tab's table/SQL tabs. Every other connection's
+    /// live in `stashed_tabs`; switching swaps one for the other, which is
+    /// what lets the rest of this file go on saying `self.tabs`.
     pub(crate) tabs: Tabs,
+    /// Tab sets belonging to connection tabs that are not in front.
+    pub(crate) stashed_tabs: HashMap<ConnectionId, Tabs>,
     pub(crate) detail_open: bool,
     /// Which draft field / search box is focused in the detail sidebar.
     pub(crate) detail_input: Option<DetailInput>,
@@ -234,6 +241,28 @@ fn editor_height_for(start_height: Pixels, delta: Pixels, viewport_height: Pixel
     px((f32::from(start_height) + f32::from(delta)).clamp(EDITOR_HEIGHT_MIN, max))
 }
 
+/// Which schemas to leave unfolded once a catalog arrives.
+///
+/// Whatever the session restored wins, minus any schema the server no longer
+/// has — a folder for something that is gone is worse than a closed one.
+/// Nothing restored falls back to opening the first, so a new connection is
+/// not a wall of closed folders.
+fn schemas_to_expand(restored: &[String], catalog: &Catalog) -> Vec<String> {
+    let kept: Vec<String> = restored
+        .iter()
+        .filter(|name| catalog.schemas.iter().any(|schema| &schema.name == *name))
+        .cloned()
+        .collect();
+    if !kept.is_empty() {
+        return kept;
+    }
+    catalog
+        .schemas
+        .first()
+        .map(|schema| vec![schema.name.clone()])
+        .unwrap_or_default()
+}
+
 impl DbUi {
     pub fn new(runtime: DbRuntime, workspace: Workspace, focus_handle: FocusHandle) -> Self {
         Self {
@@ -243,6 +272,7 @@ impl DbUi {
             focus_handle,
             focus: Focus::Sidebar,
             tabs: Tabs::default(),
+            stashed_tabs: HashMap::new(),
             detail_open: false,
             detail_input: None,
             detail_value_menu: None,
@@ -395,6 +425,7 @@ impl DbUi {
                 self.workspace.open_table = None;
             }
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -412,6 +443,7 @@ impl DbUi {
         if self.tabs.items.is_empty() {
             self.workspace.open_table = None;
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -514,6 +546,7 @@ impl DbUi {
     pub(crate) fn open_sql_tab(&mut self, cx: &mut Context<Self>) {
         self.tabs.open_sql();
         self.focus = Focus::Editor;
+        self.persist_session();
         cx.notify();
     }
 
@@ -541,15 +574,22 @@ impl DbUi {
                         let version = driver.server_version().to_string();
                         if let Some(entry) = this.workspace.get_mut(id) {
                             entry.status = ConnectionStatus::Connected(driver);
-                            entry.expanded = catalog
-                                .schemas
-                                .first()
-                                .map(|schema| vec![schema.name.clone()])
-                                .unwrap_or_default();
+                            entry.expanded = schemas_to_expand(&entry.expanded, &catalog);
                             entry.catalog = Some(catalog);
                         }
-                        this.workspace.activate(id);
+                        // Only jump to it if it is still what the user is
+                        // looking at -- a background tab finishing its connect
+                        // must not yank them off the tab they switched to.
+                        if this.workspace.active_id().is_none() {
+                            this.workspace.activate(id);
+                        }
                         this.status = Status::info(format!("Connected — {version}"));
+                        // The driver only exists now, so a tab restored from
+                        // disk (or left over from a disconnect) gets its rows
+                        // here rather than at the moment it was put in front.
+                        if this.workspace.active_id() == Some(id) {
+                            this.load_active_table_if_empty(cx);
+                        }
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -575,35 +615,166 @@ impl DbUi {
         }
         entry.disconnect();
 
+        // The rows are stale, but the arrangement is not: what was open is
+        // still what the user wants open when the connection comes back.
         if self.workspace.active_id() == Some(id) {
-            self.tabs = Tabs::default();
-            self.workspace.open_table = None;
+            self.tabs.clear_results();
             self.selected_cell = None;
+            self.detail_input = None;
+            self.detail_value_menu = None;
+        } else if let Some(tabs) = self.stashed_tabs.get_mut(&id) {
+            tabs.clear_results();
         }
         self.status = Status::info("Disconnected");
         cx.notify();
     }
 
+    /// Bring a connection tab to the front, swapping in the tabs it owns.
+    ///
+    /// The front connection's tab set lives in `self.tabs` and every other
+    /// one's in `stashed_tabs`; a switch is a swap between the two. Nothing is
+    /// thrown away, which is the difference between a tab and a mode: coming
+    /// back finds the same tables open on the same tab.
     pub(crate) fn select_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
-        let was_active = self.workspace.active_id() == Some(id);
+        let previous = self.workspace.active_id();
+        if previous == Some(id) {
+            self.workspace.activate(id);
+            self.focus = Focus::Sidebar;
+            cx.notify();
+            return;
+        }
+
+        // Fold any half-finished row edit into the outgoing tab set before it
+        // is put away, or the change is lost on the way out.
+        self.stash_current_draft(cx);
+        if let Some(previous) = previous {
+            self.stashed_tabs
+                .insert(previous, std::mem::take(&mut self.tabs));
+        }
+
         self.workspace.activate(id);
-        if !was_active {
-            self.tabs = Tabs::default();
+        self.tabs = self.stashed_tabs.remove(&id).unwrap_or_default();
+
+        self.selected_cell = None;
+        self.detail_input = None;
+        self.detail_value_menu = None;
+        self.filter_focus = None;
+        self.page_size_focus = false;
+        self.sidebar_cursor = None;
+        self.completion = None;
+        self.column_cache.clear();
+        self.workspace.open_table = self.tabs.active().and_then(|tab| tab.table_ref().cloned());
+        self.focus = Focus::Sidebar;
+
+        self.persist_session();
+        cx.notify();
+        // A restored tab has no rows yet. Loading here rather than on restore
+        // means a background connection never dials out on its own.
+        self.load_active_table_if_empty(cx);
+    }
+
+    // -- connection tabs ----------------------------------------------------
+
+    /// Open a connection as a tab and connect it if it is not already.
+    pub(crate) fn open_connection_tab(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        self.select_connection(id, cx);
+        let connected = self
+            .workspace
+            .get(id)
+            .map(|entry| entry.status.is_connected() || entry.status.is_busy())
+            .unwrap_or(false);
+        if !connected {
+            self.connect(id, cx);
+        }
+    }
+
+    /// Close a connection tab: drop its tabs, close its socket, keep the
+    /// connection itself saved so it can be reopened from the picker.
+    pub(crate) fn close_connection_tab(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if !self.workspace.is_open(id) {
+            return;
+        }
+        let was_active = self.workspace.active_id() == Some(id);
+        if was_active {
+            self.stash_current_draft(cx);
+        }
+
+        if let Some(entry) = self.workspace.get(id) {
+            if let Some(driver) = entry.status.driver().cloned() {
+                commands::disconnect(&self.runtime, driver);
+            }
+        }
+        if let Some(entry) = self.workspace.get_mut(id) {
+            entry.disconnect();
+        }
+
+        self.stashed_tabs.remove(&id);
+        let promoted = self.workspace.close_connection(id);
+
+        if was_active {
+            self.tabs = promoted
+                .and_then(|next| self.stashed_tabs.remove(&next))
+                .unwrap_or_default();
             self.selected_cell = None;
             self.detail_input = None;
             self.detail_value_menu = None;
             self.filter_focus = None;
-            self.workspace.open_table = None;
+            self.page_size_focus = false;
             self.sidebar_cursor = None;
+            self.completion = None;
+            self.column_cache.clear();
+            self.workspace.open_table =
+                self.tabs.active().and_then(|tab| tab.table_ref().cloned());
+            self.focus = Focus::Sidebar;
         }
-        self.focus = Focus::Sidebar;
+
+        self.persist_session();
         cx.notify();
+        if was_active {
+            self.load_active_table_if_empty(cx);
+        }
+    }
+
+    pub(crate) fn close_active_connection_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.workspace.active_id() {
+            self.close_connection_tab(id, cx);
+        }
+    }
+
+    /// Step through the connection tab bar. `forward` wraps at either end.
+    pub(crate) fn cycle_connection_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.workspace.open_count();
+        if count < 2 {
+            return;
+        }
+        let Some(index) = self.workspace.active_index() else {
+            return;
+        };
+        let next = if forward {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        let Some(id) = self.workspace.open_ids().get(next).copied() else {
+            return;
+        };
+        self.open_connection_tab(id, cx);
+    }
+
+    /// Load the front table tab's rows if it has none — a tab restored from
+    /// disk, or one that was open when its connection dropped.
+    fn load_active_table_if_empty(&mut self, cx: &mut Context<Self>) {
+        if !self.tabs.active_needs_load() || self.workspace.active_driver().is_none() {
+            return;
+        }
+        self.load_active_table(cx);
     }
 
     pub(crate) fn toggle_schema(&mut self, id: ConnectionId, schema: &str, cx: &mut Context<Self>) {
         if let Some(entry) = self.workspace.get_mut(id) {
             entry.toggle_schema(schema);
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -643,6 +814,7 @@ impl DbUi {
         self.tabs.open_table(table.clone());
         self.workspace.open_table = Some(table);
         self.selected_cell = None;
+        self.persist_session();
         self.load_active_table(cx);
     }
 
@@ -1507,15 +1679,7 @@ impl DbUi {
 
     pub(crate) fn pick_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         self.connection_picker_open = false;
-        self.select_connection(id, cx);
-        if !self
-            .workspace
-            .get(id)
-            .map(|entry| entry.status.is_connected())
-            .unwrap_or(false)
-        {
-            self.connect(id, cx);
-        }
+        self.open_connection_tab(id, cx);
     }
 
     pub(crate) fn close_modal(&mut self, cx: &mut Context<Self>) {
@@ -1598,11 +1762,30 @@ impl DbUi {
                 commands::disconnect(&self.runtime, driver);
             }
         }
+        let was_active = self.workspace.active_id() == Some(id);
         self.workspace.remove(id);
         store::delete_password(id);
-        self.tabs = Tabs::default();
+        self.stashed_tabs.remove(&id);
+
+        // Deleting the connection that was in front leaves its tabs pointing
+        // at a server that no longer exists; the promoted tab brings its own.
+        if was_active {
+            self.tabs = self
+                .workspace
+                .active_id()
+                .and_then(|next| self.stashed_tabs.remove(&next))
+                .unwrap_or_default();
+            self.workspace.open_table =
+                self.tabs.active().and_then(|tab| tab.table_ref().cloned());
+            self.selected_cell = None;
+        }
+
         self.persist_connections();
+        self.persist_session();
         cx.notify();
+        if was_active {
+            self.load_active_table_if_empty(cx);
+        }
     }
 
     fn persist_connections(&mut self) {
@@ -1611,6 +1794,92 @@ impl DbUi {
         if let Err(error) = result {
             self.status = Status::error(format!("Could not save connections: {error}"));
         }
+    }
+
+    // -- the session --------------------------------------------------------
+
+    /// What is open right now, in the shape that survives a restart.
+    pub(crate) fn session_snapshot(&self) -> Session {
+        let active_id = self.workspace.active_id();
+        let tabs = self
+            .workspace
+            .open_ids()
+            .iter()
+            .map(|id| {
+                let (tabs, active_tab) = if active_id == Some(*id) {
+                    self.tabs.to_saved()
+                } else {
+                    self.stashed_tabs
+                        .get(id)
+                        .map(Tabs::to_saved)
+                        .unwrap_or_default()
+                };
+                SavedConnectionTab {
+                    connection: *id,
+                    tabs,
+                    active_tab,
+                    expanded: self
+                        .workspace
+                        .get(*id)
+                        .map(|entry| entry.expanded.clone())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        Session {
+            tabs,
+            active: self.workspace.active_index().unwrap_or(0),
+        }
+    }
+
+    /// Write the session out.
+    ///
+    /// Called on every structural change — a tab opened, closed or switched —
+    /// and once more on quit, which is what catches SQL text typed since. A
+    /// failure here is deliberately silent: the session is a convenience, and
+    /// an unwritable one is not worth taking over the status bar that is
+    /// describing the user's actual query.
+    pub(crate) fn persist_session(&self) {
+        let session = self.session_snapshot();
+        let _ = session::session_path().and_then(|path| session::save(&path, &session));
+    }
+
+    /// Apply a session read from disk: rebuild the tab bar, restore each
+    /// connection's tabs, and hand back the connection to connect.
+    ///
+    /// Only the front tab's connection is returned. Restoring is not a reason
+    /// to dial every server the user has ever saved — including the production
+    /// one they left open last week.
+    pub fn restore_session(&mut self, session: &Session) -> Option<ConnectionId> {
+        if session.is_empty() {
+            return self.workspace.active_id();
+        }
+
+        self.workspace
+            .restore_open(session.tabs.iter().map(|tab| tab.connection), session.active);
+
+        let active = self.workspace.active_id();
+        for saved in &session.tabs {
+            if !self.workspace.is_open(saved.connection) {
+                continue;
+            }
+            let tabs = Tabs::from_saved(&saved.tabs, saved.active_tab);
+            if Some(saved.connection) == active {
+                self.tabs = tabs;
+            } else {
+                self.stashed_tabs.insert(saved.connection, tabs);
+            }
+            // Held until the connection opens: the tree cannot draw a folder
+            // before the catalog naming it has arrived, and `connect` keeps
+            // whatever is here rather than defaulting to the first schema.
+            if let Some(entry) = self.workspace.get_mut(saved.connection) {
+                entry.expanded.clone_from(&saved.expanded);
+            }
+        }
+
+        self.workspace.open_table = self.tabs.active().and_then(|tab| tab.table_ref().cloned());
+        active
     }
 
     // -- keyboard ----------------------------------------------------------
@@ -1625,6 +1894,7 @@ impl DbUi {
         let key = keystroke.key.as_str();
         let command = keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
+        let alt = keystroke.modifiers.alt;
 
         if self.palette.is_some() {
             self.handle_palette_key(keystroke, cx);
@@ -1712,6 +1982,12 @@ impl DbUi {
                     self.open_sql_tab(cx);
                     return;
                 }
+                // ⌘⇧W closes the whole connection, ⌘W one table tab. The
+                // shifted arm has to come first or ⌘W swallows both.
+                "w" if shift => {
+                    self.close_active_connection_tab(cx);
+                    return;
+                }
                 "w" => {
                     self.close_active_tab(cx);
                     return;
@@ -1721,6 +1997,15 @@ impl DbUi {
                         editor.clear();
                     }
                     cx.notify();
+                    return;
+                }
+                // ⌥ lifts the bracket keys from paging to the connection bar.
+                "[" if alt => {
+                    self.cycle_connection_tab(false, cx);
+                    return;
+                }
+                "]" if alt => {
+                    self.cycle_connection_tab(true, cx);
                     return;
                 }
                 "[" => {
@@ -2091,6 +2376,15 @@ impl Render for DbUi {
             )
             .on_action(cx.listener(|this, _: &crate::NextTab, _window, cx| this.next_tab(cx)))
             .on_action(cx.listener(|this, _: &crate::PrevTab, _window, cx| this.prev_tab(cx)))
+            .on_action(cx.listener(|this, _: &crate::CloseConnection, _window, cx| {
+                this.close_active_connection_tab(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::NextConnection, _window, cx| {
+                this.cycle_connection_tab(true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::PrevConnection, _window, cx| {
+                this.cycle_connection_tab(false, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::SelectTab1, _window, cx| {
                     this.select_tab_number(1, cx)
@@ -2195,5 +2489,60 @@ mod tests {
             bubble_height_for(px(BUBBLE_HEIGHT_DEFAULT), px(9000.), px(10.)),
             px(BUBBLE_HEIGHT_MIN)
         );
+    }
+
+    // -- restoring the tree ---------------------------------------------------
+
+    fn catalog_of(names: &[&str]) -> Catalog {
+        Catalog {
+            schemas: names
+                .iter()
+                .map(|name| dbui_app::domain::Schema {
+                    name: (*name).to_string(),
+                    tables: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The bug this fixes: connecting used to overwrite the restored expansion
+    /// with the first schema, so every folder the user had open came back shut.
+    #[test]
+    fn a_restored_expansion_survives_the_catalog_arriving() {
+        let catalog = catalog_of(&["drizzle", "pscale_extensions", "public"]);
+        assert_eq!(
+            schemas_to_expand(&["public".into(), "drizzle".into()], &catalog),
+            vec!["public".to_string(), "drizzle".to_string()]
+        );
+    }
+
+    /// A folder for a schema that is gone is worse than a closed one.
+    #[test]
+    fn a_schema_the_server_dropped_is_not_expanded() {
+        let catalog = catalog_of(&["public"]);
+        assert_eq!(
+            schemas_to_expand(&["public".into(), "retired".into()], &catalog),
+            vec!["public".to_string()]
+        );
+    }
+
+    /// Nothing restored -- or nothing left after filtering -- still opens one
+    /// folder, so a fresh connection is not a wall of closed ones.
+    #[test]
+    fn with_nothing_restored_the_first_schema_opens() {
+        let catalog = catalog_of(&["drizzle", "public"]);
+        assert_eq!(
+            schemas_to_expand(&[], &catalog),
+            vec!["drizzle".to_string()]
+        );
+        assert_eq!(
+            schemas_to_expand(&["all-gone".into()], &catalog),
+            vec!["drizzle".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_server_with_no_schemas_expands_nothing() {
+        assert!(schemas_to_expand(&["public".into()], &catalog_of(&[])).is_empty());
     }
 }

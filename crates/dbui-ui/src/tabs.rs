@@ -4,6 +4,7 @@ use crate::json_format;
 use crate::root::ResultView;
 use crate::text_input::TextInput;
 use dbui_app::domain::{Column, ColumnInfo, Page, TableRef, Value};
+use dbui_app::SavedTab;
 use std::collections::HashSet;
 
 /// Stable identity for a tab across activates/closes. Async loads key off this
@@ -419,6 +420,71 @@ impl WorkspaceTab {
             Self::Table { selected_row, .. } | Self::Sql { selected_row, .. } => *selected_row,
         }
     }
+
+    /// The part of this tab worth writing to disk.
+    ///
+    /// Rows are left out on purpose: they are what the server held at the time,
+    /// and restoring them would show stale data under a live heading. What is
+    /// kept is the question — which table, which filter, which columns were
+    /// hidden, what SQL was typed — and asking it again is a page load.
+    pub fn to_saved(&self) -> SavedTab {
+        match self {
+            Self::Table {
+                table,
+                where_clause,
+                hidden_columns,
+                ..
+            } => {
+                // Sorted so an unordered set does not rewrite the file with
+                // the same tabs in a different order on every save.
+                let mut hidden: Vec<String> = hidden_columns.iter().cloned().collect();
+                hidden.sort();
+                SavedTab::Table {
+                    schema: table.schema.clone(),
+                    name: table.name.clone(),
+                    where_clause: where_clause.clone(),
+                    hidden_columns: hidden,
+                }
+            }
+            Self::Sql { editor, .. } => SavedTab::Sql {
+                text: editor.text().to_string(),
+            },
+        }
+    }
+
+    fn from_saved(id: TabId, saved: &SavedTab) -> Self {
+        match saved {
+            SavedTab::Table {
+                schema,
+                name,
+                where_clause,
+                hidden_columns,
+            } => {
+                let mut tab = Self::table(id, TableRef::new(schema, name));
+                if let Self::Table {
+                    where_clause: clause,
+                    where_draft,
+                    hidden_columns: hidden,
+                    ..
+                } = &mut tab
+                {
+                    clause.clone_from(where_clause);
+                    // The strip opens showing the filter that is applied, not
+                    // an empty box over filtered rows.
+                    *where_draft = TextInput::with_text(where_clause.clone(), false);
+                    *hidden = hidden_columns.iter().cloned().collect();
+                }
+                tab
+            }
+            SavedTab::Sql { text } => {
+                let mut tab = Self::sql(id);
+                if let Self::Sql { editor, .. } = &mut tab {
+                    *editor = TextInput::with_text(text.clone(), true);
+                }
+                tab
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -512,6 +578,61 @@ impl Tabs {
         } else if index < self.active {
             self.active -= 1;
         }
+    }
+
+    /// This tab set as it survives a restart.
+    pub fn to_saved(&self) -> (Vec<SavedTab>, usize) {
+        (
+            self.items.iter().map(WorkspaceTab::to_saved).collect(),
+            self.active,
+        )
+    }
+
+    /// Rebuild a tab set from disk. Every tab starts with no rows: the active
+    /// one loads when the connection it belongs to is in front and connected.
+    pub fn from_saved(saved: &[SavedTab], active: usize) -> Self {
+        let mut tabs = Self::default();
+        for entry in saved {
+            let id = tabs.alloc_id();
+            tabs.items.push(WorkspaceTab::from_saved(id, entry));
+        }
+        tabs.active = active.min(tabs.items.len().saturating_sub(1));
+        tabs
+    }
+
+    /// Drop every result, keeping the tabs themselves.
+    ///
+    /// Disconnecting invalidates the rows but not the arrangement: what was
+    /// open is still what the user wants open when the connection comes back.
+    pub fn clear_results(&mut self) {
+        for tab in &mut self.items {
+            match tab {
+                WorkspaceTab::Table {
+                    result,
+                    selected_row,
+                    draft,
+                    ..
+                }
+                | WorkspaceTab::Sql {
+                    result,
+                    selected_row,
+                    draft,
+                    ..
+                } => {
+                    *result = None;
+                    *selected_row = None;
+                    *draft = None;
+                }
+            }
+        }
+    }
+
+    /// Whether the tab in front is showing rows already.
+    ///
+    /// Restored tabs have none, which is what tells the UI to load on the way
+    /// in rather than reloading a tab the user merely stepped away from.
+    pub fn active_needs_load(&self) -> bool {
+        matches!(self.active(), Some(tab) if tab.result().is_none() && !tab.is_sql())
     }
 }
 
@@ -654,6 +775,135 @@ mod tests {
             tabs.get_mut(a),
             Some(WorkspaceTab::Table { .. })
         ));
+    }
+
+    // -- surviving a restart -------------------------------------------------
+
+    /// What the user arranged comes back: the tables, the SQL text, which tab
+    /// was in front. What the server said does not -- that is reloaded.
+    #[test]
+    fn a_tab_set_survives_a_save_and_reload() {
+        let mut tabs = Tabs::default();
+        tabs.open_table(TableRef::new("public", "users"));
+        tabs.open_table(TableRef::new("shop", "orders"));
+        tabs.open_sql();
+        if let Some(WorkspaceTab::Sql { editor, .. }) = tabs.active_mut() {
+            *editor = TextInput::with_text("select 1", true);
+        }
+        tabs.activate(1);
+
+        let (saved, active) = tabs.to_saved();
+        let restored = Tabs::from_saved(&saved, active);
+
+        assert_eq!(restored.items.len(), 3);
+        assert_eq!(restored.active, 1);
+        assert_eq!(
+            restored.items[1].table_ref(),
+            Some(&TableRef::new("shop", "orders"))
+        );
+        assert!(matches!(
+            &restored.items[2],
+            WorkspaceTab::Sql { editor, .. } if editor.text() == "select 1"
+        ));
+    }
+
+    /// A filter is part of the question the tab is asking, so it has to come
+    /// back applied -- and visible in the strip, not an empty box over
+    /// filtered rows.
+    #[test]
+    fn a_filtered_table_tab_comes_back_filtered() {
+        let mut tabs = Tabs::default();
+        tabs.open_table(TableRef::new("public", "users"));
+        if let Some(WorkspaceTab::Table {
+            where_clause,
+            hidden_columns,
+            ..
+        }) = tabs.active_mut()
+        {
+            *where_clause = "id > 10".into();
+            hidden_columns.insert("secret".into());
+        }
+
+        let (saved, active) = tabs.to_saved();
+        let restored = Tabs::from_saved(&saved, active);
+
+        let WorkspaceTab::Table {
+            where_clause,
+            where_draft,
+            hidden_columns,
+            ..
+        } = &restored.items[0]
+        else {
+            panic!("expected a table tab");
+        };
+        assert_eq!(where_clause, "id > 10");
+        assert_eq!(where_draft.text(), "id > 10");
+        assert!(hidden_columns.contains("secret"));
+    }
+
+    /// Ids are minted fresh on restore, so an in-flight load keyed off an id
+    /// from the previous run cannot land on a restored tab.
+    #[test]
+    fn restored_tabs_get_fresh_ids_that_keep_allocating() {
+        let restored = Tabs::from_saved(
+            &[
+                SavedTab::Sql {
+                    text: String::new(),
+                },
+                SavedTab::Table {
+                    schema: "public".into(),
+                    name: "users".into(),
+                    where_clause: String::new(),
+                    hidden_columns: Vec::new(),
+                },
+            ],
+            0,
+        );
+        assert_eq!(restored.items[0].id(), 0);
+        assert_eq!(restored.items[1].id(), 1);
+
+        let mut restored = restored;
+        restored.open_table(TableRef::new("public", "orders"));
+        assert_eq!(restored.items[2].id(), 2, "ids must not collide");
+    }
+
+    #[test]
+    fn an_empty_save_restores_to_an_empty_tab_set() {
+        let restored = Tabs::from_saved(&[], 4);
+        assert!(restored.items.is_empty());
+        assert_eq!(restored.active, 0);
+        assert!(!restored.active_needs_load());
+    }
+
+    /// Disconnecting invalidates the rows but not the arrangement.
+    #[test]
+    fn clearing_results_keeps_the_tabs() {
+        let mut tabs = Tabs::default();
+        tabs.open_table(TableRef::new("public", "users"));
+        assert!(tabs.active_needs_load(), "a tab with no rows wants a load");
+
+        if let Some(WorkspaceTab::Table { selected_row, .. }) = tabs.active_mut() {
+            *selected_row = Some(3);
+        }
+        tabs.clear_results();
+
+        assert_eq!(tabs.items.len(), 1);
+        assert_eq!(tabs.items[0].selected_row(), None);
+        assert!(tabs.active_needs_load());
+    }
+
+    /// A SQL tab has nothing to reload -- it holds a query the user has not
+    /// necessarily run, and running it on restore would be the app deciding to
+    /// execute something on its own.
+    #[test]
+    fn a_restored_sql_tab_is_never_loaded_on_the_way_in() {
+        let tabs = Tabs::from_saved(
+            &[SavedTab::Sql {
+                text: "delete from users".into(),
+            }],
+            0,
+        );
+        assert!(!tabs.active_needs_load());
     }
 
     #[test]

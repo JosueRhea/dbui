@@ -24,7 +24,7 @@ mod e2e;
 
 pub use root::{DbUi, Focus, ResultSource, ResultView, Status};
 
-use dbui_app::{store, DbRuntime, Workspace};
+use dbui_app::{session, store, DbRuntime, Workspace};
 use gpui::{
     point, px, size, App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem,
     TitlebarOptions, WindowBounds, WindowOptions,
@@ -52,6 +52,14 @@ pub fn run() {
         .and_then(|path| store::load_prefs(&path))
         .unwrap_or_default();
 
+    // What was open last time. Pruned against the connections that actually
+    // loaded, so a session naming a deleted -- or unreadable -- connection
+    // opens one tab fewer rather than a tab onto nothing.
+    let mut last_session = session::session_path()
+        .map(|path| session::load(&path))
+        .unwrap_or_default();
+    last_session.prune(&saved.iter().map(|config| config.id).collect::<Vec<_>>());
+
     Application::new().run(move |cx: &mut App| {
         cx.activate(true);
         load_bundled_fonts(cx);
@@ -71,6 +79,11 @@ pub fn run() {
             // ⌘W is handled in `DbUi::on_key` so it isn't stolen / double-fired.
             KeyBinding::new("cmd-shift-]", NextTab, Some("DbUi")),
             KeyBinding::new("cmd-shift-[", PrevTab, Some("DbUi")),
+            // Connection tabs sit one level above table tabs, and their
+            // shortcuts are the table-tab ones plus ⌥.
+            KeyBinding::new("cmd-alt-]", NextConnection, Some("DbUi")),
+            KeyBinding::new("cmd-alt-[", PrevConnection, Some("DbUi")),
+            KeyBinding::new("cmd-shift-w", CloseConnection, Some("DbUi")),
             KeyBinding::new("cmd-1", SelectTab1, Some("DbUi")),
             KeyBinding::new("cmd-2", SelectTab2, Some("DbUi")),
             KeyBinding::new("cmd-3", SelectTab3, Some("DbUi")),
@@ -105,6 +118,7 @@ pub fn run() {
         let theme_id = prefs.theme.clone();
         let zoom_pct = prefs.zoom_pct;
         let editor_height_px = prefs.sql_editor_height_px;
+        let last_session = last_session.clone();
 
         cx.open_window(options, |window, cx| {
             cx.new(|cx| {
@@ -116,9 +130,23 @@ pub fn run() {
                 view.apply_theme_id(&theme_id);
                 view.apply_zoom_pct(zoom_pct);
                 view.apply_editor_height_px(editor_height_px);
+                let reopen = view.restore_session(&last_session);
                 if let Some(message) = load_error {
                     view.report_startup_error(message);
                 }
+                // Only the tab that was in front dials out. The rest wait to
+                // be clicked -- restoring is not a reason to reach for every
+                // server the user has ever had open.
+                if let Some(id) = reopen {
+                    view.connect(id, cx);
+                }
+                // SQL typed since the last structural change is only in the
+                // editor buffer; this is what gets it to disk.
+                cx.on_app_quit(|view: &mut DbUi, _cx| {
+                    view.persist_session();
+                    async {}
+                })
+                .detach();
                 // Ask GitHub whether there is anything newer. Fire-and-forget:
                 // it resolves into the status-bar chip, and a machine that is
                 // offline never hears about it.
@@ -138,7 +166,13 @@ fn menus() -> Vec<Menu> {
         },
         Menu {
             name: "Connection".into(),
-            items: vec![MenuItem::action("New Connection", NewConnection)],
+            items: vec![
+                MenuItem::action("New Connection", NewConnection),
+                MenuItem::separator(),
+                MenuItem::action("Next Connection", NextConnection),
+                MenuItem::action("Previous Connection", PrevConnection),
+                MenuItem::action("Close Connection", CloseConnection),
+            ],
         },
         Menu {
             name: "View".into(),
@@ -190,6 +224,9 @@ gpui::actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        CloseConnection,
+        NextConnection,
+        PrevConnection,
         SelectTab1,
         SelectTab2,
         SelectTab3,

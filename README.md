@@ -82,6 +82,12 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
   Test button that dials the server without keeping the socket. Saved to
   `~/.config/dbui/connections.json`; passwords are kept in memory only and never
   written.
+- **Connection tabs** — several connections open at once, one tab each in the
+  titlebar, each owning its own table and SQL tabs. Switching puts back what
+  that connection had open; closing a tab closes the socket without forgetting
+  the connection. What was open is restored on the next launch, down to the SQL
+  you were typing — only the tab that was in front reconnects, the rest wait to
+  be clicked.
 - **Schema tree** — schemas and their tables, views and materialised views,
   read from `pg_catalog` / `information_schema`.
 - **Table browser** — click a table for its rows, 500 at a time, with the
@@ -106,6 +112,10 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘E` | Open / focus the SQL editor |
 | `⌘K` | Clear the editor |
 | `⌘[` / `⌘]` | Previous / next page of a table |
+| `⌘W` | Close the table / SQL tab |
+| `⌃⇥` / `⌃⇧⇥` | Next / previous table tab |
+| `⌘⌥[` / `⌘⌥]` | Previous / next connection tab |
+| `⌘⇧W` | Close the connection tab |
 | `Esc` | Close the sheet, dismiss autocomplete, or leave the editor |
 
 ## Layout

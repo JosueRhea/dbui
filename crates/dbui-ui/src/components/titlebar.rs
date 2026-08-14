@@ -4,9 +4,14 @@
 //! surface rather than a chrome bar stuck on top of an app. The left inset
 //! keeps clear of the traffic lights, which are still drawn by the platform.
 //!
-//! Connection switching lives here (not in the sidebar): a compact picker and
-//! dropdown, TablePlus-style. The rest of the bar still owns native chrome —
-//! drag to move, double-click to zoom.
+//! Connection switching lives here (not in the sidebar): one tab per open
+//! connection, TablePlus-style, with a `+` that drops down the list of saved
+//! connections to open. The rest of the bar still owns native chrome — drag to
+//! move, double-click to zoom.
+//!
+//! A tab is an open connection; the dropdown is every connection the user has
+//! saved. Closing a tab therefore does not delete anything, which is why the
+//! `×` and the picker's `✎`/`⏻` are different gestures with different reach.
 
 use super::{caption, dot};
 use crate::root::DbUi;
@@ -21,29 +26,9 @@ use std::rc::Rc;
 
 impl DbUi {
     pub(crate) fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = &self.theme;
         let picker_open = self.connection_picker_open;
-
-        let (label, summary, light) = match self.workspace.active() {
-            Some(entry) => {
-                let light = match &entry.status {
-                    ConnectionStatus::Connected(_) => theme.success,
-                    ConnectionStatus::Connecting => theme.warning,
-                    ConnectionStatus::Failed(_) => theme.danger,
-                    ConnectionStatus::Disconnected => theme.text_faint,
-                };
-                (
-                    SharedString::from(entry.config.name.clone()),
-                    Some(SharedString::from(entry.config.summary())),
-                    light,
-                )
-            }
-            None => (
-                SharedString::from("No connection"),
-                None,
-                theme.text_faint,
-            ),
-        };
+        let tabs = self.render_connection_tabs(cx);
+        let theme = &self.theme;
 
         let should_move = Rc::new(Cell::new(false));
         let should_move_down = should_move.clone();
@@ -66,18 +51,24 @@ impl DbUi {
             .border_color(theme.border)
             .text_color(theme.text_muted)
             .text_size(metrics::text_size_small())
+            .child(tabs)
             .child(
+                // The `+` is the only way to reach a connection that is not
+                // already a tab, so it stays put rather than scrolling away
+                // with the strip when the bar is full.
                 div()
                     .id("connection-picker")
                     .relative()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+                    .justify_center()
+                    .w(px(24.))
+                    .h(px(22.))
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover))
+                    .text_color(theme.text_muted)
+                    .hover(|s| s.bg(theme.hover).text_color(theme.text))
                     .when(picker_open, |s| s.bg(theme.selection))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -86,31 +77,7 @@ impl DbUi {
                             this.toggle_connection_picker(cx);
                         }),
                     )
-                    .child(dot(light))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .max_w(px(280.))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_color(theme.text)
-                                    .child(label),
-                            )
-                            .children(summary.map(|text| {
-                                div()
-                                    .truncate()
-                                    .text_color(theme.text_faint)
-                                    .child(text)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_faint)
-                            .child(if picker_open { "▴" } else { "▾" }),
-                    )
+                    .child("+")
                     .children(picker_open.then(|| self.render_connection_picker(cx))),
             )
             .child(
@@ -151,6 +118,96 @@ impl DbUi {
             )
     }
 
+    /// One tab per open connection, in tab order.
+    ///
+    /// The strip is the only thing here allowed to grow, and it scrolls rather
+    /// than pushing the `+` and the drag area off the end of the bar.
+    fn render_connection_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let active = self.workspace.active_id();
+
+        if self.workspace.open_count() == 0 {
+            return div()
+                .flex()
+                .items_center()
+                .px_2()
+                .flex_shrink_0()
+                .child(caption("No connection open", theme))
+                .into_any_element();
+        }
+
+        let tabs: Vec<AnyElement> = self
+            .workspace
+            .open_entries()
+            .map(|entry| {
+                let id = entry.id();
+                let key = id.0 as usize;
+                let is_active = active == Some(id);
+                let light = status_color(&entry.status, theme);
+                let name = SharedString::from(entry.config.name.clone());
+
+                div()
+                    .id(("connection-tab", key))
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .pl_2()
+                    .pr_1()
+                    .py_1()
+                    .max_w(px(200.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(is_active, |tab| tab.bg(theme.selection))
+                    .when(!is_active, |tab| tab.hover(|s| s.bg(theme.hover)))
+                    .text_color(if is_active {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_connection_tab(id, cx);
+                        }),
+                    )
+                    .child(dot(light))
+                    .child(div().truncate().child(name))
+                    .child(
+                        div()
+                            .id(("connection-tab-close", key))
+                            .px_1()
+                            .text_color(theme.text_faint)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.danger))
+                            // Mouse-down rather than click, to match the tab
+                            // itself -- otherwise the tab activates on the way
+                            // down and only then closes on the way up.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.close_connection_tab(id, cx);
+                                }),
+                            )
+                            .child("×"),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("connection-tabs")
+            .flex()
+            .items_center()
+            .gap_1()
+            .min_w(px(0.))
+            .overflow_x_scroll()
+            .children(tabs)
+            .into_any_element()
+    }
+
     fn render_connection_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let active = self.workspace.active_id();
@@ -169,6 +226,7 @@ impl DbUi {
             for entry in self.workspace.entries() {
                 let id = entry.id();
                 let is_active = active == Some(id);
+                let is_open = self.workspace.is_open(id);
                 let connected = entry.status.is_connected();
                 let light = status_color(&entry.status, theme);
                 let name = SharedString::from(entry.config.name.clone());
@@ -209,6 +267,11 @@ impl DbUi {
                                 )
                                 .child(caption(summary, theme).truncate()),
                         )
+                        // Says which of these already have a tab, so clicking
+                        // one reads as "go there" rather than "open a second".
+                        .when(is_open && !is_active, |row| {
+                            row.child(caption("open", theme))
+                        })
                         .when(connected, |row| {
                             row.child(
                                 div()

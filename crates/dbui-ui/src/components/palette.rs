@@ -40,6 +40,9 @@ enum ActionId {
     ImportTablePlus,
     ConnectActive,
     DisconnectActive,
+    CloseConnection,
+    NextConnection,
+    PrevConnection,
     RefreshCatalog,
     RefreshResult,
     OpenSql,
@@ -124,6 +127,24 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::DisconnectActive,
         label: "Disconnect Active",
         shortcut: None,
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::NextConnection,
+        label: "Next Connection",
+        shortcut: Some("⌘⌥]"),
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::PrevConnection,
+        label: "Previous Connection",
+        shortcut: Some("⌘⌥["),
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::CloseConnection,
+        label: "Close Connection",
+        shortcut: Some("⌘⇧W"),
         section: "Connection",
     },
     ActionDef {
@@ -580,6 +601,11 @@ impl DbUi {
                         .unwrap_or(false)
             }
             ActionId::DisconnectActive | ActionId::RefreshCatalog => connected,
+            ActionId::CloseConnection => has_active,
+            // Nothing to step to with one tab open, or none.
+            ActionId::NextConnection | ActionId::PrevConnection => {
+                self.workspace.open_count() > 1
+            }
             ActionId::RefreshResult => connected && (is_table || is_sql),
             ActionId::RunQuery | ActionId::RunAllQueries | ActionId::ClearSql => is_sql,
             ActionId::ToggleFilters
@@ -625,6 +651,9 @@ impl DbUi {
                     self.disconnect(id, cx);
                 }
             }
+            ActionId::CloseConnection => self.close_active_connection_tab(cx),
+            ActionId::NextConnection => self.cycle_connection_tab(true, cx),
+            ActionId::PrevConnection => self.cycle_connection_tab(false, cx),
             ActionId::RefreshCatalog => self.refresh_catalog(cx),
             ActionId::RefreshResult => self.refresh_result(cx),
             ActionId::OpenSql => self.open_sql_tab(cx),

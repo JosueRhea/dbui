@@ -23,16 +23,33 @@ pub enum StoreError {
     Parse { path: PathBuf, message: String },
 }
 
+/// Environment variable pointing dbui at a different configuration directory.
+pub const CONFIG_DIR_VAR: &str = "DBUI_CONFIG_DIR";
+
+/// `~/.config/dbui` (or the platform equivalent), unless [`CONFIG_DIR_VAR`]
+/// says otherwise.
+///
+/// The override is what lets a second profile exist side by side — and what
+/// keeps the UI tests, which persist a session as they click around, out of
+/// the developer's own configuration.
+pub fn config_dir() -> Result<PathBuf, StoreError> {
+    if let Some(dir) = std::env::var_os(CONFIG_DIR_VAR) {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    let base = dirs::config_dir().ok_or(StoreError::NoConfigDir)?;
+    Ok(base.join("dbui"))
+}
+
 /// `~/.config/dbui/connections.json` (or the platform equivalent).
 pub fn connections_path() -> Result<PathBuf, StoreError> {
-    let base = dirs::config_dir().ok_or(StoreError::NoConfigDir)?;
-    Ok(base.join("dbui").join("connections.json"))
+    Ok(config_dir()?.join("connections.json"))
 }
 
 /// `~/.config/dbui/prefs.json` — UI preferences like the active theme.
 pub fn prefs_path() -> Result<PathBuf, StoreError> {
-    let base = dirs::config_dir().ok_or(StoreError::NoConfigDir)?;
-    Ok(base.join("dbui").join("prefs.json"))
+    Ok(config_dir()?.join("prefs.json"))
 }
 
 /// Window preferences persisted beside connections.
