@@ -21,8 +21,15 @@ impl DbUi {
             let view = self.tabs.active()?.result()?;
             let value = view.set.rows.get(row)?.get(column)?;
             let name = view.set.columns.get(column)?.name.clone();
+            // An underlined value is not much of an affordance on its own, so
+            // the bar says how to open it.
+            let opens = if self.foreign_key_at(row, column).is_some() {
+                "  ·  ⌘↵ or ⌥-click to open"
+            } else {
+                ""
+            };
             Some(SharedString::from(format!(
-                "{name} = {}",
+                "{name} = {}{opens}",
                 value.to_cell(180)
             )))
         });

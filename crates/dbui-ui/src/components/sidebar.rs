@@ -165,6 +165,7 @@ impl DbUi {
     }
 
     pub(crate) fn set_sidebar_cursor(&mut self, item: SidebarItem, cx: &mut Context<Self>) {
+        self.finish_cell_edit(cx);
         self.sidebar_cursor = Some(item);
         self.focus = Focus::Sidebar;
         cx.notify();

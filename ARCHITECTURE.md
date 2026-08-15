@@ -221,6 +221,13 @@ bubble, so the test's `toggle` closed it again) and the schema tree, which
 renders only when a connection is *live* and so had never been painted by any
 test at all.
 
+**A key binding is dispatched before `on_key` ever sees it.** `key_bindings()`
+is shared by `run()` and the test harness for that reason: a shortcut handled
+in both places behaves differently in a window that bound them and a test that
+did not, which is exactly how ⌘↵ came to follow a foreign key in the suite and
+run a query in the app. Installing the real bindings in the tests is what makes
+the two agree.
+
 **The tree is why `open_connected` exists.** SQLite makes a real connection
 available in a unit test — the engine is linked in and the database is a temp
 file — so the surfaces gated on connection status can be reached without a

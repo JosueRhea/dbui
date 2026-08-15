@@ -111,9 +111,11 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 - **New rows** — `+ Row` stages a blank row under the others. Columns left
   reading `DEFAULT` are left out of the `INSERT`, so sequences and column
   defaults still fire. It commits in the same transaction as everything else.
-- **Foreign keys** — a value that references another table is underlined;
-  `⌘↵` (or the right-click menu) opens that table filtered to the row it points
-  at. Composite keys are not offered: one cell is not the whole key.
+- **Foreign keys** — a value that references another table is underlined, and
+  the status bar says how to open it. `⌘↵`, `⌥-click`, or the right-click menu
+  opens that table filtered to the row it points at. A plain click still just
+  selects the cell, because a foreign-key column is an editable column like any
+  other. Composite keys are not offered: one cell is not the whole key.
 - **Copy, paste and duplicate rows** — `⌘C` copies the selected rows as TSV for
   a spreadsheet (or as JSON / `INSERT` statements from the right-click menu),
   and `⌘V` reads that same TSV back in as new staged rows, matching columns by
@@ -165,7 +167,8 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘V` | Paste rows from the clipboard as new rows |
 | `⌘D` | Duplicate the selected rows |
 | `↵` | Edit the selected cell in place |
-| `⌘↵` | Follow the foreign key under the cursor (run, in the editor) |
+| `⌘↵` / `⌥-click` | Follow the foreign key under the cursor (run, in the editor) |
+| `←` / `→` | Move the cell cursor along a row |
 | `⌘F` | Filter the rows of the open table |
 | `⌘N` | New connection |
 | `⌘R` | Refresh the result (or the catalog) |

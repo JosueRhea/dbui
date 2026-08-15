@@ -1145,6 +1145,23 @@ impl DbUi {
         self.load_active_table(cx);
     }
 
+    /// What ⌘↵ means: follow the link under the cursor, or run the statement.
+    ///
+    /// Both the key binding's action and `on_key` route here. They used to
+    /// each have their own idea, and since the action is dispatched first the
+    /// window did one thing while the tests proved the other.
+    pub(crate) fn run_or_follow_link(&mut self, cx: &mut Context<Self>) {
+        if !self.text_undo_has_focus() {
+            if let Some((row, column)) = self.selected_cell {
+                if self.foreign_key_at(row, column).is_some() {
+                    self.follow_foreign_key(row, column, cx);
+                    return;
+                }
+            }
+        }
+        self.run_query(cx);
+    }
+
     pub(crate) fn run_query(&mut self, cx: &mut Context<Self>) {
         let Some(sql) = self.resolve_run_sql() else {
             return;
@@ -1875,6 +1892,25 @@ impl DbUi {
     ) {
         self.close_context_menu(cx);
 
+        // ⌥-click opens what the cell points at. A plain click cannot: an
+        // editable column that happens to be a foreign key still has to be
+        // selectable, copyable and editable like any other.
+        if modifiers.alt {
+            if let Some(column) = column {
+                if self.foreign_key_at(row, column).is_some() {
+                    self.follow_foreign_key(row, column, cx);
+                    return;
+                }
+            }
+        }
+
+        // Clicking away from an open editor commits it, the way a spreadsheet
+        // does. Leaving the box open over a row the user has moved on from is
+        // how an edit gets lost, or lands somewhere it was never typed.
+        if self.editing_cell.is_some() && self.editing_cell != column.map(|c| (row, c)) {
+            self.commit_cell_edit(cx);
+        }
+
         // Shift and ⌘ are choosing a set of rows, not changing which row the
         // detail sidebar is describing — so neither disturbs the open draft.
         if modifiers.shift {
@@ -2207,6 +2243,17 @@ impl DbUi {
         self.detail_input = None;
         self.focus = Focus::Grid;
         cx.notify();
+    }
+
+    /// Commit an open cell editor, if there is one.
+    ///
+    /// Called from every route that moves the focus elsewhere -- another cell,
+    /// a sidebar field, the tree, a menu -- so the editor never outlives the
+    /// thing it was opened on.
+    pub(crate) fn finish_cell_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing_cell.is_some() {
+            self.commit_cell_edit(cx);
+        }
     }
 
     /// Write what was typed back into the draft, which stages it.
@@ -3420,16 +3467,8 @@ impl DbUi {
                     self.discard_pending_edits(cx);
                     return;
                 }
-                // Over the grid, ⌘↵ follows the link under the cursor; in the
-                // editor it is still "run this statement".
-                "enter" if !shift && !self.text_undo_has_focus() => {
-                    if let Some((row, column)) = self.selected_cell {
-                        if self.foreign_key_at(row, column).is_some() {
-                            self.follow_foreign_key(row, column, cx);
-                            return;
-                        }
-                    }
-                    self.run_query(cx);
+                "enter" if !shift => {
+                    self.run_or_follow_link(cx);
                     return;
                 }
                 "enter" if shift => {
@@ -4038,7 +4077,9 @@ impl Render for DbUi {
             }))
             .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| this.open_sql_tab(cx)))
             .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| this.refresh_result(cx)))
-            .on_action(cx.listener(|this, _: &crate::RunQuery, _window, cx| this.run_query(cx)))
+            .on_action(cx.listener(|this, _: &crate::RunQuery, _window, cx| {
+                this.run_or_follow_link(cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::RunAllQueries, _window, cx| this.run_all_queries(cx)),
             )

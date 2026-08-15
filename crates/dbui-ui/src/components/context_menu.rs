@@ -280,6 +280,7 @@ impl DbUi {
         if self.confirm.is_some() {
             return;
         }
+        self.finish_cell_edit(cx);
         self.connection_picker_open = false;
         self.detail_value_menu = None;
         self.context_menu = Some(ContextMenu {

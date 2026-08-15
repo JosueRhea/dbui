@@ -91,6 +91,11 @@ impl DbUi {
     }
 
     pub(crate) fn focus_input(&mut self, target: InputTarget, cx: &mut Context<Self>) {
+        // Moving the keyboard into another box closes the one open over a
+        // grid cell, rather than leaving two editors on screen at once.
+        if target != InputTarget::CellEditor {
+            self.finish_cell_edit(cx);
+        }
         match target {
             InputTarget::WhereDraft => {
                 self.filter_focus = Some(crate::root::FilterFocus::Where);

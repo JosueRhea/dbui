@@ -55,7 +55,14 @@ fn open_with(
 ) -> (Entity<DbUi>, &mut VisualTestContext) {
     redirect_config_dir();
     let runtime = DbRuntime::new().expect("runtime");
-    cx.update(|cx| crate::load_bundled_fonts(cx));
+    cx.update(|cx| {
+        crate::load_bundled_fonts(cx);
+        // The same bindings `run()` installs. Without them a test only ever
+        // reaches `on_key`, while the real window dispatches the action first
+        // -- so a shortcut handled in both places would be tested in the one
+        // place it does not run.
+        cx.bind_keys(crate::key_bindings());
+    });
     cx.add_window_view(|window, cx| {
         let focus = cx.focus_handle();
         window.focus(&focus);
@@ -3752,6 +3759,141 @@ fn a_staged_edit_is_what_the_grid_shows(cx: &mut TestAppContext) {
             tab.staged_edit_for_row(0, &batch).is_none(),
             "and the rows around it are untouched"
         );
+    });
+}
+
+/// Clicking another cell commits the one being edited. Leaving the box open
+/// over a row the user has moved on from is how an edit gets lost.
+#[gpui::test]
+fn clicking_away_commits_the_open_cell_editor(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("renamed");
+
+        // A click on a different row.
+        view.grid_pointer_down(3, Some(1), gpui::Modifiers::default(), cx);
+        assert!(view.editing_cell.is_none(), "the editor closed");
+
+        let batch = view.collect_batch_edits();
+        assert_eq!(batch.len(), 1, "and what was typed was kept");
+        assert_eq!(batch[0].changes[0].new_text, "renamed");
+    });
+}
+
+/// A press anywhere in the window closes it -- not only on another cell. The
+/// handlers on the other surfaces cover the ones that *have* handlers; this is
+/// what covers the tab bar, the empty space beside the grid, and everything
+/// else that does not.
+#[gpui::test]
+fn a_press_anywhere_else_commits_the_cell_editor(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("renamed");
+    });
+    cx.run_until_parked();
+
+    // Far from the grid: the tab bar at the top of the window.
+    cx.simulate_click(gpui::point(gpui::px(400.), gpui::px(30.)), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert!(view.editing_cell.is_none(), "the editor closed");
+        assert_eq!(
+            view.collect_batch_edits()[0].changes[0].new_text,
+            "renamed",
+            "and kept what was typed"
+        );
+    });
+}
+
+/// Clicking the *same* cell keeps editing it, rather than closing and
+/// reopening under the pointer.
+#[gpui::test]
+fn clicking_the_cell_being_edited_keeps_it_open(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.grid_pointer_down(0, Some(1), gpui::Modifiers::default(), cx);
+        assert_eq!(view.editing_cell, Some((0, 1)));
+    });
+}
+
+/// Moving the keyboard into any other box closes it too, or there are two
+/// editors on screen at once.
+#[gpui::test]
+fn focusing_another_field_commits_the_cell_editor(cx: &mut TestAppContext) {
+    use crate::components::text_field::InputTarget;
+
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("via the sidebar");
+        view.focus_input(InputTarget::DetailField(1), cx);
+
+        assert!(view.editing_cell.is_none());
+        assert_eq!(view.collect_batch_edits().len(), 1);
+    });
+}
+
+/// And so does clicking a table in the tree.
+#[gpui::test]
+fn clicking_the_tree_commits_the_cell_editor(cx: &mut TestAppContext) {
+    use crate::root::SidebarItem;
+
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("typed");
+        let connection = view.workspace.entries()[0].id();
+        view.set_sidebar_cursor(
+            SidebarItem::Table {
+                connection,
+                table: TableRef::new("public", "teams"),
+            },
+            cx,
+        );
+        assert!(view.editing_cell.is_none());
+    });
+}
+
+/// ⌥-click opens what a cell points at. A plain click cannot: a foreign-key
+/// column is still an editable column.
+#[gpui::test]
+fn alt_click_follows_a_foreign_key_and_a_plain_click_does_not(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        let before = view.tabs.items.len();
+        view.grid_pointer_down(1, Some(1), gpui::Modifiers::default(), cx);
+        assert_eq!(view.tabs.items.len(), before, "a plain click selects");
+        assert_eq!(view.selected_cell, Some((1, 1)));
+
+        view.grid_pointer_down(1, Some(1), gpui::Modifiers::alt(), cx);
+        assert_eq!(
+            view.tabs.active().and_then(|tab| tab.table_ref()).map(|t| t.qualified()),
+            Some("public.teams".to_string()),
+            "and ⌥ opens it"
+        );
+    });
+}
+
+/// ⌥-click on a column that points nowhere is just a click.
+#[gpui::test]
+fn alt_click_on_an_ordinary_cell_selects_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        let before = view.tabs.items.len();
+        view.grid_pointer_down(2, Some(0), gpui::Modifiers::alt(), cx);
+        assert_eq!(view.tabs.items.len(), before);
+        assert_eq!(view.selected_cell, Some((2, 0)));
     });
 }
 

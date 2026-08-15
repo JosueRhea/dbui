@@ -205,6 +205,16 @@ impl DbUi {
                                             theme,
                                             cx,
                                         ))
+                                        // A press anywhere else closes it and
+                                        // keeps what was typed. Handlers on the
+                                        // other surfaces only cover the ones
+                                        // that have handlers; this covers the
+                                        // rest of the window.
+                                        .on_mouse_down_out(cx.listener(
+                                            |this, _: &MouseDownEvent, _, cx| {
+                                                this.finish_cell_edit(cx);
+                                            },
+                                        ))
                                         .into_any_element();
                                 }
 

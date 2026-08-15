@@ -67,46 +67,7 @@ pub fn run() {
         load_bundled_fonts(cx);
         // Bind before set_menus so the menu bar can show the key equivalents.
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-n", NewConnection, Some("DbUi")),
-            KeyBinding::new("cmd-p", GoToTable, Some("DbUi")),
-            KeyBinding::new("cmd-shift-p", CommandPalette, Some("DbUi")),
-            KeyBinding::new("cmd-shift-t", ChooseTheme, Some("DbUi")),
-            KeyBinding::new("cmd-f", Find, Some("DbUi")),
-            KeyBinding::new("cmd-shift-f", SearchTables, Some("DbUi")),
-            KeyBinding::new("cmd-s", CommitChanges, Some("DbUi")),
-            // ⌘A, ⌘C, ⌘V, ⌘D, ⌘⌫ and ⌘Z are handled in `DbUi::on_key` rather
-            // than bound here: each means something different depending on
-            // which surface has the keyboard — ⌘V pastes rows onto the grid
-            // and text into an editor — and an action would claim them
-            // everywhere.
-            KeyBinding::new("cmd-e", OpenSql, Some("DbUi")),
-            KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
-            KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
-            KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
-            // ⌘W is handled in `DbUi::on_key` so it isn't stolen / double-fired.
-            KeyBinding::new("cmd-shift-]", NextTab, Some("DbUi")),
-            KeyBinding::new("cmd-shift-[", PrevTab, Some("DbUi")),
-            // Connection tabs sit one level above table tabs, and their
-            // shortcuts are the table-tab ones plus ⌥.
-            KeyBinding::new("cmd-alt-]", NextConnection, Some("DbUi")),
-            KeyBinding::new("cmd-alt-[", PrevConnection, Some("DbUi")),
-            KeyBinding::new("cmd-shift-w", CloseConnection, Some("DbUi")),
-            KeyBinding::new("cmd-1", SelectTab1, Some("DbUi")),
-            KeyBinding::new("cmd-2", SelectTab2, Some("DbUi")),
-            KeyBinding::new("cmd-3", SelectTab3, Some("DbUi")),
-            KeyBinding::new("cmd-4", SelectTab4, Some("DbUi")),
-            KeyBinding::new("cmd-5", SelectTab5, Some("DbUi")),
-            KeyBinding::new("cmd-6", SelectTab6, Some("DbUi")),
-            KeyBinding::new("cmd-7", SelectTab7, Some("DbUi")),
-            KeyBinding::new("cmd-8", SelectTab8, Some("DbUi")),
-            KeyBinding::new("cmd-9", SelectTab9, Some("DbUi")),
-            KeyBinding::new("cmd-=", ZoomIn, Some("DbUi")),
-            KeyBinding::new("cmd-+", ZoomIn, Some("DbUi")),
-            KeyBinding::new("cmd--", ZoomOut, Some("DbUi")),
-            KeyBinding::new("cmd-0", ZoomReset, Some("DbUi")),
-        ]);
+        cx.bind_keys(key_bindings());
         cx.set_menus(menus());
 
         let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
@@ -165,6 +126,56 @@ pub fn run() {
         })
         .expect("failed to open window");
     });
+}
+
+/// The key bindings, in one place so the tests can install the same ones.
+///
+/// This matters more than it looks: a binding dispatches an *action*, and an
+/// action is handled before `DbUi::on_key` ever sees the keystroke. A shortcut
+/// that exists in both places therefore behaves differently in the app than in
+/// a test that never bound anything -- which is exactly how ⌘↵ came to follow
+/// a foreign key in the test suite and run a query in the real window.
+pub(crate) fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-n", NewConnection, Some("DbUi")),
+            KeyBinding::new("cmd-p", GoToTable, Some("DbUi")),
+            KeyBinding::new("cmd-shift-p", CommandPalette, Some("DbUi")),
+            KeyBinding::new("cmd-shift-t", ChooseTheme, Some("DbUi")),
+            KeyBinding::new("cmd-f", Find, Some("DbUi")),
+            KeyBinding::new("cmd-shift-f", SearchTables, Some("DbUi")),
+            KeyBinding::new("cmd-s", CommitChanges, Some("DbUi")),
+            // ⌘A, ⌘C, ⌘V, ⌘D, ⌘⌫ and ⌘Z are handled in `DbUi::on_key` rather
+            // than bound here: each means something different depending on
+            // which surface has the keyboard — ⌘V pastes rows onto the grid
+            // and text into an editor — and an action would claim them
+            // everywhere.
+            KeyBinding::new("cmd-e", OpenSql, Some("DbUi")),
+            KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
+            KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
+            KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
+            // ⌘W is handled in `DbUi::on_key` so it isn't stolen / double-fired.
+            KeyBinding::new("cmd-shift-]", NextTab, Some("DbUi")),
+            KeyBinding::new("cmd-shift-[", PrevTab, Some("DbUi")),
+            // Connection tabs sit one level above table tabs, and their
+            // shortcuts are the table-tab ones plus ⌥.
+            KeyBinding::new("cmd-alt-]", NextConnection, Some("DbUi")),
+            KeyBinding::new("cmd-alt-[", PrevConnection, Some("DbUi")),
+            KeyBinding::new("cmd-shift-w", CloseConnection, Some("DbUi")),
+            KeyBinding::new("cmd-1", SelectTab1, Some("DbUi")),
+            KeyBinding::new("cmd-2", SelectTab2, Some("DbUi")),
+            KeyBinding::new("cmd-3", SelectTab3, Some("DbUi")),
+            KeyBinding::new("cmd-4", SelectTab4, Some("DbUi")),
+            KeyBinding::new("cmd-5", SelectTab5, Some("DbUi")),
+            KeyBinding::new("cmd-6", SelectTab6, Some("DbUi")),
+            KeyBinding::new("cmd-7", SelectTab7, Some("DbUi")),
+            KeyBinding::new("cmd-8", SelectTab8, Some("DbUi")),
+            KeyBinding::new("cmd-9", SelectTab9, Some("DbUi")),
+            KeyBinding::new("cmd-=", ZoomIn, Some("DbUi")),
+            KeyBinding::new("cmd-+", ZoomIn, Some("DbUi")),
+            KeyBinding::new("cmd--", ZoomOut, Some("DbUi")),
+            KeyBinding::new("cmd-0", ZoomReset, Some("DbUi")),
+    ]
 }
 
 fn menus() -> Vec<Menu> {
