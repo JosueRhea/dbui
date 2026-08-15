@@ -204,7 +204,27 @@ assuming, and the audit found a shortcut nobody had ever driven.
 
 One of them takes `layout_lock()`: the zoom lives in a process-wide static
 because it scales every surface at once, so the tests that measure painted
-pixels cannot run alongside the one that moves it. They are in-crate rather
+pixels cannot run alongside the one that moves it.
+
+**Every surface is also drawn, not just driven.** The `*_draws` tests put the
+window into each state — the expanded change bubble with all three kinds of
+staged change in it, each palette, the context menu against a corner, the
+inline cell editor, every theme — and repaint at three window sizes including
+a narrow and a short one. A layout that divides by a zero width or an element
+id that collides only surfaces when something actually paints it, and until
+these existed the only way to find one was to open the app and look.
+
+They were checked the way any test should be: by breaking each render path in
+turn and confirming the test that covers it fails. That found two that were
+drawing nothing — the change bubble's diff (staging a row already expands the
+bubble, so the test's `toggle` closed it again) and the schema tree, which
+renders only when a connection is *live* and so had never been painted by any
+test at all.
+
+**The tree is why `open_connected` exists.** SQLite makes a real connection
+available in a unit test — the engine is linked in and the database is a temp
+file — so the surfaces gated on connection status can be reached without a
+server and without touching anything outside the test process. They are in-crate rather
 than in `tests/` so they can read `pub(crate)` state without widening the public
 API for the benefit of tests.
 

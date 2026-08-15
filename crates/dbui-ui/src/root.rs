@@ -1938,6 +1938,49 @@ impl DbUi {
         cx.notify();
     }
 
+    /// ← / → — move the cell cursor along the selected row.
+    ///
+    /// Without this the grid is only half keyboard-drivable: rows can be
+    /// walked but the cell within one can only be reached with the pointer,
+    /// which leaves everything keyed off the selected cell — editing in place,
+    /// following a foreign key — out of reach.
+    pub(crate) fn move_selected_cell(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(view) = self.tabs.active().and_then(|tab| tab.result()) else {
+            return;
+        };
+        let columns = view.set.columns.len();
+        if columns == 0 {
+            return;
+        }
+
+        let row = match self.selected_cell {
+            Some((row, _)) => row,
+            // No cell yet: start at the row the detail sidebar is describing.
+            None => match self.tabs.active().and_then(|tab| tab.selected_row()) {
+                Some(row) => row,
+                None => return,
+            },
+        };
+        let next = match self.selected_cell {
+            Some((_, column)) => {
+                let step = if delta < 0 {
+                    column + columns - 1
+                } else {
+                    column + 1
+                };
+                step % columns
+            }
+            // Arriving from a row selection lands on the first column going
+            // right and the last going left.
+            None if delta < 0 => columns - 1,
+            None => 0,
+        };
+
+        self.selected_cell = Some((row, next));
+        self.focus = Focus::Grid;
+        cx.notify();
+    }
+
     /// ⇧↑ / ⇧↓ — grow the selection a row at a time.
     pub(crate) fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.result_row_count();
@@ -3739,6 +3782,14 @@ impl DbUi {
                 }
                 "down" => {
                     self.move_selected_row(1, cx);
+                    return;
+                }
+                "left" => {
+                    self.move_selected_cell(-1, cx);
+                    return;
+                }
+                "right" => {
+                    self.move_selected_cell(1, cx);
                     return;
                 }
                 _ => {}

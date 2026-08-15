@@ -27,3 +27,14 @@ pub use workspace::{ConnectionEntry, ConnectionStatus, Workspace};
 // keep when there is exactly one crate to import from.
 pub use dbui_domain as domain;
 pub use dbui_driver::{DatabaseDriver, DriverError, RowBatch, RowDelete, RowInsert, RowUpdate};
+
+/// Open a connection directly, without going through a [`DbRuntime`].
+///
+/// The UI never needs this -- every database call it makes goes through the
+/// runtime so a query cannot block a frame. It exists so a test above this
+/// layer can lay down a fixture, which for SQLite needs no server at all.
+pub async fn connect_driver(
+    config: &domain::ConnectionConfig,
+) -> Result<std::sync::Arc<dyn DatabaseDriver>, DriverError> {
+    dbui_driver::connect(config).await
+}

@@ -72,6 +72,10 @@ the typo it usually is, rather than quietly becoming an empty database.
 cargo test
 ```
 
+Nothing here opens a window on your screen or takes over your keyboard: the UI
+tests drive a real GPUI window inside the test process, dispatching real
+keystrokes, mouse events and repaints.
+
 Unit, UI and SQLite tests need nothing running — the SQLite engine is linked
 in, so `crates/dbui-driver/tests/sqlite.rs` exercises a real database file on
 every run. The Postgres and MySQL tests need actual servers and are opt-in:

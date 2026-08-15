@@ -1520,6 +1520,7 @@ dependencies = [
  "gpui",
  "objc",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

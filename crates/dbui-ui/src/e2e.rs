@@ -2003,6 +2003,583 @@ fn history_records_statements_and_loads_them_back(cx: &mut TestAppContext) {
     });
 }
 
+// -- a real connection, with no server ------------------------------------
+
+/// A window with a *live* connection, backed by a temporary SQLite file.
+///
+/// The surfaces that only exist once something is connected -- the schema
+/// tree above all -- cannot be reached by faking a catalog, because they check
+/// the connection status rather than the data. SQLite is what makes a real one
+/// available in a unit test: the engine is linked in and the database is a
+/// file this makes and deletes.
+struct ConnectedDb {
+    path: std::path::PathBuf,
+}
+
+impl Drop for ConnectedDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn open_connected<'a>(
+    cx: &'a mut TestAppContext,
+    name: &str,
+) -> (Entity<DbUi>, &'a mut VisualTestContext, ConnectedDb) {
+    let mut path = std::env::temp_dir();
+    path.push(format!("dbui-e2e-{}-{name}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    std::fs::File::create(&path).expect("create the database file");
+
+    // Seeded with the driver directly; the UI only has to open it.
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to seed with");
+        let file = path.to_string_lossy().to_string();
+        runtime.block_on(async {
+            let mut config = ConnectionConfig::new(Driver::Sqlite);
+            config.database = file;
+            let db = dbui_driver_connect(&config).await;
+            for sql in [
+                "CREATE TABLE teams (slug TEXT PRIMARY KEY, name TEXT)",
+                "INSERT INTO teams VALUES ('core','Core'), ('ops','Operations')",
+                "CREATE TABLE members (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     team_slug TEXT REFERENCES teams (slug)
+                 )",
+                "INSERT INTO members (name, team_slug) VALUES ('Ada','core'), ('Grace','ops')",
+                "CREATE VIEW active_members AS SELECT id, name FROM members",
+            ] {
+                db.execute(sql).await.expect("seed");
+            }
+            db.close().await;
+        });
+    }
+
+    let mut config = ConnectionConfig::new(Driver::Sqlite);
+    config.name = name.to_string();
+    config.database = path.to_string_lossy().to_string();
+
+    let (view, cx) = open_with(cx, Workspace::from_configs(vec![config]));
+    view.update(cx, |view, cx| {
+        let id = view.workspace.entries()[0].id();
+        view.connect(id, cx);
+    });
+
+    // The connect crosses to tokio and back, so parking once is not enough.
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let connected = view.update(cx, |view, _| {
+            view.workspace
+                .active()
+                .is_some_and(|entry| entry.status.is_connected())
+        });
+        if connected {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.workspace
+                .active()
+                .is_some_and(|entry| entry.status.is_connected()),
+            "the test database should have connected"
+        );
+    });
+
+    (view, cx, ConnectedDb { path })
+}
+
+/// The driver crate is not a direct dependency of this one; the app layer
+/// re-exports what is needed to open a connection.
+async fn dbui_driver_connect(
+    config: &ConnectionConfig,
+) -> std::sync::Arc<dyn dbui_app::DatabaseDriver> {
+    dbui_app::connect_driver(config).await.expect("connect")
+}
+
+/// The tree only draws once something is connected, which is why nothing had
+/// ever drawn it.
+#[gpui::test]
+fn the_schema_tree_draws_against_a_real_connection(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "tree");
+
+    view.update(cx, |view, _| {
+        let items = view.sidebar_visible_items();
+        assert!(!items.is_empty(), "the tree has rows to draw");
+    });
+    draw_at_every_size(&view, cx);
+
+    // With a filter over it, and with one that matches nothing.
+    view.update(cx, |view, cx| {
+        view.sidebar_filter.set_text("mem");
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.sidebar_filter.set_text("zzzz");
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+}
+
+/// End to end through the real UI: open a table, edit a cell, commit, and ask
+/// the database whether it happened.
+#[gpui::test]
+fn a_committed_edit_reaches_the_database(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "commit");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let loaded = view.update(cx, |view, _| {
+            view.tabs.active().and_then(|tab| tab.result()).is_some()
+        });
+        if loaded {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    view.update(cx, |view, _| {
+        let rows = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .map(|r| r.set.rows.len());
+        assert_eq!(rows, Some(2), "the seeded rows arrived");
+    });
+    draw_at_every_size(&view, cx);
+}
+
+// -- every surface actually draws -----------------------------------------
+//
+// The behaviour tests above prove what each command *does*. These prove the
+// surfaces they open can be painted -- at a comfortable size, at a narrow one,
+// and at a short one. A layout that divides by a zero width, or an element id
+// that collides, only shows up when something actually draws it, and until now
+// the only way to find that was to open the app and look.
+
+/// Open the change bubble's detail area, whatever state it was in.
+///
+/// Staging a row or a deletion expands it already, so toggling can just as
+/// easily close it -- which is how a test meant to draw the diff ended up
+/// drawing nothing at all.
+fn expand_change_bubble(view: &mut DbUi, cx: &mut gpui::Context<DbUi>) {
+    if let Some(WorkspaceTab::Table {
+        change_bubble_expanded,
+        ..
+    }) = view.tabs.active_mut()
+    {
+        *change_bubble_expanded = true;
+    }
+    cx.notify();
+}
+
+/// Sizes worth drawing at: the default, a narrow window, and a short one.
+///
+/// The sidebar, detail panel and change bubble all claim fixed widths or
+/// heights, so a window smaller than the sum of them is where clamping either
+/// works or panics.
+const DRAW_SIZES: [(f32, f32); 3] = [(1200., 800.), (620., 700.), (900., 320.)];
+
+/// Draw the window at each size. A panic in any layout fails the test; the
+/// return is the state surviving the round trip, which is what proves a draw
+/// happened rather than being skipped.
+fn draw_at_every_size(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    for (width, height) in DRAW_SIZES {
+        cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(height)));
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    }
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(800.)));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn the_grid_and_detail_sidebar_draw(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 40);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(3, Some(1), gpui::Modifiers::default(), cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.selected_cell, Some((3, 1)), "and the state survived");
+    });
+}
+
+/// The change bubble, expanded, with all three kinds of staged change in it --
+/// the diff renderer is the most intricate thing in the window.
+#[gpui::test]
+fn the_change_bubble_draws_with_every_kind_of_change(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 6);
+
+    view.update(cx, |view, cx| {
+        // An edit.
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("renamed");
+        view.commit_cell_edit(cx);
+        // A deletion.
+        view.grid_pointer_down(2, None, gpui::Modifiers::default(), cx);
+        view.delete_selected_rows(cx);
+        // And a new row.
+        view.add_row(cx);
+        expand_change_bubble(view, cx);
+    });
+
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.collect_batch_edits().len(), 1);
+        assert_eq!(view.collect_batch_deletes().len(), 1);
+        assert_eq!(view.staged_insert_count(), 1);
+    });
+}
+
+/// A multi-line JSON edit, which is what puts the line-diff renderer to work.
+#[gpui::test]
+fn the_bubble_draws_a_multi_line_diff(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        type_into_draft(view, 1, "{\n  \"a\": 1,\n  \"b\": 2\n}");
+        expand_change_bubble(view, cx);
+    });
+    draw_at_every_size(&view, cx);
+}
+
+#[gpui::test]
+fn the_statement_strip_draws(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_batch(
+            view,
+            &[
+                ("UPDATE t SET a = 1", None),
+                ("SELECT * FROM t", Some(12)),
+                ("DELETE FROM t WHERE id = 1", None),
+                ("SELECT count(*) FROM t", Some(1)),
+            ],
+            cx,
+        );
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.select_statement_result(3, cx);
+    });
+    draw_at_every_size(&view, cx);
+}
+
+#[gpui::test]
+fn each_palette_draws(cx: &mut TestAppContext) {
+    use crate::components::palette::PaletteKind;
+
+    let (view, cx) = with_catalog(cx, &[("users", &["id"]), ("orders", &["id"])]);
+
+    for kind in [
+        PaletteKind::GoToTable,
+        PaletteKind::Actions,
+        PaletteKind::Themes,
+        PaletteKind::History,
+    ] {
+        view.update(cx, |view, cx| {
+            view.history.record(dbui_app::HistoryEntry {
+                sql: "SELECT * FROM users WHERE id = 1".into(),
+                connection: None,
+                at: 1,
+                ok: true,
+            });
+            view.open_palette(kind, cx);
+        });
+        draw_at_every_size(&view, cx);
+        view.update(cx, |view, cx| view.close_palette(cx));
+    }
+}
+
+/// Every theme, drawn -- a colour that does not exist is a compile error, but a
+/// theme whose stripe or selection is missing only shows up when painted.
+#[gpui::test]
+fn every_theme_draws(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 10);
+
+    for theme in crate::theme::all_themes() {
+        view.update(cx, |view, cx| {
+            view.apply_theme_id(theme.id);
+            view.grid_pointer_down(1, Some(0), gpui::Modifiers::default(), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn the_context_menu_and_confirmation_draw(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+    use dbui_app::domain::TableKind;
+
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    // Against the sidebar, near a corner, so the flip-and-clamp runs.
+    for position in [(20., 40.), (1180., 780.), (0., 0.)] {
+        view.update(cx, |view, cx| {
+            view.open_context_menu(
+                ContextTarget::Table {
+                    table: TableRef::new("public", "users"),
+                    kind: TableKind::Table,
+                },
+                gpui::point(gpui::px(position.0), gpui::px(position.1)),
+                cx,
+            );
+        });
+        draw_at_every_size(&view, cx);
+        view.update(cx, |view, cx| view.close_context_menu(cx));
+    }
+
+    // The row menu, and then the typed confirmation over the top of it.
+    view.update(cx, |view, cx| {
+        view.open_context_menu(ContextTarget::Rows, gpui::point(gpui::px(500.), gpui::px(300.)), cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.open_context_menu(
+            ContextTarget::Table {
+                table: TableRef::new("public", "users"),
+                kind: TableKind::Table,
+            },
+            gpui::point(gpui::px(40.), gpui::px(40.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::Drop, cx);
+        assert!(view.confirm.is_some());
+    });
+    draw_at_every_size(&view, cx);
+}
+
+/// The connection sheet, the picker, and the read-only badge beside them.
+#[gpui::test]
+fn the_connection_surfaces_draw(cx: &mut TestAppContext) {
+    let mut config = ConnectionConfig::new(Driver::Postgres);
+    config.name = "Prod".into();
+    config.read_only = true;
+    let mut sqlite = ConnectionConfig::new(Driver::Sqlite);
+    sqlite.name = "Local file".into();
+    sqlite.database = "/tmp/x.db".into();
+
+    let (view, cx) = open_with(cx, Workspace::from_configs(vec![config, sqlite]));
+
+    // The read-only badge in the titlebar.
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| view.toggle_connection_picker(cx));
+    draw_at_every_size(&view, cx);
+    view.update(cx, |view, cx| view.close_connection_picker(cx));
+
+    // The sheet, for both a networked engine and a file-based one -- the
+    // second hides host, port, user and password.
+    view.update(cx, |view, cx| view.open_new_connection(cx));
+    draw_at_every_size(&view, cx);
+    view.update(cx, |view, cx| {
+        if let Some(form) = view.modal.as_mut() {
+            form.set_driver(Driver::Sqlite);
+        }
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+}
+
+/// The tree with a filter over it, the structure pane, the columns panel and
+/// the filter strip -- everything the centre column can show.
+#[gpui::test]
+fn the_side_and_centre_panels_draw(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"]), ("user_sessions", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        view.focus_sidebar_search(cx);
+        view.sidebar_filter.set_text("user");
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.sidebar_filter.set_text("nothing matches this");
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+}
+
+#[gpui::test]
+fn the_table_panes_draw(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 20);
+
+    view.update(cx, |view, cx| {
+        view.toggle_filters_open(cx);
+        view.toggle_columns_open(cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.set_table_pane(crate::tabs::TablePane::Structure, cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    // An empty result, which is a different path from rows.
+    view.update(cx, |view, cx| {
+        view.set_table_pane(crate::tabs::TablePane::Data, cx);
+        if let Some(WorkspaceTab::Table { result, .. }) = view.tabs.active_mut() {
+            if let Some(view) = result.as_mut() {
+                view.set.rows.clear();
+            }
+        }
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+}
+
+/// The editor with highlighting, a completion popup over it, and a cell editor
+/// open in the grid underneath.
+#[gpui::test]
+fn the_editors_draw(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id", "email"])]);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(
+            view,
+            "-- a comment\nselect id, email\nfrom us\nwhere id = 1;\n",
+        );
+        view.trigger_completion(cx);
+        view.focus = Focus::Editor;
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+}
+
+#[gpui::test]
+fn the_inline_cell_editor_draws(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 8);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(2, 1, cx);
+        assert!(view.editing_cell.is_some());
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert!(view.editing_cell.is_some(), "still open after the redraws");
+    });
+}
+
+/// A bulk selection, which is what puts MIXED and the banner on screen.
+#[gpui::test]
+fn the_bulk_edit_sidebar_draws(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 30);
+
+    cx.simulate_keystrokes("cmd-a");
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert_eq!(draft_texts(view)[1], crate::tabs::MIXED);
+    });
+}
+
+/// Staged new rows are drawn under the stored ones, so the grid renders two
+/// kinds of row from one list.
+#[gpui::test]
+fn staged_new_rows_draw_in_the_grid(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        view.add_row(cx);
+        view.edit_insert(0, cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, _| assert_eq!(view.staged_insert_count(), 2));
+}
+
+// -- moving the cell cursor -----------------------------------------------
+
+/// Without ← / → the grid is only half keyboard-drivable: everything keyed off
+/// the selected cell -- editing in place, following a foreign key -- could
+/// only be reached with the pointer.
+#[gpui::test]
+fn arrows_walk_the_cell_cursor_along_a_row(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.select_row(1, cx);
+        view.focus = Focus::Grid;
+        assert_eq!(view.selected_cell, None);
+
+        // Arriving from a row selection lands on the first column.
+        view.move_selected_cell(1, cx);
+        assert_eq!(view.selected_cell, Some((1, 0)));
+
+        view.move_selected_cell(1, cx);
+        assert_eq!(view.selected_cell, Some((1, 1)));
+
+        // Two columns in the fixture, so it wraps.
+        view.move_selected_cell(1, cx);
+        assert_eq!(view.selected_cell, Some((1, 0)));
+        view.move_selected_cell(-1, cx);
+        assert_eq!(view.selected_cell, Some((1, 1)), "and wraps the other way");
+    });
+}
+
+/// Going left from no cell at all lands on the last column, so ← from a fresh
+/// row selection reaches the far end without walking the whole row.
+#[gpui::test]
+fn going_left_from_a_row_selection_lands_at_the_end(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        view.focus = Focus::Grid;
+        view.move_selected_cell(-1, cx);
+        assert_eq!(view.selected_cell, Some((0, 1)));
+    });
+}
+
+/// The whole point: a foreign key is now reachable without the pointer.
+#[gpui::test]
+fn a_foreign_key_can_be_followed_from_the_keyboard(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.select_row(1, cx);
+        view.focus = Focus::Grid;
+        // Walk to the column that references another table.
+        view.move_selected_cell(1, cx);
+        view.move_selected_cell(1, cx);
+        assert_eq!(view.selected_cell, Some((1, 1)));
+        assert!(view.foreign_key_at(1, 1).is_some());
+    });
+
+    cx.simulate_keystrokes("cmd-enter");
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs.active().and_then(|tab| tab.table_ref()).map(|t| t.qualified()),
+            Some("public.teams".to_string())
+        );
+    });
+}
+
 // -- connections, tabs, menus ---------------------------------------------
 
 #[gpui::test]

@@ -23,3 +23,7 @@ objc = "0.2"
 # on macOS.
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# Test-only: laying down a SQLite fixture needs somewhere to await the driver.
+# The crate itself has no async runtime -- every database call it makes goes
+# through `DbRuntime`, which is the point.
+tokio = { workspace = true }
