@@ -110,8 +110,13 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 - **Foreign keys** — a value that references another table is underlined;
   `⌘↵` (or the right-click menu) opens that table filtered to the row it points
   at. Composite keys are not offered: one cell is not the whole key.
-- **Copy out** — `⌘C` copies the selected rows as TSV for a spreadsheet, or as
-  JSON or `INSERT` statements from the right-click menu.
+- **Copy, paste and duplicate rows** — `⌘C` copies the selected rows as TSV for
+  a spreadsheet (or as JSON / `INSERT` statements from the right-click menu),
+  and `⌘V` reads that same TSV back in as new staged rows, matching columns by
+  name so rows move between tables that share them. `⌘D` duplicates the
+  selection directly, leaving keys the table can generate for it to fill in.
+  All three stage rows rather than writing them, so `⌘S` still commits and
+  `⌘Z` still discards.
 - **Query history** — every statement run is kept and searchable with `⌘⇧H`;
   picking one loads it back into the editor rather than running it.
 - **Read-only connections** — a per-connection switch that refuses every write
@@ -153,6 +158,8 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘⇧F` | Search the schema tree |
 | `⌘⇧H` | Query history |
 | `⌘C` | Copy the selected rows as TSV |
+| `⌘V` | Paste rows from the clipboard as new rows |
+| `⌘D` | Duplicate the selected rows |
 | `↵` | Edit the selected cell in place |
 | `⌘↵` | Follow the foreign key under the cursor (run, in the editor) |
 | `⌘F` | Filter the rows of the open table |

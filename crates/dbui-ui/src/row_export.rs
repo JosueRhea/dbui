@@ -172,6 +172,96 @@ pub fn sql_literal(value: &Value) -> String {
     }
 }
 
+/// Rows read back off the clipboard.
+pub struct PastedRows {
+    /// The header line: column names, in the order the cells come in.
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Parse tab-separated text back into rows.
+///
+/// The exact inverse of [`tsv`], including its quoting: a cell holding a tab
+/// or a newline was written quoted, and has to be read back as one cell rather
+/// than as the start of a new column or row. `None` when the text is not
+/// shaped like a table at all.
+pub fn parse_tsv(text: &str) -> Option<PastedRows> {
+    let mut records = split_records(text);
+    if records.len() < 2 {
+        // A header and at least one row. A lone line is a value someone
+        // copied from somewhere else, not a table.
+        return None;
+    }
+
+    let columns = records.remove(0);
+    if columns.iter().all(|name| name.trim().is_empty()) {
+        return None;
+    }
+
+    let width = columns.len();
+    let mut rows = Vec::with_capacity(records.len());
+    for mut record in records {
+        // A spreadsheet often drops trailing empty cells; a record with more
+        // cells than headers is something else entirely and is refused rather
+        // than silently misaligned.
+        if record.len() > width {
+            return None;
+        }
+        record.resize(width, String::new());
+        rows.push(record);
+    }
+
+    if rows.is_empty() {
+        return None;
+    }
+    Some(PastedRows { columns, rows })
+}
+
+/// Split TSV text into records of fields, honouring quoted cells.
+fn split_records(text: &str) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == '"' {
+                // A doubled quote inside a quoted cell is one quote.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' if field.is_empty() => quoted = true,
+            '\t' => record.push(std::mem::take(&mut field)),
+            '\n' => {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            }
+            '\r' => {}
+            other => field.push(other),
+        }
+    }
+
+    // Whatever is left over is the last record, unless the text ended on a
+    // newline and there is nothing after it.
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    records
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +374,66 @@ mod tests {
     fn a_result_with_no_table_still_produces_a_statement() {
         let out = inserts(&columns(&["a"]), &[vec![Value::Int(1)]], Driver::MySql, None);
         assert_eq!(out, "INSERT INTO `table` (`a`) VALUES (1);\n");
+    }
+
+    // -- reading rows back ------------------------------------------------
+
+    /// The property that matters: whatever copy writes, paste reads back.
+    #[test]
+    fn tsv_round_trips_through_the_clipboard() {
+        let columns = columns(&["id", "name", "note"]);
+        let values = vec![
+            vec![
+                Value::Int(1),
+                Value::Text("Ada".into()),
+                Value::Text("two\tparts".into()),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Null,
+                Value::Text("two\nlines".into()),
+            ],
+        ];
+
+        let written = tsv(&columns, &values);
+        let read = parse_tsv(&written).expect("it reads back");
+
+        assert_eq!(read.columns, vec!["id", "name", "note"]);
+        assert_eq!(read.rows[0], vec!["1", "Ada", "two\tparts"]);
+        assert_eq!(
+            read.rows[1],
+            vec!["2", "", "two\nlines"],
+            "a NULL comes back as the empty cell it was written as"
+        );
+    }
+
+    #[test]
+    fn a_quote_inside_a_cell_survives_the_round_trip() {
+        let written = tsv(&columns(&["note"]), &[vec![Value::Text("say \"hi\"".into())]]);
+        let read = parse_tsv(&written).expect("reads back");
+        assert_eq!(read.rows[0][0], "say \"hi\"");
+    }
+
+    /// A spreadsheet often drops trailing empty cells.
+    #[test]
+    fn a_short_row_is_padded_to_the_header() {
+        let read = parse_tsv("a\tb\tc\n1\t2\n").expect("reads back");
+        assert_eq!(read.rows[0], vec!["1", "2", ""]);
+    }
+
+    /// More cells than headers is something other than a table, and pasting it
+    /// would put values under the wrong columns.
+    #[test]
+    fn a_row_wider_than_the_header_is_refused() {
+        assert!(parse_tsv("a\tb\n1\t2\t3\n").is_none());
+    }
+
+    /// One line is a value copied from somewhere else, not a table.
+    #[test]
+    fn a_single_line_is_not_a_table() {
+        assert!(parse_tsv("just some text").is_none());
+        assert!(parse_tsv("").is_none());
+        assert!(parse_tsv("a\tb\n").is_none(), "a header with no rows");
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub enum MenuAction {
     DeleteRows,
     AddRow,
     FollowForeignKey,
+    DuplicateRows,
+    PasteRows,
 }
 
 impl MenuAction {
@@ -155,6 +157,14 @@ fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
                 label: RowFormat::Insert.label().into(),
             },
             MenuRow::Separator,
+            MenuRow::Item {
+                action: MenuAction::PasteRows,
+                label: "Paste Rows".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::DuplicateRows,
+                label: "Duplicate Rows".into(),
+            },
             MenuRow::Item {
                 action: MenuAction::AddRow,
                 label: "New Row".into(),
@@ -354,6 +364,8 @@ impl DbUi {
             (_, MenuAction::CopyRowsJson) => self.copy_selected_rows(RowFormat::Json, cx),
             (_, MenuAction::CopyRowsInsert) => self.copy_selected_rows(RowFormat::Insert, cx),
             (_, MenuAction::AddRow) => self.add_row(cx),
+            (_, MenuAction::DuplicateRows) => self.duplicate_selected_rows(cx),
+            (_, MenuAction::PasteRows) => self.paste_rows(cx),
             (_, MenuAction::FollowForeignKey) => {
                 if let Some((row, column)) = self.selected_cell {
                     self.follow_foreign_key(row, column, cx);

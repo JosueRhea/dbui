@@ -2368,6 +2368,197 @@ impl DbUi {
         cx.notify();
     }
 
+    /// Stage a copy of every selected row.
+    ///
+    /// The copies land as new rows under the others and are committed with the
+    /// rest of the batch, so a duplicate can be edited — or discarded — before
+    /// anything reaches the server.
+    pub(crate) fn duplicate_selected_rows(&mut self, cx: &mut Context<Self>) {
+        self.stash_current_draft(cx);
+
+        // Duplicating the staged row that is open is the obvious reading of
+        // ⌘D while filling one in.
+        if let Some(index) = self.tabs.active().and_then(|tab| tab.editing_insert()) {
+            self.duplicate_staged_insert(index, cx);
+            return;
+        }
+
+        let Some(WorkspaceTab::Table {
+            result: Some(view),
+            selection,
+            ..
+        }) = self.tabs.active()
+        else {
+            self.status = Status::info("Duplicating needs a table tab");
+            cx.notify();
+            return;
+        };
+
+        let rows = selection.ordered();
+        if rows.is_empty() {
+            self.status = Status::info("Select a row to duplicate");
+            cx.notify();
+            return;
+        }
+
+        let columns = view.set.columns.clone();
+        let structure = view.structure.clone();
+        let copies: Vec<crate::tabs::PendingRowInsert> = rows
+            .iter()
+            .filter_map(|row| view.set.rows.get(*row))
+            .map(|values| {
+                crate::tabs::PendingRowInsert::duplicating(&columns, &structure, &values.0)
+            })
+            .collect();
+
+        let count = copies.len();
+        self.stage_inserts(copies, cx);
+        let plural = if count == 1 { "row" } else { "rows" };
+        self.status = Status::info(format!("{count} {plural} duplicated — ⌘S to commit"));
+        cx.notify();
+    }
+
+    /// ⌘D while a staged row is open: copy that one.
+    fn duplicate_staged_insert(&mut self, index: usize, cx: &mut Context<Self>) {
+        let copy = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                pending_inserts,
+                result: Some(view),
+                ..
+            }) => pending_inserts.get(index).map(|row| {
+                let mut copy =
+                    crate::tabs::PendingRowInsert::blank(&view.set.columns, &view.structure);
+                for (slot, (_, input, _)) in copy.fields.iter_mut().zip(row.fields.iter()) {
+                    slot.1 = crate::text_input::TextInput::with_text(input.text().to_string(), true);
+                }
+                copy
+            }),
+            _ => None,
+        };
+        let Some(copy) = copy else { return };
+        self.stage_inserts(vec![copy], cx);
+        self.status = Status::info("Row duplicated — ⌘S to commit");
+        cx.notify();
+    }
+
+    /// Add staged rows and open the first for editing.
+    fn stage_inserts(
+        &mut self,
+        rows: Vec<crate::tabs::PendingRowInsert>,
+        cx: &mut Context<Self>,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let Some(WorkspaceTab::Table {
+            pending_inserts,
+            editing_insert,
+            selection,
+            draft,
+            selected_row,
+            change_bubble_expanded,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+        let first = pending_inserts.len();
+        pending_inserts.extend(rows);
+        *editing_insert = Some(first);
+        *change_bubble_expanded = true;
+        selection.clear();
+        *selected_row = None;
+        *draft = None;
+
+        self.detail_open = true;
+        self.detail_input = None;
+        self.focus = Focus::Detail;
+        cx.notify();
+    }
+
+    /// Stage rows read off the clipboard.
+    ///
+    /// The inverse of ⌘C: columns are matched by the header names it wrote, so
+    /// rows copied out of one table paste into another that shares column
+    /// names. Anything the clipboard names that this table does not have is
+    /// ignored rather than refused — pasting three of five columns is a
+    /// reasonable thing to want.
+    pub(crate) fn paste_rows(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.status = Status::info("Nothing on the clipboard");
+            cx.notify();
+            return;
+        };
+
+        let Some(pasted) = crate::row_export::parse_tsv(&text) else {
+            self.status = Status::info("The clipboard does not hold rows copied from a table");
+            cx.notify();
+            return;
+        };
+
+        let Some(WorkspaceTab::Table {
+            result: Some(view), ..
+        }) = self.tabs.active()
+        else {
+            self.status = Status::info("Pasting rows needs a table tab");
+            cx.notify();
+            return;
+        };
+        let columns = view.set.columns.clone();
+        let structure = view.structure.clone();
+
+        // Match by name, case-insensitively as a fallback -- a spreadsheet
+        // round trip often changes the case of a header.
+        let matched: Vec<Option<String>> = pasted
+            .columns
+            .iter()
+            .map(|name| {
+                columns
+                    .iter()
+                    .find(|column| column.name == *name)
+                    .or_else(|| {
+                        columns
+                            .iter()
+                            .find(|column| column.name.eq_ignore_ascii_case(name))
+                    })
+                    .map(|column| column.name.clone())
+            })
+            .collect();
+
+        if matched.iter().all(Option::is_none) {
+            self.status =
+                Status::error("None of those column names are in this table".to_string());
+            cx.notify();
+            return;
+        }
+
+        let staged: Vec<crate::tabs::PendingRowInsert> = pasted
+            .rows
+            .iter()
+            .map(|cells| {
+                let mut row = crate::tabs::PendingRowInsert::blank(&columns, &structure);
+                for (cell, column) in cells.iter().zip(matched.iter()) {
+                    if let Some(column) = column {
+                        row.set_from_text(column, cell);
+                    }
+                }
+                row
+            })
+            .collect();
+
+        let count = staged.len();
+        let ignored = matched.iter().filter(|column| column.is_none()).count();
+        self.stage_inserts(staged, cx);
+
+        let plural = if count == 1 { "row" } else { "rows" };
+        self.status = Status::info(if ignored > 0 {
+            format!("Pasted {count} {plural} — {ignored} column(s) ignored")
+        } else {
+            format!("Pasted {count} {plural} — ⌘S to commit")
+        });
+        cx.notify();
+    }
+
     /// Open one of the staged inserts in the detail sidebar.
     pub(crate) fn edit_insert(&mut self, index: usize, cx: &mut Context<Self>) {
         self.stash_current_draft(cx);
@@ -3167,10 +3358,18 @@ impl DbUi {
                     self.delete_selected_rows(cx);
                     return;
                 }
-                // ⌘C over the grid copies rows; inside an editor it is still
-                // "copy the selected text".
+                // ⌘C / ⌘V over the grid copy and paste *rows*; inside an
+                // editor they are still the text operations they always were.
                 "c" if !self.text_undo_has_focus() => {
                     self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx);
+                    return;
+                }
+                "v" if !self.text_undo_has_focus() => {
+                    self.paste_rows(cx);
+                    return;
+                }
+                "d" if !self.text_undo_has_focus() => {
+                    self.duplicate_selected_rows(cx);
                     return;
                 }
                 // Unshifted only: ⌘⇧Z is redo, and a staged batch has nothing
@@ -3741,6 +3940,12 @@ impl Render for DbUi {
             .on_action(cx.listener(|this, _: &crate::DeleteRows, _window, cx| {
                 this.delete_selected_rows(cx)
             }))
+            .on_action(cx.listener(|this, _: &crate::DuplicateRows, _window, cx| {
+                this.duplicate_selected_rows(cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &crate::PasteRows, _window, cx| this.paste_rows(cx)),
+            )
             .on_action(cx.listener(|this, _: &crate::DiscardChanges, _window, cx| {
                 this.discard_pending_edits(cx)
             }))

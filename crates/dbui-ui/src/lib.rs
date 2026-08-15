@@ -76,10 +76,10 @@ pub fn run() {
             KeyBinding::new("cmd-f", Find, Some("DbUi")),
             KeyBinding::new("cmd-shift-f", SearchTables, Some("DbUi")),
             KeyBinding::new("cmd-s", CommitChanges, Some("DbUi")),
-            // ⌘A, ⌘⌫ and ⌘Z are handled in `DbUi::on_key` rather than bound
-            // here: each means something different depending on which surface
-            // has the keyboard — ⌘Z discards the staged batch on the grid and
-            // undoes typing in an editor — and an action would claim them
+            // ⌘A, ⌘C, ⌘V, ⌘D, ⌘⌫ and ⌘Z are handled in `DbUi::on_key` rather
+            // than bound here: each means something different depending on
+            // which surface has the keyboard — ⌘V pastes rows onto the grid
+            // and text into an editor — and an action would claim them
             // everywhere.
             KeyBinding::new("cmd-e", OpenSql, Some("DbUi")),
             KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
@@ -201,6 +201,8 @@ fn menus() -> Vec<Menu> {
             name: "Edit".into(),
             items: vec![
                 MenuItem::action("Select All Rows", SelectAllRows),
+                MenuItem::action("Duplicate Selected Rows", DuplicateRows),
+                MenuItem::action("Paste Rows", PasteRows),
                 MenuItem::action("Delete Selected Rows", DeleteRows),
                 MenuItem::separator(),
                 MenuItem::action("Commit Changes", CommitChanges),
@@ -241,6 +243,8 @@ gpui::actions!(
         CommitChanges,
         SelectAllRows,
         DeleteRows,
+        DuplicateRows,
+        PasteRows,
         DiscardChanges,
         OpenSql,
         Refresh,

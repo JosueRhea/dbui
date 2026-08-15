@@ -1988,6 +1988,194 @@ fn history_records_statements_and_loads_them_back(cx: &mut TestAppContext) {
     });
 }
 
+// -- duplicate, copy, paste -----------------------------------------------
+
+/// ⌘D stages a copy of each selected row. The key is left for the table to
+/// generate, so the copy gets its own identity rather than clashing.
+#[gpui::test]
+fn cmd_d_duplicates_the_selected_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, None, gpui::Modifiers::default(), cx);
+        view.grid_pointer_down(2, None, gpui::Modifiers::shift(), cx);
+    });
+    cx.simulate_keystrokes("cmd-d");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.staged_insert_count(), 2, "one copy per selected row");
+
+        let staged = view.collect_batch_inserts().expect("parses");
+        // `id` is a lone integer key: left out so the sequence fires.
+        for row in &staged {
+            assert!(
+                !row.values.iter().any(|(column, _)| column == "id"),
+                "the generated key is left for the table"
+            );
+        }
+        assert_eq!(
+            staged[0].values[0],
+            ("name".to_string(), dbui_app::domain::Value::Text("row 2".into())),
+            "and the rest of the row is copied"
+        );
+    });
+}
+
+/// A key the table cannot generate is copied instead, so the clash is visible
+/// in the sidebar rather than only at commit time.
+#[gpui::test]
+fn duplicating_copies_a_key_the_table_cannot_generate(cx: &mut TestAppContext) {
+    use dbui_app::domain::{Column, ColumnInfo, Value};
+
+    let structure = vec![Column {
+        name: "slug".into(),
+        data_type: "text".into(),
+        nullable: false,
+        default: None,
+        is_primary_key: true,
+        ordinal: 1,
+        references: None,
+    }];
+    let columns = vec![ColumnInfo {
+        name: "slug".into(),
+        type_name: "text".into(),
+    }];
+
+    let row = crate::tabs::PendingRowInsert::duplicating(
+        &columns,
+        &structure,
+        &[Value::Text("alpha".into())],
+    );
+    assert_eq!(
+        row.to_values().expect("parses"),
+        vec![("slug".to_string(), Value::Text("alpha".into()))],
+        "a natural key is copied, not dropped"
+    );
+    let _ = cx;
+}
+
+/// ⌘V is the exact inverse of ⌘C: rows copied out come back in as new ones.
+#[gpui::test]
+fn copied_rows_paste_back_as_new_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        view.grid_pointer_down(1, None, gpui::Modifiers::shift(), cx);
+    });
+    cx.simulate_keystrokes("cmd-c");
+    cx.simulate_keystrokes("cmd-v");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.staged_insert_count(), 2);
+        let staged = view.collect_batch_inserts().expect("parses");
+        // Paste is faithful: it writes back exactly what was copied, key and
+        // all. ⌘D is the one that knows to leave the key out.
+        let names: Vec<String> = staged
+            .iter()
+            .flat_map(|row| row.values.iter())
+            .filter(|(column, _)| column == "name")
+            .map(|(_, value)| value.to_text())
+            .collect();
+        assert_eq!(names, vec!["row 1", "row 2"]);
+    });
+}
+
+/// Text that is not a table is refused rather than staged as nonsense.
+#[gpui::test]
+fn pasting_something_that_is_not_a_table_says_so(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("just some notes".into()));
+    });
+    view.update(cx, |view, cx| {
+        view.paste_rows(cx);
+        assert_eq!(view.staged_insert_count(), 0);
+        assert!(
+            describe(&view.status).contains("does not hold rows"),
+            "got: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// Columns the table does not have are ignored rather than refused: pasting
+/// three of five columns is a reasonable thing to want.
+#[gpui::test]
+fn pasting_ignores_columns_this_table_does_not_have(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "name	elsewhere
+Katherine	ignored
+".into(),
+        ));
+    });
+    view.update(cx, |view, cx| {
+        view.paste_rows(cx);
+        let staged = view.collect_batch_inserts().expect("parses");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].values.len(), 1, "only the column that matched");
+        assert_eq!(staged[0].values[0].0, "name");
+        assert!(
+            describe(&view.status).contains("ignored"),
+            "and it says one was dropped: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// None of the names matching is a paste into the wrong table, and worth
+/// refusing outright.
+#[gpui::test]
+fn pasting_rows_from_an_unrelated_table_is_refused(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "alpha	beta
+1	2
+".into(),
+        ));
+    });
+    view.update(cx, |view, cx| {
+        view.paste_rows(cx);
+        assert_eq!(view.staged_insert_count(), 0);
+        assert!(
+            describe(&view.status).contains("column names"),
+            "got: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// ⌘C and ⌘V inside an editor are still the text operations they always were.
+#[gpui::test]
+fn copy_and_paste_in_the_editor_are_still_text(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select 1");
+        view.focus = Focus::Editor;
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-c");
+    cx.simulate_keystrokes("cmd-v");
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            sql_editor_text(view),
+            "select 1",
+            "the editor's own copy and paste ran, not the grid's"
+        );
+        assert_eq!(view.staged_insert_count(), 0);
+    });
+}
+
 // -- foreign keys ---------------------------------------------------------
 
 /// A cell on a foreign key knows where it points; one that is not does not.

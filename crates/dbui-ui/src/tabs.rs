@@ -151,6 +151,45 @@ impl PendingRowInsert {
         }
     }
 
+    /// A copy of an existing row, ready to be staged as a new one.
+    ///
+    /// Key columns the table can supply itself are left reading `DEFAULT` so
+    /// the sequence fires and the copy gets its own identity. A key the table
+    /// *cannot* generate is copied instead, so the clash is visible in the
+    /// sidebar and fixable before the commit rather than after it.
+    pub fn duplicating(
+        columns: &[ColumnInfo],
+        structure: &[Column],
+        values: &[Value],
+    ) -> Self {
+        let generated = generated_key_columns(structure);
+        let mut row = Self::blank(columns, structure);
+        for (index, (name, input, _)) in row.fields.iter_mut().enumerate() {
+            if generated.iter().any(|key| key == name) {
+                continue;
+            }
+            if let Some(value) = values.get(index) {
+                *input = TextInput::with_text(value_editor_text(value), true);
+            }
+        }
+        row
+    }
+
+    /// Set one column from text read off the clipboard.
+    ///
+    /// An empty cell is a NULL, because that is what [`crate::row_export`]
+    /// writes one as -- there is no way to say "use the default" in TSV.
+    pub fn set_from_text(&mut self, column: &str, text: &str) {
+        if let Some((_, input, _)) = self
+            .fields
+            .iter_mut()
+            .find(|(name, _, _)| name == column)
+        {
+            let value = if text.is_empty() { "NULL" } else { text };
+            *input = TextInput::with_text(value.to_string(), true);
+        }
+    }
+
     /// The columns to actually write.
     ///
     /// Fields still reading `DEFAULT` are dropped rather than sent: naming a
@@ -187,6 +226,28 @@ impl PendingRowInsert {
 }
 
 pub const DEFAULT_TOKEN: &str = "DEFAULT";
+
+/// Key columns the table can fill in by itself on an INSERT.
+///
+/// A column with a default has one outright (`nextval(...)`). Beyond that, a
+/// lone integer primary key is generated on all three engines -- `serial`,
+/// `AUTO_INCREMENT` and SQLite's rowid alias -- and none of them reports that
+/// the same way, so the shape is what says so rather than a flag.
+pub fn generated_key_columns(structure: &[Column]) -> Vec<String> {
+    let keys: Vec<&Column> = structure.iter().filter(|c| c.is_primary_key).collect();
+    keys.iter()
+        .filter(|column| {
+            let has_default = column
+                .default
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let lone_integer = keys.len() == 1
+                && matches!(Value::prototype_for(&column.data_type), Value::Int(_));
+            has_default || lone_integer
+        })
+        .map(|column| column.name.clone())
+        .collect()
+}
 
 fn one_line_value(text: &str) -> String {
     let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
@@ -1839,5 +1900,55 @@ mod tests {
 
         draft.reset(&view);
         assert!(draft.to_pending_batch(&view, &[]).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+
+    fn key(name: &str, data_type: &str, default: Option<&str>) -> Column {
+        Column {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable: false,
+            default: default.map(str::to_string),
+            is_primary_key: true,
+            ordinal: 1,
+            references: None,
+        }
+    }
+
+    /// A serial key has a default outright.
+    #[test]
+    fn a_key_with_a_default_is_generated() {
+        let structure = vec![key("id", "bigint", Some("nextval('s'::regclass)"))];
+        assert_eq!(generated_key_columns(&structure), vec!["id".to_string()]);
+    }
+
+    /// MySQL's AUTO_INCREMENT and SQLite's rowid alias report no default at
+    /// all, so the shape is what says the engine will fill it in.
+    #[test]
+    fn a_lone_integer_key_is_generated_even_with_no_default() {
+        let structure = vec![key("id", "INTEGER", None)];
+        assert_eq!(generated_key_columns(&structure), vec!["id".to_string()]);
+    }
+
+    /// A text key is one the user chose, and nothing will invent another.
+    #[test]
+    fn a_natural_key_is_not_generated() {
+        let structure = vec![key("slug", "text", None)];
+        assert!(generated_key_columns(&structure).is_empty());
+    }
+
+    /// Neither half of a composite key is generated: there is no sequence
+    /// behind a two-column key on any of the three engines.
+    #[test]
+    fn a_composite_key_is_not_generated() {
+        let mut tenant = key("tenant", "int", None);
+        tenant.ordinal = 1;
+        let mut id = key("id", "int", None);
+        id.ordinal = 2;
+        assert!(generated_key_columns(&[tenant, id]).is_empty());
     }
 }

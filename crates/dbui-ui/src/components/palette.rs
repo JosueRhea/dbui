@@ -76,6 +76,8 @@ enum ActionId {
     ZoomOut,
     ZoomReset,
     ShowHistory,
+    DuplicateRows,
+    PasteRows,
 }
 
 struct ActionDef {
@@ -232,6 +234,18 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::DeleteRows,
         label: "Delete Selected Rows",
         shortcut: Some("⌘⌫"),
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::DuplicateRows,
+        label: "Duplicate Selected Rows",
+        shortcut: Some("⌘D"),
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::PasteRows,
+        label: "Paste Rows",
+        shortcut: Some("⌘V"),
         section: "Rows",
     },
     ActionDef {
@@ -728,6 +742,16 @@ impl DbUi {
                 .and_then(|tab| tab.result())
                 .is_some_and(|view| !view.set.rows.is_empty()),
             ActionId::ClearSort => self.active_sort().is_some(),
+            ActionId::DuplicateRows => {
+                is_table
+                    && self
+                        .tabs
+                        .active()
+                        .is_some_and(|tab| !tab.selection().is_empty())
+            }
+            // Enabled whenever the tab could take rows; whether the clipboard
+            // actually holds any is answered when it is read.
+            ActionId::PasteRows => is_table,
             ActionId::CommitChanges | ActionId::DiscardChanges => {
                 !self.collect_batch_edits().is_empty() || !self.collect_batch_deletes().is_empty()
             }
@@ -802,6 +826,8 @@ impl DbUi {
             }
             ActionId::ClearSort => self.clear_sort(cx),
             ActionId::ShowHistory => self.open_palette(PaletteKind::History, cx),
+            ActionId::DuplicateRows => self.duplicate_selected_rows(cx),
+            ActionId::PasteRows => self.paste_rows(cx),
             ActionId::CommitChanges => self.save_pending_edits(cx),
             ActionId::DiscardChanges => self.discard_pending_edits(cx),
             ActionId::ToggleFilters => self.toggle_filters_open(cx),
