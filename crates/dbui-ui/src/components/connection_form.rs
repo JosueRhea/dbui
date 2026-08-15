@@ -178,6 +178,10 @@ impl ConnectionForm {
     }
 
     /// Whether the sheet is showing a complaint rather than a result.
+    ///
+    /// The renderer reads `message` directly for its colour; this exists so a
+    /// test can ask the question without the field being public.
+    #[cfg(test)]
     pub fn has_problem(&self) -> bool {
         matches!(self.message, Some((false, _)))
     }
