@@ -184,6 +184,7 @@ impl DbUi {
                                 };
                                 let is_selected = this.selected_cell == Some((index, column));
                                 let editing = this.editing_cell == Some((index, column));
+                                let links = this.foreign_key_at(index, column).is_some();
 
                                 if editing {
                                     return div()
@@ -228,6 +229,12 @@ impl DbUi {
                                     })
                                     .when(pending.is_some(), |cell| {
                                         cell.text_color(theme.success)
+                                    })
+                                    // A value that points at another table is
+                                    // underlined, the way a link is anywhere
+                                    // else.
+                                    .when(links && pending.is_none(), |cell| {
+                                        cell.underline().text_color(theme.value_structured)
                                     })
                                     // A row on its way out is drawn as one:
                                     // struck through, in the colour the change

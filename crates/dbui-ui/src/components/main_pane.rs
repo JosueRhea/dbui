@@ -125,6 +125,7 @@ impl DbUi {
                 .flex_col()
                 .overflow_hidden()
                 .child(self.render_editor(cx))
+                .child(self.render_statement_strip(cx))
                 .child(self.render_grid(window, cx))
                 .into_any_element(),
             WorkspaceTab::Table { pane, .. } => match pane {
@@ -140,6 +141,85 @@ impl DbUi {
                     .into_any_element(),
             },
         }
+    }
+
+    /// One chip per statement of the last run.
+    ///
+    /// Hidden for a single statement: a strip with one entry is chrome that
+    /// says nothing.
+    fn render_statement_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let Some(WorkspaceTab::Sql {
+            results,
+            active_result,
+            ..
+        }) = self.tabs.active()
+        else {
+            return div().into_any_element();
+        };
+        if results.len() < 2 {
+            return div().into_any_element();
+        }
+        let active = *active_result;
+
+        let chips: Vec<AnyElement> = results
+            .iter()
+            .enumerate()
+            .map(|(index, statement)| {
+                let selected = index == active;
+                let empty = statement.rows.is_none() && index != active;
+                div()
+                    .id(("statement-chip", index))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .h(px(22.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .flex_shrink_0()
+                    .bg(if selected { theme.selection } else { theme.elevated })
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .border_1()
+                    .border_color(if selected { theme.accent } else { theme.border })
+                    .hover(|chip| chip.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.select_statement_result(index, cx);
+                    }))
+                    .child(SharedString::from(statement.label(index)))
+                    // A statement that returned no rows says so, so a chip
+                    // opening an empty grid is not a surprise.
+                    .when(empty, |chip| {
+                        chip.child(
+                            div()
+                                .text_size(px(9.))
+                                .text_color(theme.text_faint)
+                                .child("·"),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("statement-strip")
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .flex_shrink_0()
+            .overflow_x_scroll()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .text_size(metrics::text_size_small())
+            .children(chips)
+            .into_any_element()
     }
 
     fn render_structure(&mut self, _cx: &mut Context<Self>) -> AnyElement {

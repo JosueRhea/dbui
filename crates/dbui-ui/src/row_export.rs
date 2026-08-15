@@ -161,7 +161,7 @@ fn inserts(
 /// than binding it -- the output is text for a human to read and run, not a
 /// statement this app executes. Quotes are still doubled, so a pasted string
 /// cannot end its own literal.
-fn sql_literal(value: &Value) -> String {
+pub fn sql_literal(value: &Value) -> String {
     match value {
         Value::Null | Value::Default => "NULL".to_string(),
         Value::Bool(flag) => if *flag { "TRUE" } else { "FALSE" }.to_string(),

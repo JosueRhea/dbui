@@ -115,6 +115,20 @@ impl TableRef {
     }
 }
 
+/// One column's reference to another table.
+///
+/// Only single-column keys are carried. A composite foreign key cannot be
+/// followed from one cell -- the value in front of the user is one part of a
+/// key, and jumping on it would land on rows that merely share that part.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKey {
+    /// The column on this table.
+    pub column: String,
+    pub references: TableRef,
+    /// The column on the referenced table.
+    pub references_column: String,
+}
+
 /// One column of a table, as the structure pane lists it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
@@ -125,6 +139,9 @@ pub struct Column {
     pub default: Option<String>,
     pub is_primary_key: bool,
     pub ordinal: i32,
+    /// Where this column points, when it is a single-column foreign key.
+    #[serde(default)]
+    pub references: Option<ForeignKey>,
 }
 
 #[cfg(test)]

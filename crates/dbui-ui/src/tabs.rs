@@ -197,6 +197,33 @@ fn one_line_value(text: &str) -> String {
     }
 }
 
+/// One statement of a run, and what came back.
+///
+/// Kept even when it produced no rows: "3 rows affected" is a result, and a
+/// batch where the interesting statement is the UPDATE in the middle is
+/// exactly the batch this exists for.
+pub struct StatementResult {
+    pub sql: String,
+    pub rows: Option<ResultView>,
+    /// The one-line verdict, shown on the tab and in the status bar.
+    pub summary: String,
+}
+
+impl StatementResult {
+    /// A short label for the strip: `1 SELECT`, `2 UPDATE`, …
+    pub fn label(&self, index: usize) -> String {
+        let verb: String = self
+            .sql
+            .split_whitespace()
+            .next()
+            .unwrap_or("SQL")
+            .chars()
+            .take(8)
+            .collect();
+        format!("{} {}", index + 1, verb.to_uppercase())
+    }
+}
+
 /// Which result rows are selected, and where a range grows from.
 ///
 /// The anchor is the last row picked deliberately, which is not the same as
@@ -635,6 +662,13 @@ pub enum WorkspaceTab {
         id: TabId,
         load_seq: u64,
         editor: TextInput,
+        /// Every statement of the last run, in order, with what it produced.
+        /// Run-all used to keep only the last row-producing result and throw
+        /// the rest away; these are what the strip above the grid selects
+        /// between.
+        results: Vec<StatementResult>,
+        /// Which of `results` the grid is showing.
+        active_result: usize,
         result: Option<ResultView>,
         selected_row: Option<usize>,
         selection: RowSelection,
@@ -677,6 +711,8 @@ impl WorkspaceTab {
             id,
             load_seq: 0,
             editor: TextInput::new(true),
+            results: Vec::new(),
+            active_result: 0,
             result: None,
             selected_row: None,
             selection: RowSelection::default(),
@@ -1388,6 +1424,7 @@ mod tests {
                 default: None,
                 is_primary_key: true,
                 ordinal: 1,
+                references: None,
             }],
         )
     }
@@ -1536,6 +1573,7 @@ mod tests {
                 default: None,
                 is_primary_key: true,
                 ordinal: 1,
+                references: None,
             }],
         )
     }

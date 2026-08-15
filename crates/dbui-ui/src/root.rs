@@ -13,7 +13,7 @@ use crate::tabs::{RowDraft, Tabs, WorkspaceTab};
 use crate::theme::{metrics, Theme};
 use dbui_app::commands;
 use dbui_app::domain::{
-    Catalog, Column, ConnectionId, Page, QueryOutcome, QueryResult, ResultSet, TableRef,
+    Catalog, Column, ConnectionId, Page, QueryOutcome, ResultSet, TableRef,
 };
 use dbui_app::{
     session, store, ConnectionStatus, DbRuntime, RowUpdate, SavedConnectionTab, Session, Workspace,
@@ -246,6 +246,8 @@ pub struct DbUi {
     pub(crate) context_menu: Option<ContextMenu>,
     /// A destructive action waiting on the user typing the table's name.
     pub(crate) confirm: Option<ConfirmPrompt>,
+    /// Every statement run, newest first. Loaded once at launch.
+    pub(crate) history: dbui_app::History,
 }
 
 /// Starting height of the diff area, and the range the drag is allowed.
@@ -329,6 +331,9 @@ impl DbUi {
             column_drag: None,
             context_menu: None,
             confirm: None,
+            history: dbui_app::history::history_path()
+                .map(|path| dbui_app::history::load(&path))
+                .unwrap_or_default(),
         }
     }
 
@@ -1155,6 +1160,21 @@ impl DbUi {
         self.dispatch_statements(statements, cx);
     }
 
+    /// Put a statement from the history into the editor, ready to run.
+    ///
+    /// Loaded rather than run: a statement pulled out of history is one the
+    /// user wants to look at before it goes anywhere, and some of them are the
+    /// DELETE that made them open the history in the first place.
+    pub(crate) fn put_sql_in_editor(&mut self, sql: &str, cx: &mut Context<Self>) {
+        self.open_sql_tab(cx);
+        if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
+            *editor = crate::text_input::TextInput::with_text(sql.to_string(), true);
+        }
+        self.focus = Focus::Editor;
+        self.status = Status::info("Loaded from history — ⌘↵ to run");
+        cx.notify();
+    }
+
     /// Open or refresh the SQL autocomplete popup at the caret.
     pub(crate) fn trigger_completion(&mut self, cx: &mut Context<Self>) {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
@@ -1275,10 +1295,50 @@ impl DbUi {
         }
     }
 
+    /// Add statements to the history and write it out.
+    ///
+    /// Recorded when they are *sent*, not when they land: a statement that
+    /// errored is often the one most worth getting back, and one that never
+    /// returns is worth seeing too. The outcome is folded in when it arrives.
+    fn record_history(&mut self, statements: &[String]) {
+        let connection = self.workspace.active_id();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        for sql in statements {
+            self.history.record(dbui_app::HistoryEntry {
+                sql: sql.clone(),
+                connection,
+                at,
+                ok: true,
+            });
+        }
+        // A history that cannot be written is not worth a message over the
+        // query the user is actually looking at.
+        let _ = dbui_app::history::history_path()
+            .and_then(|path| dbui_app::history::save(&path, &self.history));
+    }
+
+    /// Mark the most recent history entry as having failed.
+    fn record_history_failure(&mut self, sql: &str) {
+        if let Some(entry) = self
+            .history
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sql == sql)
+        {
+            entry.ok = false;
+        }
+        let _ = dbui_app::history::history_path()
+            .and_then(|path| dbui_app::history::save(&path, &self.history));
+    }
+
     fn dispatch_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
         if statements.is_empty() {
             return;
         }
+        self.record_history(&statements);
 
         let Some(driver) = self.workspace.active_driver() else {
             self.status = Status::error("Not connected");
@@ -1295,6 +1355,7 @@ impl DbUi {
         self.loads_in_flight = self.loads_in_flight.saturating_add(1);
         self.status = Status::busy("Running…");
 
+        let failed_sql = statements.clone();
         let task = commands::run_queries(&self.runtime, driver, statements);
         cx.spawn(async move |this, cx| {
             let landed = task.await;
@@ -1307,6 +1368,9 @@ impl DbUi {
                             this.absorb_batch_result(tab_id, batch, is_active);
                         }
                         Some(Err(error)) if is_current && is_active => {
+                            if let Some(sql) = failed_sql.first() {
+                                this.record_history_failure(sql);
+                            }
                             this.status = Status::error(error.to_string());
                         }
                         _ => {}
@@ -1319,6 +1383,12 @@ impl DbUi {
         .detach();
     }
 
+    /// Keep every statement's result, not just the last row-producing one.
+    ///
+    /// Run-all used to discard all but the last grid, which made a batch whose
+    /// interesting statement was in the middle unreadable. Each one becomes an
+    /// entry in the strip above the grid; the first that produced rows is put
+    /// in front, because that is usually the one being looked for.
     fn absorb_batch_result(
         &mut self,
         tab_id: crate::tabs::TabId,
@@ -1326,60 +1396,133 @@ impl DbUi {
         is_active: bool,
     ) {
         let summary = batch.summary();
-        if let Some(result) = batch.last_rows {
-            self.absorb_query_result(tab_id, result, is_active);
-            if is_active && batch.results.len() > 1 {
-                self.status = Status::info(summary);
-            }
-            return;
-        }
+        let statements: Vec<crate::tabs::StatementResult> = batch
+            .results
+            .into_iter()
+            .map(|result| {
+                let sql = result.statement.clone();
+                let one_line = result.summary();
+                let rows = match result.outcome {
+                    QueryOutcome::Rows(set) => Some(ResultView::new(
+                        set,
+                        ResultSource::Query { sql: sql.clone() },
+                        one_line.clone(),
+                        Vec::new(),
+                    )),
+                    QueryOutcome::Affected(_) => None,
+                };
+                crate::tabs::StatementResult {
+                    sql,
+                    rows,
+                    summary: one_line,
+                }
+            })
+            .collect();
 
-        // No row-producing statement: keep any existing grid, surface the
-        // batch / last affected summary on the status bar.
+        let front = statements
+            .iter()
+            .position(|statement| statement.rows.is_some())
+            .unwrap_or(0);
+        let produced_rows = statements.iter().any(|statement| statement.rows.is_some());
+        let count = statements.len();
+
+        if let Some(WorkspaceTab::Sql {
+            results,
+            active_result,
+            selected_row,
+            selection,
+            draft,
+            ..
+        }) = self.tabs.get_mut(tab_id)
+        {
+            *results = statements;
+            *active_result = front;
+            *selected_row = None;
+            selection.clear();
+            *draft = None;
+        }
+        self.show_statement_result(tab_id, front);
+
         if is_active {
-            self.status = Status::info(summary);
+            self.status = if produced_rows && count == 1 {
+                Status::Idle
+            } else {
+                Status::info(summary)
+            };
+            if produced_rows {
+                self.focus = Focus::Grid;
+            }
         }
     }
 
-    fn absorb_query_result(
+    #[cfg(test)]
+    pub(crate) fn absorb_batch_result_for_test(
         &mut self,
         tab_id: crate::tabs::TabId,
-        result: QueryResult,
+        batch: commands::BatchQueryResult,
         is_active: bool,
     ) {
-        let sql = result.statement.clone();
-        let summary = result.summary();
-        match result.outcome {
-            QueryOutcome::Rows(set) => {
-                if let Some(WorkspaceTab::Sql {
-                    result: tab_result,
-                    selected_row,
-                    selection,
-                    draft,
-                    ..
-                }) = self.tabs.get_mut(tab_id)
-                {
-                    *selected_row = None;
-                    selection.clear();
-                    *draft = None;
-                    *tab_result = Some(ResultView::new(
-                        set,
-                        ResultSource::Query { sql },
-                        summary.clone(),
-                        Vec::new(),
-                    ));
-                }
-                if is_active {
-                    self.focus = Focus::Grid;
-                    self.status = Status::Idle;
-                }
-            }
-            QueryOutcome::Affected(_) => {
-                if is_active {
-                    self.status = Status::info(summary);
+        self.absorb_batch_result(tab_id, batch, is_active);
+    }
+
+    /// Put one statement's rows in the grid.
+    pub(crate) fn show_statement_result(&mut self, tab_id: crate::tabs::TabId, index: usize) {
+        let Some(WorkspaceTab::Sql {
+            results,
+            active_result,
+            result,
+            selected_row,
+            selection,
+            draft,
+            ..
+        }) = self.tabs.get_mut(tab_id)
+        else {
+            return;
+        };
+        if index >= results.len() {
+            *result = None;
+            return;
+        }
+        *active_result = index;
+        *selected_row = None;
+        selection.clear();
+        *draft = None;
+        // Moved out of the list and back rather than cloned: a result set can
+        // be thousands of rows and only one is on screen at a time. Exactly
+        // one of `results[active].rows` and `result` holds it; the caller
+        // hands the old one back before asking for a new one.
+        *result = results[index].rows.take();
+    }
+
+    /// Select a statement from the strip above the grid.
+    pub(crate) fn select_statement_result(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.tabs.active_id() else {
+            return;
+        };
+        // The grid currently owns one of the results; hand it back first.
+        if let Some(WorkspaceTab::Sql {
+            results,
+            active_result,
+            result,
+            ..
+        }) = self.tabs.get_mut(tab_id)
+        {
+            if let Some(slot) = results.get_mut(*active_result) {
+                if slot.rows.is_none() {
+                    slot.rows = result.take();
                 }
             }
         }
+        self.show_statement_result(tab_id, index);
+        // Saying what the selected statement did is the whole reason the
+        // strip keeps the ones that returned no rows.
+        if let Some(WorkspaceTab::Sql { results, .. }) = self.tabs.get_mut(tab_id) {
+            if let Some(statement) = results.get(index) {
+                let summary = statement.summary.clone();
+                self.status = Status::info(summary);
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn refresh_result(&mut self, cx: &mut Context<Self>) {
@@ -1907,6 +2050,70 @@ impl DbUi {
             *change_bubble_expanded = true;
         }
         Ok(staged)
+    }
+
+    // -- following a foreign key --------------------------------------------
+
+    /// Where the cell at `(row, column)` points, if anywhere.
+    pub(crate) fn foreign_key_at(
+        &self,
+        row: usize,
+        column: usize,
+    ) -> Option<(dbui_app::domain::ForeignKey, dbui_app::domain::Value)> {
+        let view = self.tabs.active()?.result()?;
+        let info = view.set.columns.get(column)?;
+        let key = view
+            .structure
+            .iter()
+            .find(|meta| meta.name == info.name)?
+            .references
+            .clone()?;
+        let value = view.set.rows.get(row)?.get(column)?.clone();
+        // A null reference points at nothing, which is not a row to open.
+        if value.is_null() {
+            return None;
+        }
+        Some((key, value))
+    }
+
+    /// Open the referenced table, filtered to the row this cell points at.
+    ///
+    /// A filter rather than a jump to an offset: the referenced row is
+    /// somewhere in a table that may have millions of rows, and the only thing
+    /// known about it is its key.
+    pub(crate) fn follow_foreign_key(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        let Some((key, value)) = self.foreign_key_at(row, column) else {
+            return;
+        };
+
+        let Some(driver) = self.active_driver_kind() else {
+            self.status = Status::error("Not connected");
+            cx.notify();
+            return;
+        };
+        let predicate = format!(
+            "{} = {}",
+            driver.quote_identifier(&key.references_column),
+            crate::row_export::sql_literal(&value)
+        );
+
+        let target = key.references.clone();
+        self.open_table_tab(target.clone(), cx);
+        if let Some(WorkspaceTab::Table {
+            where_clause,
+            where_draft,
+            filters_open,
+            page,
+            ..
+        }) = self.tabs.active_mut()
+        {
+            *where_clause = predicate.clone();
+            *where_draft = crate::text_input::TextInput::with_text(predicate, false);
+            *filters_open = true;
+            page.offset = 0;
+        }
+        self.status = Status::info(format!("Following {} → {}", key.column, target.qualified()));
+        self.load_active_table(cx);
     }
 
     // -- editing a cell in place --------------------------------------------
@@ -2928,6 +3135,10 @@ impl DbUi {
                     self.open_palette(PaletteKind::Themes, cx);
                     return;
                 }
+                "h" if shift => {
+                    self.open_palette(PaletteKind::History, cx);
+                    return;
+                }
                 "p" => {
                     self.open_palette(PaletteKind::GoToTable, cx);
                     return;
@@ -2966,6 +3177,18 @@ impl DbUi {
                 // to redo — so it falls through rather than discarding twice.
                 "z" if !shift && !self.text_undo_has_focus() => {
                     self.discard_pending_edits(cx);
+                    return;
+                }
+                // Over the grid, ⌘↵ follows the link under the cursor; in the
+                // editor it is still "run this statement".
+                "enter" if !shift && !self.text_undo_has_focus() => {
+                    if let Some((row, column)) = self.selected_cell {
+                        if self.foreign_key_at(row, column).is_some() {
+                            self.follow_foreign_key(row, column, cx);
+                            return;
+                        }
+                    }
+                    self.run_query(cx);
                     return;
                 }
                 "enter" if shift => {

@@ -32,6 +32,33 @@ pub const CONFIG_DIR_VAR: &str = "DBUI_CONFIG_DIR";
 /// The override is what lets a second profile exist side by side — and what
 /// keeps the UI tests, which persist a session as they click around, out of
 /// the developer's own configuration.
+/// Write a file by renaming a sibling temp file over it.
+///
+/// A plain write truncates before it fills, so anything reading -- or a crash
+/// -- during that window sees half a file. A rename on the same filesystem is
+/// atomic, so a reader gets one whole version or the other and never a torn
+/// one. Shared by the session and the history, both of which are rewritten
+/// often enough for that window to matter.
+pub fn write_atomic(path: &Path, text: &str) -> Result<(), StoreError> {
+    let write_error = |path: &Path, error: std::io::Error| StoreError::Write {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| write_error(parent, error))?;
+    }
+
+    // The pid keeps two processes from renaming each other's half-written file
+    // into place.
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&temp, text).map_err(|error| write_error(&temp, error))?;
+    std::fs::rename(&temp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        write_error(path, error)
+    })
+}
+
 pub fn config_dir() -> Result<PathBuf, StoreError> {
     if let Some(dir) = std::env::var_os(CONFIG_DIR_VAR) {
         if !dir.is_empty() {

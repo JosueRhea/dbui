@@ -140,28 +140,11 @@ pub fn load(path: &Path) -> Session {
 /// closing. A rename on the same filesystem is atomic, so a reader gets either
 /// the old session or the new one and never a torn one.
 pub fn save(path: &Path, session: &Session) -> Result<(), StoreError> {
-    let write_error = |path: &Path, error: std::io::Error| StoreError::Write {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    };
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| write_error(parent, error))?;
-    }
-
     let text = serde_json::to_string_pretty(session).map_err(|error| StoreError::Write {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-
-    // The pid keeps two processes from renaming each other's half-written file
-    // into place.
-    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temp, text).map_err(|error| write_error(&temp, error))?;
-    std::fs::rename(&temp, path).map_err(|error| {
-        let _ = std::fs::remove_file(&temp);
-        write_error(path, error)
-    })
+    crate::store::write_atomic(path, &text)
 }
 
 #[cfg(test)]

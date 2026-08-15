@@ -51,6 +51,32 @@ pub const COLUMNS: &str = "
      ORDER BY ORDINAL_POSITION
 ";
 
+/// Single-column foreign keys on one table.
+///
+/// The `HAVING count(*) = 1` is the composite-key filter: a key spanning two
+/// columns cannot be followed from the one cell the user clicked.
+pub const FOREIGN_KEYS: &str = "
+    SELECT k.COLUMN_NAME            AS column_name,
+           k.REFERENCED_TABLE_SCHEMA AS ref_schema,
+           k.REFERENCED_TABLE_NAME   AS ref_table,
+           k.REFERENCED_COLUMN_NAME  AS ref_column
+      FROM information_schema.KEY_COLUMN_USAGE k
+      JOIN (
+             SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME
+               FROM information_schema.KEY_COLUMN_USAGE
+              WHERE TABLE_SCHEMA = ?
+                AND TABLE_NAME = ?
+                AND REFERENCED_TABLE_NAME IS NOT NULL
+              GROUP BY CONSTRAINT_SCHEMA, CONSTRAINT_NAME
+             HAVING count(*) = 1
+           ) single
+        ON single.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA
+       AND single.CONSTRAINT_NAME = k.CONSTRAINT_NAME
+     WHERE k.TABLE_SCHEMA = ?
+       AND k.TABLE_NAME = ?
+       AND k.REFERENCED_TABLE_NAME IS NOT NULL
+";
+
 pub const SERVER_VERSION: &str = "SELECT VERSION()";
 
 /// `information_schema.TABLES.TABLE_TYPE` -> the domain's [`TableKind`].

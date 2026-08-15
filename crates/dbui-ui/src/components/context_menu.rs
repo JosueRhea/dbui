@@ -46,6 +46,7 @@ pub enum MenuAction {
     CopyRowsInsert,
     DeleteRows,
     AddRow,
+    FollowForeignKey,
 }
 
 impl MenuAction {
@@ -136,6 +137,11 @@ impl ConfirmPrompt {
 fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
     match target {
         ContextTarget::Rows => vec![
+            MenuRow::Item {
+                action: MenuAction::FollowForeignKey,
+                label: "Go to Referenced Row".into(),
+            },
+            MenuRow::Separator,
             MenuRow::Item {
                 action: MenuAction::CopyRowsTsv,
                 label: RowFormat::Tsv.label().into(),
@@ -348,6 +354,11 @@ impl DbUi {
             (_, MenuAction::CopyRowsJson) => self.copy_selected_rows(RowFormat::Json, cx),
             (_, MenuAction::CopyRowsInsert) => self.copy_selected_rows(RowFormat::Insert, cx),
             (_, MenuAction::AddRow) => self.add_row(cx),
+            (_, MenuAction::FollowForeignKey) => {
+                if let Some((row, column)) = self.selected_cell {
+                    self.follow_foreign_key(row, column, cx);
+                }
+            }
             (_, MenuAction::DeleteRows) => self.delete_selected_rows(cx),
 
             (ContextTarget::Table { table, .. }, MenuAction::OpenTable) => {
@@ -389,10 +400,15 @@ impl DbUi {
     }
 
     /// The engine of the active connection, for quoting.
+    ///
+    /// Falls back to the saved config when nothing is connected: which engine
+    /// a connection is for is known the moment it is saved, and quoting an
+    /// identifier should not need a live socket.
     pub(crate) fn active_driver_kind(&self) -> Option<dbui_app::domain::Driver> {
         self.workspace
             .active_driver()
             .map(|driver| driver.driver())
+            .or_else(|| self.workspace.active().map(|entry| entry.config.driver))
     }
 
     pub(crate) fn copy_to_clipboard(

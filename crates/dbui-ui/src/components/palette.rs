@@ -13,6 +13,8 @@ pub enum PaletteKind {
     GoToTable,
     Actions,
     Themes,
+    /// Statements run before, newest first.
+    History,
 }
 
 pub struct Palette {
@@ -73,6 +75,7 @@ enum ActionId {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ShowHistory,
 }
 
 struct ActionDef {
@@ -250,6 +253,12 @@ const ACTIONS: &[ActionDef] = &[
         section: "Rows",
     },
     ActionDef {
+        id: ActionId::ShowHistory,
+        label: "Query History…",
+        shortcut: Some("⌘⇧H"),
+        section: "Query",
+    },
+    ActionDef {
         id: ActionId::ClearSort,
         label: "Clear Sort",
         shortcut: None,
@@ -314,6 +323,8 @@ const ACTIONS: &[ActionDef] = &[
 
 enum PaletteRow {
     Table(TableRef),
+    /// `(sql, whether it succeeded)`
+    History { sql: String, ok: bool },
     Action {
         id: ActionId,
         enabled: bool,
@@ -328,6 +339,7 @@ impl PaletteRow {
     fn section(&self) -> &'static str {
         match self {
             PaletteRow::Table(_) => "Tables",
+            PaletteRow::History { .. } => "History",
             PaletteRow::Theme { .. } => "Themes",
             PaletteRow::Action { id, .. } => ACTIONS
                 .iter()
@@ -621,6 +633,15 @@ impl DbUi {
                     enabled: self.action_enabled(action.id),
                 })
                 .collect(),
+            PaletteKind::History => self
+                .history
+                .search(&query)
+                .into_iter()
+                .map(|entry| PaletteRow::History {
+                    sql: entry.sql.clone(),
+                    ok: entry.ok,
+                })
+                .collect(),
             PaletteKind::Themes => crate::theme::all_themes()
                 .iter()
                 .filter(|theme| {
@@ -655,6 +676,7 @@ impl DbUi {
             | ActionId::ImportTablePlus
             | ActionId::GoToTable
             | ActionId::SearchTables
+            | ActionId::ShowHistory
             | ActionId::FocusSidebar
             | ActionId::ChangeTheme
             | ActionId::OpenSql
@@ -731,6 +753,11 @@ impl DbUi {
             PaletteRow::Theme { id, .. } => {
                 self.commit_theme_id(id, cx);
             }
+            PaletteRow::History { sql, .. } => {
+                let sql = sql.clone();
+                self.close_palette(cx);
+                self.put_sql_in_editor(&sql, cx);
+            }
         }
     }
 
@@ -774,6 +801,7 @@ impl DbUi {
                 self.copy_selected_rows(crate::row_export::RowFormat::Insert, cx)
             }
             ActionId::ClearSort => self.clear_sort(cx),
+            ActionId::ShowHistory => self.open_palette(PaletteKind::History, cx),
             ActionId::CommitChanges => self.save_pending_edits(cx),
             ActionId::DiscardChanges => self.discard_pending_edits(cx),
             ActionId::ToggleFilters => self.toggle_filters_open(cx),
@@ -812,6 +840,7 @@ impl DbUi {
             PaletteKind::GoToTable => "Search tables…",
             PaletteKind::Actions => "Type a command…",
             PaletteKind::Themes => "Search themes…",
+            PaletteKind::History => "Search history…",
         };
 
         let rows = self.palette_rows(kind);
@@ -832,6 +861,7 @@ impl DbUi {
                     }
                 }
                 PaletteKind::Actions => "No matching actions",
+                PaletteKind::History => "Nothing run yet",
                 PaletteKind::Themes => "No matching themes",
             };
             vec![div()
@@ -898,6 +928,27 @@ impl DbUi {
                                 }
                                 this.close_palette(cx);
                                 this.run_action(action_id, cx);
+                            }),
+                        )
+                    }
+                    PaletteRow::History { sql, ok } => {
+                        // One line, however many the statement has: the
+                        // palette is a list, and a twelve-line query would
+                        // push everything else off it.
+                        let label = SharedString::from(one_line(sql));
+                        let target = sql.clone();
+                        palette_row(
+                            index,
+                            is_sel,
+                            true,
+                            command_mark(if *ok { theme.text_muted } else { theme.danger })
+                                .into_any_element(),
+                            label,
+                            (!*ok).then_some("failed"),
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                this.close_palette(cx);
+                                this.put_sql_in_editor(&target, cx);
                             }),
                         )
                     }
@@ -1028,6 +1079,16 @@ impl DbUi {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// A statement flattened onto one line for the list.
+fn one_line(sql: &str) -> String {
+    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 120 {
+        format!("{}…", flat.chars().take(120).collect::<String>())
+    } else {
+        flat
     }
 }
 

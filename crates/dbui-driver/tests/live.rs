@@ -943,6 +943,70 @@ both_engines!(a_failing_insert_rolls_the_batch_back, |fx: Fixture| async move {
     );
 });
 
+// The introspection SQL for foreign keys is the kind of thing only a real
+// server can prove parses -- and the composite-key filter only a real one with
+// a composite key can prove works.
+both_engines!(foreign_keys_are_read_for_single_column_references, |fx: Fixture| async move {
+    let child = fx.table("orders");
+    let parent = fx.people();
+    let child_sql = child.quoted(fx.driver());
+    let parent_sql = parent.quoted(fx.driver());
+
+    fx.execute(&format!(
+        "CREATE TABLE {child_sql} (
+             id        bigint PRIMARY KEY,
+             person_id bigint NOT NULL,
+             FOREIGN KEY (person_id) REFERENCES {parent_sql} (id)
+         )"
+    ))
+    .await
+    .expect("create child");
+
+    let columns = fx.columns(&child).await.expect("columns");
+    let person = columns
+        .iter()
+        .find(|column| column.name == "person_id")
+        .expect("person_id");
+    let key = person.references.as_ref().expect("it references people");
+    assert_eq!(key.column, "person_id");
+    assert_eq!(key.references.name, parent.name);
+    assert_eq!(key.references_column, "id");
+
+    let id = columns.iter().find(|column| column.name == "id").unwrap();
+    assert!(id.references.is_none(), "a plain key points nowhere");
+});
+
+// A composite foreign key cannot be followed from one cell, so it is not
+// reported at all -- the value on screen is only part of the key.
+both_engines!(a_composite_foreign_key_is_not_reported, |fx: Fixture| async move {
+    let parent = fx.table("pairs");
+    let child = fx.table("pair_refs");
+    let parent_sql = parent.quoted(fx.driver());
+    let child_sql = child.quoted(fx.driver());
+
+    fx.execute(&format!(
+        "CREATE TABLE {parent_sql} (a bigint, b bigint, PRIMARY KEY (a, b))"
+    ))
+    .await
+    .expect("create parent");
+    fx.execute(&format!(
+        "CREATE TABLE {child_sql} (
+             id bigint PRIMARY KEY,
+             a  bigint NOT NULL,
+             b  bigint NOT NULL,
+             FOREIGN KEY (a, b) REFERENCES {parent_sql} (a, b)
+         )"
+    ))
+    .await
+    .expect("create child");
+
+    let columns = fx.columns(&child).await.expect("columns");
+    assert!(
+        columns.iter().all(|column| column.references.is_none()),
+        "a two-column key is not followable from one cell"
+    );
+});
+
 both_engines!(closing_is_idempotent, |fx: Fixture| async move {
     fx.close().await;
     fx.close().await;

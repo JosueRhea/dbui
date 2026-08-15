@@ -98,6 +98,7 @@ mod tests {
             default: None,
             is_primary_key: false,
             ordinal: 0,
+            references: None,
         }
     }
 

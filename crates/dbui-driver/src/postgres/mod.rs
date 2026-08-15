@@ -9,7 +9,8 @@ use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, Page, QueryOutcome,
-    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef,
+    ForeignKey, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey,
+    Table, TableRef,
     TlsMode, Value,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -91,6 +92,32 @@ impl PostgresDriver {
     }
 }
 
+impl PostgresDriver {
+    /// Single-column foreign keys on `table`, for the grid's jump arrows.
+    async fn foreign_keys(&self, table: &TableRef) -> Result<Vec<ForeignKey>> {
+        let rows = sqlx::query(catalog::FOREIGN_KEYS)
+            .bind(&table.schema)
+            .bind(&table.name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::catalog(&error))?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some(ForeignKey {
+                    column: row.try_get::<String, _>("column_name").ok()?,
+                    references: TableRef::new(
+                        row.try_get::<String, _>("ref_schema").ok()?,
+                        row.try_get::<String, _>("ref_table").ok()?,
+                    ),
+                    references_column: row.try_get::<String, _>("ref_column").ok()?,
+                })
+            })
+            .collect())
+    }
+}
+
 #[async_trait]
 impl DatabaseDriver for PostgresDriver {
     fn driver(&self) -> Driver {
@@ -160,6 +187,10 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>> {
+        // Best effort: a server that will not answer this still gives back a
+        // perfectly usable structure pane, just without the arrows.
+        let keys = self.foreign_keys(table).await.unwrap_or_default();
+
         let rows = sqlx::query(catalog::COLUMNS)
             .bind(&table.schema)
             .bind(&table.name)
@@ -177,7 +208,15 @@ impl DatabaseDriver for PostgresDriver {
                     default: row.try_get::<Option<String>, _>("column_default").ok().flatten(),
                     is_primary_key: row.try_get::<bool, _>("is_primary_key").unwrap_or(false),
                     ordinal: i32::from(row.try_get::<i16, _>("ordinal").unwrap_or(0)),
+                    references: None,
                 })
+            })
+            .map(|mut column: Column| {
+                column.references = keys
+                    .iter()
+                    .find(|key| key.column == column.name)
+                    .cloned();
+                column
             })
             .collect())
     }

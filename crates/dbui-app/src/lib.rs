@@ -6,6 +6,7 @@
 //! from a plain `#[test]`.
 
 pub mod commands;
+pub mod history;
 pub mod runtime;
 pub mod session;
 pub mod store;
@@ -14,6 +15,7 @@ pub mod updater;
 pub mod workspace;
 
 pub use commands::{BatchQueryResult, Outcome, TableContents};
+pub use history::{History, HistoryEntry};
 pub use runtime::{DbRuntime, Task};
 pub use session::{SavedConnectionTab, SavedTab, Session};
 pub use tableplus::{import_from_tableplus, ImportReport, TablePlusError};

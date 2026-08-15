@@ -1107,7 +1107,9 @@ fn open_table_with_rows<'a>(
     use crate::root::{ResultSource, ResultView};
     use dbui_app::domain::{Column, ColumnInfo, Page, ResultSet, Row, Value};
 
-    let (view, cx) = open(cx);
+    // A saved connection, so the engine is known for quoting even though
+    // nothing here dials out.
+    let (view, cx) = open_with(cx, saved_connections(1));
     let table = TableRef::new("public", "users");
     let columns = vec![
         ColumnInfo {
@@ -1127,6 +1129,7 @@ fn open_table_with_rows<'a>(
             default: None,
             is_primary_key: true,
             ordinal: 1,
+            references: None,
         },
         Column {
             name: "name".into(),
@@ -1135,6 +1138,14 @@ fn open_table_with_rows<'a>(
             default: None,
             is_primary_key: false,
             ordinal: 2,
+            // `name` doubles as the foreign key in these tests: the fixture
+            // only has two columns, and what matters is that a column with a
+            // reference behaves differently from one without.
+            references: Some(dbui_app::domain::ForeignKey {
+                column: "name".into(),
+                references: TableRef::new("public", "teams"),
+                references_column: "slug".into(),
+            }),
         },
     ];
     let rows = (0..count)
@@ -1822,6 +1833,223 @@ fn copying_with_no_selection_takes_the_whole_page(cx: &mut TestAppContext) {
         view.clear_row_selection(cx);
         view.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx);
         assert_eq!(describe(&view.status), "info: Copied 3 rows");
+    });
+}
+
+// -- per-statement results, history ---------------------------------------
+
+/// Put a finished batch onto a SQL tab, the way a run does.
+fn put_batch(view: &mut DbUi, statements: &[(&str, Option<usize>)], cx: &mut gpui::Context<DbUi>) {
+    use dbui_app::domain::{ColumnInfo, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, Value};
+
+    let results: Vec<QueryResult> = statements
+        .iter()
+        .map(|(sql, rows)| QueryResult {
+            statement: (*sql).to_string(),
+            outcome: match rows {
+                Some(count) => QueryOutcome::Rows(ResultSet {
+                    columns: vec![ColumnInfo {
+                        name: "n".into(),
+                        type_name: "int8".into(),
+                    }],
+                    rows: (0..*count).map(|n| Row(vec![Value::Int(n as i64)])).collect(),
+                    truncated: false,
+                }),
+                None => QueryOutcome::Affected(3),
+            },
+            stats: QueryStats {
+                elapsed: std::time::Duration::from_millis(1),
+            },
+        })
+        .collect();
+
+    let tab_id = view.tabs.active_id().expect("a tab");
+    let batch = dbui_app::BatchQueryResult {
+        last_rows: results.iter().find(|r| r.rows().is_some()).cloned(),
+        results,
+        total_elapsed: std::time::Duration::from_millis(3),
+    };
+    view.absorb_batch_result_for_test(tab_id, batch, true);
+    cx.notify();
+}
+
+/// The bug this fixes: run-all kept only the last row-producing result and
+/// threw the rest away, so a batch whose interesting statement was in the
+/// middle was unreadable.
+#[gpui::test]
+fn every_statement_of_a_run_keeps_its_result(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_batch(
+            view,
+            &[
+                ("UPDATE t SET a = 1", None),
+                ("SELECT * FROM t", Some(4)),
+                ("DELETE FROM t", None),
+            ],
+            cx,
+        );
+
+        let Some(WorkspaceTab::Sql {
+            results,
+            active_result,
+            ..
+        }) = view.tabs.active()
+        else {
+            panic!("sql tab");
+        };
+        assert_eq!(results.len(), 3, "all three are kept");
+        assert_eq!(
+            *active_result, 1,
+            "the first that produced rows is put in front"
+        );
+        assert_eq!(results[0].label(0), "1 UPDATE");
+        assert_eq!(results[2].label(2), "3 DELETE");
+    });
+}
+
+/// Selecting a statement swaps its rows into the grid and hands the old ones
+/// back, so switching to and fro does not lose either.
+#[gpui::test]
+fn selecting_a_statement_swaps_its_rows_into_the_grid(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_batch(
+            view,
+            &[("SELECT 1", Some(2)), ("SELECT 2", Some(5))],
+            cx,
+        );
+
+        let rows_now = |view: &DbUi| {
+            view.tabs
+                .active()
+                .and_then(|tab| tab.result())
+                .map(|v| v.set.rows.len())
+        };
+        assert_eq!(rows_now(view), Some(2), "the first is in front");
+
+        view.select_statement_result(1, cx);
+        assert_eq!(rows_now(view), Some(5));
+
+        view.select_statement_result(0, cx);
+        assert_eq!(rows_now(view), Some(2), "and going back finds them again");
+    });
+}
+
+/// A statement that returned no rows is still selectable -- "3 rows affected"
+/// is a result.
+#[gpui::test]
+fn a_statement_with_no_rows_is_still_in_the_strip(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_batch(view, &[("SELECT 1", Some(1)), ("UPDATE t SET a = 1", None)], cx);
+
+        view.select_statement_result(1, cx);
+        assert!(
+            view.tabs.active().and_then(|tab| tab.result()).is_none(),
+            "no grid for a statement that produced none"
+        );
+        assert!(
+            describe(&view.status).contains("affected"),
+            "but it says what happened: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// Running a statement records it, and picking it out of the history loads it
+/// back into the editor rather than running it again.
+#[gpui::test]
+fn history_records_statements_and_loads_them_back(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        view.history.record(dbui_app::HistoryEntry {
+            sql: "SELECT * FROM users".into(),
+            connection: None,
+            at: 1,
+            ok: true,
+        });
+
+        view.put_sql_in_editor("SELECT * FROM users", cx);
+        assert_eq!(sql_editor_text(view), "SELECT * FROM users");
+        assert_eq!(view.focus, Focus::Editor, "ready to read before running");
+        assert!(
+            describe(&view.status).contains("history"),
+            "got: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+// -- foreign keys ---------------------------------------------------------
+
+/// A cell on a foreign key knows where it points; one that is not does not.
+#[gpui::test]
+fn a_foreign_key_cell_knows_its_target(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, _| {
+        let (key, value) = view.foreign_key_at(1, 1).expect("name references teams");
+        assert_eq!(key.references.qualified(), "public.teams");
+        assert_eq!(key.references_column, "slug");
+        assert_eq!(value.to_text(), "row 2");
+
+        assert!(
+            view.foreign_key_at(1, 0).is_none(),
+            "the key column points nowhere"
+        );
+    });
+}
+
+/// Following opens the referenced table filtered to the one row, because the
+/// only thing known about it is its key -- not where it sits in the table.
+#[gpui::test]
+fn following_a_key_opens_the_target_filtered_to_that_row(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.follow_foreign_key(1, 1, cx);
+
+        let Some(WorkspaceTab::Table {
+            table,
+            where_clause,
+            filters_open,
+            ..
+        }) = view.tabs.active()
+        else {
+            panic!("a table tab");
+        };
+        assert_eq!(table.qualified(), "public.teams");
+        assert_eq!(where_clause, "\"slug\" = 'row 2'");
+        assert!(*filters_open, "and the filter is shown, not applied invisibly");
+    });
+}
+
+/// A null reference points at nothing, so there is no row to open.
+#[gpui::test]
+fn a_null_foreign_key_is_not_followed(cx: &mut TestAppContext) {
+    use dbui_app::domain::{Row, Value};
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+    view.update(cx, |view, cx| {
+        if let Some(WorkspaceTab::Table {
+            result: Some(view), ..
+        }) = view.tabs.active_mut()
+        {
+            view.set.rows[0] = Row(vec![Value::Int(1), Value::Null]);
+        }
+        assert!(view.foreign_key_at(0, 1).is_none());
+
+        let before = view.tabs.items.len();
+        view.follow_foreign_key(0, 1, cx);
+        assert_eq!(view.tabs.items.len(), before, "nothing was opened");
     });
 }
 

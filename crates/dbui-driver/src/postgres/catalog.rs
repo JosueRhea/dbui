@@ -72,6 +72,31 @@ pub const COLUMNS: &str = "
      ORDER BY a.attnum
 ";
 
+/// Single-column foreign keys on one table.
+///
+/// `array_length(conkey, 1) = 1` is the filter that matters: a composite key
+/// cannot be followed from one cell, because the value on screen is only part
+/// of it. Following it anyway would land on rows that merely share that part.
+pub const FOREIGN_KEYS: &str = "
+    SELECT src.attname   AS column_name,
+           tn.nspname    AS ref_schema,
+           tc.relname    AS ref_table,
+           tgt.attname   AS ref_column
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class c      ON c.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace n  ON n.oid = c.relnamespace
+      JOIN pg_catalog.pg_class tc     ON tc.oid = con.confrelid
+      JOIN pg_catalog.pg_namespace tn ON tn.oid = tc.relnamespace
+      JOIN pg_catalog.pg_attribute src
+             ON src.attrelid = con.conrelid AND src.attnum = con.conkey[1]
+      JOIN pg_catalog.pg_attribute tgt
+             ON tgt.attrelid = con.confrelid AND tgt.attnum = con.confkey[1]
+     WHERE con.contype = 'f'
+       AND n.nspname = $1
+       AND c.relname = $2
+       AND array_length(con.conkey, 1) = 1
+";
+
 pub const SERVER_VERSION: &str = "SELECT version()";
 
 /// `relkind` -> the domain's [`TableKind`].
