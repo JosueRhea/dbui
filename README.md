@@ -115,8 +115,9 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 - **Query history** — every statement run is kept and searchable with `⌘⇧H`;
   picking one loads it back into the editor rather than running it.
 - **Read-only connections** — a per-connection switch that refuses every write
-  and says so in the titlebar. For SQLite the file itself is opened read-only,
-  so the engine enforces it too.
+  and says so in the titlebar. It is enforced by the *server*, not just the UI:
+  Postgres gets `default_transaction_read_only`, MySQL a read-only session, and
+  a SQLite file is opened read-only.
 - **Row selection** — click, shift-click or drag a range, ⌘-click to pick rows
   out, `⌘A` for all of them. `⌘⌫` stages the selection for deletion: the rows
   are struck through and listed in the change bubble beside any pending edits,

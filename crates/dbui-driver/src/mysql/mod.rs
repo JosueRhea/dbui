@@ -45,9 +45,24 @@ impl MySqlDriver {
             options = options.database(&config.database);
         }
 
+        // See the Postgres adapter: read-only is a server-side setting, put on
+        // every connection the pool opens rather than trusted to the UI.
+        // Statements run in autocommit, so each is its own transaction and
+        // this applies to all of them.
+        let read_only = config.read_only;
         let pool = MySqlPoolOptions::new()
             .max_connections(4)
             .acquire_timeout(Duration::from_secs(10))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    if read_only {
+                        sqlx::query("SET SESSION transaction_read_only = 1")
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await
             .map_err(|error| DriverError::connect(&address, &error))?;

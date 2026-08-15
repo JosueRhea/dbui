@@ -1014,6 +1014,54 @@ both_engines!(a_composite_foreign_key_is_not_reported, |fx: Fixture| async move 
     );
 });
 
+// A read-only connection is refused by the *server*, not only by the UI
+// declining to send writes. That is the difference between a safeguard and a
+// convention.
+both_engines!(a_read_only_connection_is_refused_by_the_server, |fx: Fixture| async move {
+    let table = fx.people();
+    let quoted = table.quoted(fx.driver());
+
+    let mut config = config(fx.driver());
+    config.read_only = true;
+    let ro = dbui_driver::connect(&config)
+        .await
+        .expect("a read-only connection still connects");
+
+    ro.execute(&format!("SELECT * FROM {quoted}"))
+        .await
+        .expect("reading is what it is for");
+
+    let err = ro
+        .execute(&format!("UPDATE {quoted} SET nickname = 'nope' WHERE id = 1"))
+        .await
+        .expect_err("the server refuses the write");
+    assert!(!err.to_string().is_empty(), "and says why");
+
+    // And the staged-batch path is refused too, not just raw SQL.
+    assert!(
+        ro.update_row(
+            &table,
+            &[("id".into(), Value::Int(1))],
+            &[("nickname".into(), Value::Text("nope".into()))],
+        )
+        .await
+        .is_err(),
+        "including the path the commit button uses"
+    );
+
+    ro.close().await;
+
+    // The writable connection alongside it is unaffected.
+    let after = fx
+        .table_rows(&table, Page::first(), "id = 1", &[])
+        .await
+        .expect("reload");
+    assert!(
+        after.rows[0].get(2).expect("nickname").is_null(),
+        "nothing was written"
+    );
+});
+
 both_engines!(closing_is_idempotent, |fx: Fixture| async move {
     fx.close().await;
     fx.close().await;

@@ -51,6 +51,14 @@ is linked in and the database is a temp file the test makes and deletes. So
 `crates/dbui-driver/tests/sqlite.rs` runs on every `cargo test` and proves the
 same things `live.rs` can only prove when someone has Docker running.
 
+**Every engine-specific behaviour is proved on every engine.** `live.rs` runs
+each of its tests twice, once per server; `sqlite.rs` mirrors them against a
+file. The same fifteen properties -- catalog, column metadata, value decoding,
+stable paging, server-side sorting, batch commit and rollback, foreign keys,
+generated DDL, read-only enforcement, identifier quoting -- are asserted three
+times over. An adapter that passes its own tests and nobody else's is how two
+engines drift into behaving differently under one UI.
+
 ### `dbui-app` — use cases and state
 
 The whole application minus its pixels. It owns:

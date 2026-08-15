@@ -43,6 +43,11 @@ impl PostgresDriver {
             options = options.database(&config.database);
         }
 
+        // A read-only connection is enforced by the server, not only by the
+        // UI refusing to send writes. Set on every connection the pool opens,
+        // because a pool that grows later would otherwise hand back a writable
+        // one.
+        let read_only = config.read_only;
         let pool = PgPoolOptions::new()
             // A GUI issues one query at a time per window, plus the occasional
             // catalog refresh behind it. A large pool would just hold idle
@@ -50,6 +55,16 @@ impl PostgresDriver {
             .max_connections(4)
             // Fail fast enough that a wrong host is a message, not a hang.
             .acquire_timeout(Duration::from_secs(10))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    if read_only {
+                        sqlx::query("SET default_transaction_read_only = on")
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await
             .map_err(|error| DriverError::connect(&address, &error))?;

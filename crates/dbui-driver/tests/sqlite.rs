@@ -432,6 +432,79 @@ async fn a_read_only_connection_refuses_writes_at_the_engine() {
     );
 }
 
+/// The two statements the context menu offers have to be accepted as written.
+/// SQLite has no `TRUNCATE`, so `truncate_sql` emits an unqualified `DELETE`
+/// -- which its own docs point at and which optimises into the same thing.
+#[tokio::test]
+async fn generated_truncate_and_drop_are_accepted() {
+    let db = open("ddl").await;
+    let table = TableRef::new("main", "scratch");
+    let quoted = table.quoted(Driver::Sqlite);
+
+    db.execute(&format!("CREATE TABLE {quoted} (id INTEGER PRIMARY KEY)"))
+        .await
+        .expect("create");
+    db.execute(&format!("INSERT INTO {quoted} (id) VALUES (1), (2)"))
+        .await
+        .expect("seed");
+
+    db.execute(&dbui_driver::truncate_sql(Driver::Sqlite, &table))
+        .await
+        .expect("truncate");
+    assert_eq!(db.row_count(&table, "").await.expect("count"), 0);
+
+    db.execute(&dbui_driver::drop_sql(
+        Driver::Sqlite,
+        &table,
+        dbui_domain::TableKind::Table,
+    ))
+    .await
+    .expect("drop");
+    assert!(db.row_count(&table, "").await.is_err(), "the table is gone");
+
+    // A view needs DROP VIEW, which is why `drop_sql` takes the kind.
+    db.execute(&dbui_driver::drop_sql(
+        Driver::Sqlite,
+        &TableRef::new("main", "people_view"),
+        dbui_domain::TableKind::View,
+    ))
+    .await
+    .expect("drop view");
+}
+
+/// A new row's values are typed from the column, not sent as text -- the same
+/// bug that made Postgres refuse an INSERT against a bigint key.
+#[tokio::test]
+async fn an_all_defaults_insert_lets_the_key_fire() {
+    let db = open("defaults").await;
+    let table = db.people();
+
+    // `id` is INTEGER PRIMARY KEY, which is SQLite's rowid alias: leaving it
+    // out of the statement is what lets it assign one.
+    db.apply_changes(
+        &table,
+        &RowBatch {
+            inserts: vec![RowInsert {
+                values: vec![("name".into(), Value::Text("Katherine".into()))],
+            }],
+            updates: Vec::new(),
+            deletes: Vec::new(),
+        },
+    )
+    .await
+    .expect("insert");
+
+    let rows = db
+        .table_rows(&table, Page::first(), "name = 'Katherine'", &[])
+        .await
+        .expect("the new row");
+    assert_eq!(rows.rows.len(), 1);
+    assert!(
+        matches!(rows.rows[0].get(0), Some(Value::Int(n)) if *n > 5),
+        "the key was assigned, not written as text"
+    );
+}
+
 #[tokio::test]
 async fn closing_is_idempotent() {
     let db = open("closing").await;
