@@ -197,7 +197,14 @@ identifier quoting, statement classification, paging arithmetic, value
 rendering. Same for `Workspace` and `store`.
 
 **End-to-end UI tests** (`crates/dbui-ui/src/e2e.rs`) open a real GPUI window
-through `TestAppContext` and dispatch real keystrokes. They are in-crate rather
+through `TestAppContext` and dispatch real keystrokes. Every command on `DbUi`
+is reached by one, either by name or through the key that triggers it — the
+list was arrived at by auditing the two against each other rather than by
+assuming, and the audit found a shortcut nobody had ever driven.
+
+One of them takes `layout_lock()`: the zoom lives in a process-wide static
+because it scales every surface at once, so the tests that measure painted
+pixels cannot run alongside the one that moves it. They are in-crate rather
 than in `tests/` so they can read `pub(crate)` state without widening the public
 API for the benefit of tests.
 

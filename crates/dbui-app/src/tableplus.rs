@@ -384,6 +384,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A connection TablePlus reaches over SSH is skipped, not imported.
+    ///
+    /// dbui has no tunnel, so importing one would produce a connection that
+    /// dials the database host directly -- which either fails, or succeeds
+    /// against something that was never meant to be reachable.
+    #[test]
+    fn skips_connections_that_go_over_ssh() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbui-tableplus-{}-{}",
+            std::process::id(),
+            "ssh"
+        ));
+        let path = dir.join("Connections.plist");
+        write_fixture(
+            &path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+  <dict>
+    <key>Driver</key><string>PostgreSQL</string>
+    <key>ConnectionName</key><string>Behind a bastion</string>
+    <key>DatabaseHost</key><string>10.0.0.5</string>
+    <key>DatabasePort</key><string>5432</string>
+    <key>DatabaseUser</key><string>postgres</string>
+    <key>DatabaseName</key><string>prod</string>
+    <key>isOverSSH</key><true/>
+  </dict>
+  <dict>
+    <key>Driver</key><string>PostgreSQL</string>
+    <key>ConnectionName</key><string>Direct</string>
+    <key>DatabaseHost</key><string>127.0.0.1</string>
+    <key>DatabasePort</key><string>5432</string>
+    <key>DatabaseUser</key><string>postgres</string>
+    <key>DatabaseName</key><string>dev</string>
+  </dict>
+</array>
+</plist>
+"#,
+        );
+
+        let report = import_from_plist(&path, &[]).expect("import");
+        assert_eq!(report.skipped_ssh, 1);
+        assert_eq!(report.imported.len(), 1, "only the direct one came over");
+        assert_eq!(report.imported[0].host, "127.0.0.1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn skips_duplicates_already_in_dbui() {
         let dir = std::env::temp_dir().join(format!(

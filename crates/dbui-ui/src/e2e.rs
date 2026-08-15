@@ -18,6 +18,17 @@ use dbui_app::domain::{ConnectionConfig, Driver, TableRef};
 use dbui_app::{DbRuntime, Workspace};
 use gpui::{AppContext as _, Entity, TestAppContext, VisualContext as _, VisualTestContext};
 
+/// Serialises the tests that cannot run alongside a zoom change.
+///
+/// `metrics` keeps the zoom in a process-wide static, because it scales every
+/// surface at once. Anything measuring painted pixels therefore has to be kept
+/// away from the test that moves it, or it measures a layout from the middle
+/// of someone else's zoom.
+fn layout_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Point the config directory at a scratch path for the whole test process.
 ///
 /// Opening a tab persists the session, so without this a test run would
@@ -539,6 +550,7 @@ fn open_detail_draft<'a>(
 
 #[gpui::test]
 fn detail_field_does_not_move_vertically_while_typing(cx: &mut TestAppContext) {
+    let _layout = layout_lock();
     use crate::components::text_field::InputTarget;
 
     let (view, cx) = open_detail_draft(cx, &[("id", "1", true), ("name", "alpha", false)]);
@@ -571,6 +583,7 @@ fn detail_field_does_not_move_vertically_while_typing(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn detail_search_does_not_move_vertically_while_typing(cx: &mut TestAppContext) {
+    let _layout = layout_lock();
     use crate::components::text_field::InputTarget;
 
     let (view, cx) = open_detail_draft(cx, &[("id", "1", true), ("name", "alpha", false)]);
@@ -636,6 +649,7 @@ fn detail_search_does_not_move_vertically_while_typing(cx: &mut TestAppContext) 
 /// `ensure_caret_visible` flipped the offset 0 → -2 → 0 on every keystroke.
 #[gpui::test]
 fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
+    let _layout = layout_lock();
     use crate::components::text_field::InputTarget;
 
     let (view, cx) = open_detail_draft(cx, &[("id", "1", true), ("name", "alpha", false)]);
@@ -677,6 +691,7 @@ fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
 /// pinned the vertical offset for everyone.
 #[gpui::test]
 fn a_long_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
+    let _layout = layout_lock();
     use crate::components::text_field::InputTarget;
 
     let long = (1..=20)
@@ -1985,6 +2000,709 @@ fn history_records_statements_and_loads_them_back(cx: &mut TestAppContext) {
             "got: {}",
             describe(&view.status)
         );
+    });
+}
+
+// -- connections, tabs, menus ---------------------------------------------
+
+#[gpui::test]
+fn the_connection_picker_opens_and_closes(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(2));
+
+    view.update(cx, |view, cx| {
+        assert!(!view.connection_picker_open);
+        view.toggle_connection_picker(cx);
+        assert!(view.connection_picker_open);
+        view.toggle_connection_picker(cx);
+        assert!(!view.connection_picker_open);
+    });
+
+    view.update(cx, |view, cx| view.toggle_connection_picker(cx));
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        assert!(!view.connection_picker_open, "escape closes it");
+    });
+}
+
+/// Picking a connection from the picker opens it as a tab and closes the
+/// picker behind it.
+#[gpui::test]
+fn picking_a_connection_opens_it_as_a_tab(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(2));
+
+    view.update(cx, |view, cx| {
+        let second = view.workspace.entries()[1].id();
+        view.toggle_connection_picker(cx);
+        view.pick_connection(second, cx);
+
+        assert!(!view.connection_picker_open);
+        assert_eq!(view.workspace.active_id(), Some(second));
+        assert_eq!(view.workspace.open_count(), 2);
+    });
+}
+
+/// Removing a connection takes its tabs with it but leaves the others alone.
+#[gpui::test]
+fn removing_a_connection_takes_its_tabs_and_no_others(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(2));
+
+    view.update(cx, |view, cx| {
+        let (first, second) = (
+            view.workspace.entries()[0].id(),
+            view.workspace.entries()[1].id(),
+        );
+        view.open_connection_tab(second, cx);
+        view.open_table_tab(TableRef::new("public", "orders"), cx);
+        view.open_connection_tab(first, cx);
+        view.open_table_tab(TableRef::new("public", "users"), cx);
+
+        view.remove_connection(second, cx);
+
+        assert!(view.workspace.get(second).is_none(), "it is gone");
+        assert!(view.workspace.get(first).is_some(), "the other is not");
+        assert!(!view.stashed_tabs.contains_key(&second));
+        let labels: Vec<_> = view.tabs.items.iter().map(|tab| tab.label()).collect();
+        assert_eq!(labels, vec!["users"], "the surviving tab is untouched");
+    });
+}
+
+/// Dropping a relation closes the tabs pointing at it -- one onto a table that
+/// is gone only fails on its next load.
+#[gpui::test]
+fn dropping_a_table_closes_the_tabs_onto_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("public", "users"), cx);
+        view.open_table_tab(TableRef::new("public", "orders"), cx);
+        assert_eq!(view.tabs.items.len(), 2);
+
+        view.close_tabs_for_table(&TableRef::new("public", "users"), cx);
+        let labels: Vec<_> = view.tabs.items.iter().map(|tab| tab.label()).collect();
+        assert_eq!(labels, vec!["orders"]);
+    });
+}
+
+/// ⌘1…⌘9 jump to a tab by number, and ⌘9 is the last one.
+#[gpui::test]
+fn tab_numbers_select_and_nine_is_the_last(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        for name in ["a", "b", "c"] {
+            view.open_table_tab(TableRef::new("public", name), cx);
+        }
+        assert_eq!(view.tabs.items.len(), 3);
+
+        view.select_tab_number(1, cx);
+        assert_eq!(view.tabs.active, 0);
+        view.select_tab_number(2, cx);
+        assert_eq!(view.tabs.active, 1);
+        view.select_tab_number(9, cx);
+        assert_eq!(view.tabs.active, 2, "9 is the last, browser-style");
+
+        // A number past the end is ignored rather than clamped.
+        view.select_tab_number(1, cx);
+        view.select_tab_number(8, cx);
+        assert_eq!(view.tabs.active, 0);
+    });
+}
+
+#[gpui::test]
+fn next_and_previous_tab_wrap(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        for name in ["a", "b", "c"] {
+            view.open_table_tab(TableRef::new("public", name), cx);
+        }
+        view.select_tab_number(1, cx);
+
+        view.prev_tab(cx);
+        assert_eq!(view.tabs.active, 2, "back from the first wraps to the last");
+        view.next_tab(cx);
+        assert_eq!(view.tabs.active, 0, "and forward wraps round again");
+    });
+}
+
+/// The context menu is walkable from the keyboard, and Enter runs what the
+/// cursor is on -- separators are skipped because they are not selectable.
+#[gpui::test]
+fn the_context_menu_is_walkable_from_the_keyboard(cx: &mut TestAppContext) {
+    use crate::components::context_menu::ContextTarget;
+    use dbui_app::domain::TableKind;
+
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        view.open_context_menu(
+            ContextTarget::Table {
+                table: TableRef::new("public", "users"),
+                kind: TableKind::Table,
+            },
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            cx,
+        );
+        assert_eq!(view.context_menu.as_ref().unwrap().selected, 0);
+
+        view.handle_context_menu_key("down", cx);
+        assert_eq!(view.context_menu.as_ref().unwrap().selected, 1);
+        view.handle_context_menu_key("up", cx);
+        view.handle_context_menu_key("up", cx);
+        assert!(
+            view.context_menu.as_ref().unwrap().selected > 0,
+            "up from the first wraps to the last"
+        );
+
+        // Enter on "Open" (the first entry) opens the table.
+        view.handle_context_menu_key("down", cx);
+        while view.context_menu.as_ref().unwrap().selected != 0 {
+            view.handle_context_menu_key("down", cx);
+        }
+        view.handle_context_menu_key("enter", cx);
+        assert!(view.context_menu.is_none(), "and the menu closes");
+        assert_eq!(
+            view.tabs.active().map(|tab| tab.label()),
+            Some("users".to_string())
+        );
+    });
+}
+
+/// Refreshing with nothing open falls through to the catalog rather than
+/// erroring about a result that does not exist.
+#[gpui::test]
+fn refresh_with_no_tab_refreshes_the_catalog(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        assert!(view.tabs.items.is_empty());
+        view.refresh_result(cx);
+        // Nothing is connected, so it is a no-op -- the property being pinned
+        // is that it does not panic or report the wrong thing.
+        assert!(!matches!(view.status, Status::Error(_)));
+    });
+}
+
+// -- view toggles, paging, panes ------------------------------------------
+
+#[gpui::test]
+fn the_view_toggles_flip_and_flip_back(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        let open = |view: &DbUi| match view.tabs.active() {
+            Some(WorkspaceTab::Table {
+                filters_open,
+                columns_open,
+                ..
+            }) => (*filters_open, *columns_open),
+            _ => panic!("table tab"),
+        };
+        assert_eq!(open(view), (false, false));
+
+        view.toggle_filters_open(cx);
+        assert_eq!(open(view).0, true);
+        // Opening the filter strip hands it the keyboard, or it is a box the
+        // user has to click before typing in.
+        assert_eq!(view.focus, Focus::Filter);
+        view.toggle_filters_open(cx);
+        assert_eq!(open(view).0, false);
+
+        view.toggle_columns_open(cx);
+        assert_eq!(open(view).1, true);
+        view.toggle_columns_open(cx);
+        assert_eq!(open(view).1, false);
+    });
+}
+
+#[gpui::test]
+fn hiding_a_column_keeps_it_out_of_the_grid_and_the_session(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.toggle_column_hidden("name", cx);
+        let Some(WorkspaceTab::Table { hidden_columns, .. }) = view.tabs.active() else {
+            panic!("table tab");
+        };
+        assert!(hidden_columns.contains("name"));
+
+        // And it survives the round trip to disk.
+        let saved = view.tabs.to_saved().0;
+        let dbui_app::SavedTab::Table { hidden_columns, .. } = &saved[0] else {
+            panic!("a table tab");
+        };
+        assert_eq!(hidden_columns, &vec!["name".to_string()]);
+
+        view.toggle_column_hidden("name", cx);
+        let Some(WorkspaceTab::Table { hidden_columns, .. }) = view.tabs.active() else {
+            panic!("table tab");
+        };
+        assert!(hidden_columns.is_empty());
+    });
+}
+
+#[gpui::test]
+fn the_pane_switcher_moves_between_data_and_structure(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.set_table_pane(crate::tabs::TablePane::Structure, cx);
+        let Some(WorkspaceTab::Table { pane, .. }) = view.tabs.active() else {
+            panic!("table tab");
+        };
+        assert_eq!(*pane, crate::tabs::TablePane::Structure);
+
+        view.set_table_pane(crate::tabs::TablePane::Data, cx);
+        let Some(WorkspaceTab::Table { pane, .. }) = view.tabs.active() else {
+            panic!("table tab");
+        };
+        assert_eq!(*pane, crate::tabs::TablePane::Data);
+    });
+}
+
+/// Paging is anchored to the rows on screen, so a burst of clicks cannot run
+/// the offset ahead of what has actually loaded.
+#[gpui::test]
+fn paging_does_not_run_ahead_of_the_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+    let offset = |view: &DbUi| match view.tabs.active() {
+        Some(WorkspaceTab::Table { page, .. }) => page.offset,
+        _ => panic!("table tab"),
+    };
+
+    view.update(cx, |view, cx| {
+        let limit = match view.tabs.active() {
+            Some(WorkspaceTab::Table { page, .. }) => page.limit as u64,
+            _ => panic!("table tab"),
+        };
+
+        // Nothing is connected here, so the reload never lands and the result
+        // stays on page 0 -- which is exactly the state this guards.
+        view.page(true, cx);
+        assert_eq!(offset(view), limit);
+        view.page(true, cx);
+        assert_eq!(offset(view), limit, "the second click does not double it");
+    });
+}
+
+/// The bug this fixes: the early return compared against the *result's* page,
+/// so after a load that never landed, paging back did nothing at all and the
+/// tab stayed pointing at a page it had never reached.
+#[gpui::test]
+fn paging_back_works_after_a_load_that_never_landed(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+    let offset = |view: &DbUi| match view.tabs.active() {
+        Some(WorkspaceTab::Table { page, .. }) => page.offset,
+        _ => panic!("table tab"),
+    };
+
+    view.update(cx, |view, cx| {
+        view.page(true, cx);
+        assert!(offset(view) > 0);
+
+        view.page(false, cx);
+        assert_eq!(offset(view), 0, "and back it goes");
+        view.page(false, cx);
+        assert_eq!(offset(view), 0, "never past the first page");
+    });
+}
+
+#[gpui::test]
+fn the_detail_sidebar_toggles(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let was = view.detail_open;
+        view.toggle_detail(cx);
+        assert_eq!(view.detail_open, !was);
+        view.toggle_detail(cx);
+        assert_eq!(view.detail_open, was);
+    });
+}
+
+#[gpui::test]
+fn zooming_moves_in_steps_and_resets(cx: &mut TestAppContext) {
+    let _layout = layout_lock();
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        view.zoom_delta(0, cx);
+        let base = crate::theme::metrics::zoom_pct();
+
+        view.zoom_delta(1, cx);
+        assert!(crate::theme::metrics::zoom_pct() > base);
+        view.zoom_delta(-1, cx);
+        assert_eq!(crate::theme::metrics::zoom_pct(), base);
+
+        view.zoom_delta(1, cx);
+        view.zoom_delta(0, cx);
+        assert_eq!(crate::theme::metrics::zoom_pct(), base, "0 is actual size");
+    });
+}
+
+/// The change bubble is resized by dragging its top edge -- upward makes it
+/// taller, which is the direction that is not obvious from the delta.
+#[gpui::test]
+fn dragging_the_bubble_edge_upward_makes_it_taller(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update_in(cx, |view, window, cx| {
+        let before = view.change_bubble_height;
+        view.begin_change_bubble_drag(gpui::px(400.), cx);
+        view.drag_change_bubble(gpui::px(340.), window, cx);
+        assert!(view.change_bubble_height > before, "up is bigger");
+
+        view.drag_change_bubble(gpui::px(460.), window, cx);
+        assert!(view.change_bubble_height < before, "and down is smaller");
+
+        // Past the stop it clamps rather than collapsing to nothing.
+        view.drag_change_bubble(gpui::px(9_000.), window, cx);
+        assert!(view.change_bubble_height > gpui::px(0.));
+        view.end_change_bubble_drag(cx);
+        assert!(view.change_bubble_drag.is_none());
+    });
+}
+
+/// The editor's handle is its *bottom* edge, so the delta runs the other way.
+#[gpui::test]
+fn dragging_the_editor_edge_downward_makes_it_taller(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update_in(cx, |view, window, cx| {
+        let before = view.editor_height;
+        view.begin_editor_drag(gpui::px(300.), cx);
+        view.drag_editor(gpui::px(360.), window, cx);
+        assert!(view.editor_height > before, "down is bigger");
+
+        view.drag_editor(gpui::px(0.), window, cx);
+        assert!(view.editor_height > gpui::px(0.), "and it clamps");
+        view.end_editor_drag(cx);
+        assert!(view.editor_drag.is_none());
+    });
+}
+
+/// A drag that never moves changes nothing.
+#[gpui::test]
+fn a_drag_that_goes_nowhere_leaves_the_size_alone(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        let bubble = view.change_bubble_height;
+        let editor = view.editor_height;
+        view.begin_change_bubble_drag(gpui::px(400.), cx);
+        view.end_change_bubble_drag(cx);
+        view.begin_editor_drag(gpui::px(300.), cx);
+        view.end_editor_drag(cx);
+        assert_eq!(view.change_bubble_height, bubble);
+        assert_eq!(view.editor_height, editor);
+    });
+}
+
+#[gpui::test]
+fn the_change_bubble_expands_and_collapses(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let expanded = |view: &DbUi| match view.tabs.active() {
+            Some(WorkspaceTab::Table {
+                change_bubble_expanded,
+                ..
+            }) => *change_bubble_expanded,
+            _ => panic!("table tab"),
+        };
+        assert!(!expanded(view));
+        view.toggle_change_bubble(cx);
+        assert!(expanded(view));
+        view.toggle_change_bubble(cx);
+        assert!(!expanded(view));
+    });
+}
+
+/// The write-token dropdown opens on the field it was clicked on, and a second
+/// click on the same one closes it rather than reopening it.
+#[gpui::test]
+fn the_value_menu_opens_and_closes_on_the_same_field(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+
+        view.toggle_detail_value_menu(1, cx);
+        assert_eq!(view.detail_value_menu, Some(1));
+        view.toggle_detail_value_menu(1, cx);
+        assert_eq!(view.detail_value_menu, None, "the same field closes it");
+
+        view.toggle_detail_value_menu(1, cx);
+        view.close_detail_value_menu(cx);
+        assert_eq!(view.detail_value_menu, None);
+    });
+
+    // And escape closes it before it closes anything else.
+    view.update(cx, |view, cx| view.toggle_detail_value_menu(1, cx));
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert_eq!(view.detail_value_menu, None));
+}
+
+/// The Test button validates before it dials, so a half-filled sheet says what
+/// is missing instead of timing out against nothing.
+#[gpui::test]
+fn testing_an_invalid_connection_reports_without_dialling(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    // A fresh sheet is pre-filled and would be valid, so the name is emptied
+    // first -- which is also what keeps this test from dialling anything.
+    cx.simulate_keystrokes("cmd-n");
+    cx.simulate_keystrokes(&clear_field());
+
+    view.update(cx, |view, cx| {
+        view.test_connection(cx);
+
+        let form = view.modal.as_ref().expect("still open");
+        assert!(!form.testing, "it never started dialling");
+        assert!(
+            form.has_problem(),
+            "and it says what is missing instead"
+        );
+    });
+}
+
+/// Refreshing the catalog with nothing connected is a no-op, not an error
+/// about a driver that was never there.
+#[gpui::test]
+fn refreshing_the_catalog_unconnected_is_a_no_op(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        view.refresh_catalog(cx);
+        assert!(!matches!(view.status, Status::Busy(_)));
+        assert!(!matches!(view.status, Status::Error(_)));
+    });
+}
+
+// -- SQL autocomplete -----------------------------------------------------
+
+/// Give a connection a catalog without dialling anything, so the surfaces that
+/// read one -- autocomplete, the tree, the go-to palette -- can be tested.
+fn with_catalog<'a>(
+    cx: &'a mut TestAppContext,
+    tables: &[(&str, &[&str])],
+) -> (Entity<DbUi>, &'a mut VisualTestContext) {
+    use dbui_app::domain::{Catalog, Schema, Table, TableKind};
+
+    let (view, cx) = open_with(cx, saved_connections(1));
+    let catalog = Catalog {
+        schemas: vec![Schema {
+            name: "public".into(),
+            tables: tables
+                .iter()
+                .map(|(name, _)| Table {
+                    schema: "public".into(),
+                    name: (*name).to_string(),
+                    kind: TableKind::Table,
+                })
+                .collect(),
+        }],
+    };
+    view.update(cx, |view, cx| {
+        let id = view.workspace.entries()[0].id();
+        if let Some(entry) = view.workspace.get_mut(id) {
+            entry.catalog = Some(catalog);
+        }
+        // The column cache is what autocomplete reads for column names; it is
+        // normally filled by a fetch, which needs no connection to fake.
+        for (table, columns) in tables {
+            view.column_cache.insert(
+                ("public".to_string(), (*table).to_string()),
+                columns
+                    .iter()
+                    .map(|name| dbui_app::domain::Column {
+                        name: (*name).to_string(),
+                        data_type: "text".into(),
+                        nullable: true,
+                        default: None,
+                        is_primary_key: false,
+                        ordinal: 0,
+                        references: None,
+                    })
+                    .collect(),
+            );
+        }
+        cx.notify();
+    });
+    (view, cx)
+}
+
+#[gpui::test]
+fn autocomplete_offers_tables_after_from(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id", "email"]), ("orders", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select * from us");
+        view.trigger_completion(cx);
+
+        let popup = view.completion.as_ref().expect("a popup");
+        assert!(
+            popup.items.iter().any(|item| item.label.contains("users")),
+            "got: {:?}",
+            popup.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    });
+}
+
+/// Accepting replaces the partial word rather than appending to it.
+#[gpui::test]
+fn accepting_a_completion_replaces_what_was_typed(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select * from us");
+        view.trigger_completion(cx);
+        assert!(view.completion.is_some());
+
+        view.accept_completion(cx);
+        assert!(view.completion.is_none(), "and the popup closes");
+        let text = sql_editor_text(view);
+        assert!(text.starts_with("select * from "), "got: {text}");
+        assert!(!text.contains("from us "), "the partial word is gone: {text}");
+    });
+}
+
+#[gpui::test]
+fn escape_dismisses_the_completion_popup(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select * from us");
+        view.trigger_completion(cx);
+        view.focus = Focus::Editor;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert!(view.completion.is_none()));
+}
+
+/// A popup with nothing in it is not shown at all.
+#[gpui::test]
+fn a_completion_with_no_matches_does_not_open(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select * from zzzz");
+        view.trigger_completion(cx);
+        assert!(view.completion.is_none());
+    });
+}
+
+// -- the filter strip and page size ---------------------------------------
+
+/// Applying a filter puts the draft into the applied clause and restarts the
+/// paging: an offset into the unfiltered rows means nothing once they change.
+#[gpui::test]
+fn applying_a_filter_restarts_the_paging(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        if let Some(WorkspaceTab::Table {
+            where_draft, page, ..
+        }) = view.tabs.active_mut()
+        {
+            *where_draft = crate::text_input::TextInput::with_text("id > 2", false);
+            page.offset = 500;
+        }
+        view.apply_filters(cx);
+
+        let Some(WorkspaceTab::Table {
+            where_clause, page, ..
+        }) = view.tabs.active()
+        else {
+            panic!("table tab");
+        };
+        assert_eq!(where_clause, "id > 2");
+        assert_eq!(page.offset, 0);
+    });
+}
+
+#[gpui::test]
+fn clearing_a_filter_empties_both_the_draft_and_the_clause(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        if let Some(WorkspaceTab::Table { where_draft, .. }) = view.tabs.active_mut() {
+            *where_draft = crate::text_input::TextInput::with_text("id > 2", false);
+        }
+        view.apply_filters(cx);
+        view.clear_filters(cx);
+
+        let Some(WorkspaceTab::Table {
+            where_clause,
+            where_draft,
+            ..
+        }) = view.tabs.active()
+        else {
+            panic!("table tab");
+        };
+        assert!(where_clause.is_empty());
+        assert!(where_draft.text().is_empty(), "the box is emptied too");
+    });
+}
+
+/// A page size that is not a number is refused with a message, and the box is
+/// put back to the size actually in use.
+#[gpui::test]
+fn a_bad_page_size_is_refused_and_reset(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        if let Some(WorkspaceTab::Table {
+            page_size_draft, ..
+        }) = view.tabs.active_mut()
+        {
+            *page_size_draft = crate::text_input::TextInput::with_text("lots", false);
+        }
+        view.apply_page_size(cx);
+
+        assert!(
+            describe(&view.status).contains("must be a number"),
+            "got: {}",
+            describe(&view.status)
+        );
+        let Some(WorkspaceTab::Table {
+            page_size_draft,
+            page,
+            ..
+        }) = view.tabs.active()
+        else {
+            panic!("table tab");
+        };
+        assert_eq!(page_size_draft.text(), page.limit.to_string());
+    });
+}
+
+/// An absurd page size is clamped rather than sent to the server.
+#[gpui::test]
+fn a_huge_page_size_is_clamped(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        if let Some(WorkspaceTab::Table {
+            page_size_draft, ..
+        }) = view.tabs.active_mut()
+        {
+            *page_size_draft = crate::text_input::TextInput::with_text("999999", false);
+        }
+        view.apply_page_size(cx);
+
+        let Some(WorkspaceTab::Table { page, .. }) = view.tabs.active() else {
+            panic!("table tab");
+        };
+        assert_eq!(page.limit, 5_000);
+        assert_eq!(page.offset, 0, "and a new size restarts the paging");
     });
 }
 

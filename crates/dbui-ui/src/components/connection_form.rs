@@ -177,6 +177,11 @@ impl ConnectionForm {
         self.config.tls
     }
 
+    /// Whether the sheet is showing a complaint rather than a result.
+    pub fn has_problem(&self) -> bool {
+        matches!(self.message, Some((false, _)))
+    }
+
     pub fn read_only(&self) -> bool {
         self.config.read_only
     }

@@ -1129,17 +1129,16 @@ impl DbUi {
             _ => return,
         };
 
-        let Some(WorkspaceTab::Table { page, result, .. }) = self.tabs.active_mut() else {
+        let Some(WorkspaceTab::Table { page, .. }) = self.tabs.active_mut() else {
             return;
         };
-        let current = result
-            .as_ref()
-            .and_then(|view| match &view.source {
-                ResultSource::Table { page, .. } => Some(*page),
-                _ => None,
-            })
-            .unwrap_or(*page);
-        if next == current {
+        // Compared against the tab's own page, not the result's. The *next*
+        // page is computed from what is on screen so a burst of clicks cannot
+        // run ahead of the rows -- but the early return has to ask "is the tab
+        // already asking for this?", or a load that failed leaves the tab
+        // pointing at a page the result never reached and paging back becomes
+        // a no-op.
+        if next == *page {
             return;
         }
         *page = next;
