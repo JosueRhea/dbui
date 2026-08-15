@@ -10,6 +10,7 @@ mod json_format;
 mod root;
 mod sql_complete;
 mod sql_format;
+mod sql_scaffold;
 mod tabs;
 mod text_diff;
 mod text_input;
@@ -72,6 +73,11 @@ pub fn run() {
             KeyBinding::new("cmd-shift-p", CommandPalette, Some("DbUi")),
             KeyBinding::new("cmd-shift-t", ChooseTheme, Some("DbUi")),
             KeyBinding::new("cmd-f", Find, Some("DbUi")),
+            KeyBinding::new("cmd-shift-f", SearchTables, Some("DbUi")),
+            KeyBinding::new("cmd-s", CommitChanges, Some("DbUi")),
+            // ⌘A and ⌘⌫ are handled in `DbUi::on_key` rather than bound here:
+            // both mean something different depending on which surface has the
+            // keyboard, and an action would claim them everywhere.
             KeyBinding::new("cmd-e", OpenSql, Some("DbUi")),
             KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
             KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
@@ -189,10 +195,20 @@ fn menus() -> Vec<Menu> {
             ],
         },
         Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Select All Rows", SelectAllRows),
+                MenuItem::action("Delete Selected Rows", DeleteRows),
+                MenuItem::separator(),
+                MenuItem::action("Commit Changes", CommitChanges),
+            ],
+        },
+        Menu {
             name: "Go".into(),
             items: vec![
                 MenuItem::action("Go to Table…", GoToTable),
                 MenuItem::action("Command Palette…", CommandPalette),
+                MenuItem::action("Search Tables", SearchTables),
                 MenuItem::action("Find…", Find),
             ],
         },
@@ -217,6 +233,10 @@ gpui::actions!(
         CommandPalette,
         ChooseTheme,
         Find,
+        SearchTables,
+        CommitChanges,
+        SelectAllRows,
+        DeleteRows,
         OpenSql,
         Refresh,
         RunQuery,

@@ -24,4 +24,4 @@ pub use workspace::{ConnectionEntry, ConnectionStatus, Workspace};
 // `dbui-domain` and `dbui-driver` directly. The layer boundary is easier to
 // keep when there is exactly one crate to import from.
 pub use dbui_domain as domain;
-pub use dbui_driver::{DatabaseDriver, DriverError, RowUpdate};
+pub use dbui_driver::{DatabaseDriver, DriverError, RowBatch, RowDelete, RowUpdate};

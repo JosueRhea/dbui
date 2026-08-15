@@ -46,12 +46,147 @@ pub struct PendingRowEdit {
 
 impl PendingRowEdit {
     pub fn matches_pk(&self, pk: &[(String, Value)]) -> bool {
-        self.pk.len() == pk.len()
-            && self
-                .pk
-                .iter()
-                .zip(pk.iter())
-                .all(|(a, b)| a.0 == b.0 && values_equal(&a.1, &b.1))
+        pk_equal(&self.pk, pk)
+    }
+}
+
+/// A row staged for removal, waiting for the same commit as the edits.
+///
+/// Deleting is staged rather than immediate for the same reason editing is:
+/// the person doing it gets to see the whole list, and to change their mind,
+/// before anything reaches the server.
+#[derive(Clone)]
+pub struct PendingRowDelete {
+    pub pk: Vec<(String, Value)>,
+    pub label: String,
+}
+
+impl PendingRowDelete {
+    pub fn matches_pk(&self, pk: &[(String, Value)]) -> bool {
+        pk_equal(&self.pk, pk)
+    }
+}
+
+fn pk_equal(left: &[(String, Value)], right: &[(String, Value)]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| a.0 == b.0 && values_equal(&a.1, &b.1))
+}
+
+/// The primary key of one result row, as `(column, value)` pairs.
+///
+/// `Err` when the rows came from somewhere with no key to name them by -- a
+/// join, a view, a table declared without one. A row this cannot identify is a
+/// row the app must refuse to delete rather than match on its other columns.
+pub fn row_pk(
+    columns: &[ColumnInfo],
+    values: &[Value],
+    structure: &[Column],
+) -> Result<Vec<(String, Value)>, String> {
+    let mut pk = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        let is_key = structure
+            .iter()
+            .any(|meta| meta.name == column.name && meta.is_primary_key);
+        if !is_key {
+            continue;
+        }
+        if let Some(value) = values.get(index) {
+            pk.push((column.name.clone(), value.clone()));
+        }
+    }
+    if pk.is_empty() {
+        return Err("table has no primary key".into());
+    }
+    Ok(pk)
+}
+
+/// `id=7, tenant=4` -- how a staged row is named in the change bubble.
+pub fn pk_label(pk: &[(String, Value)]) -> String {
+    pk.iter()
+        .map(|(name, value)| format!("{name}={}", display_change_text(value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which result rows are selected, and where a range grows from.
+///
+/// The anchor is the last row picked deliberately, which is not the same as
+/// the last row a range happened to touch: dragging back and forth has to keep
+/// measuring from where the drag started.
+#[derive(Default, Clone)]
+pub struct RowSelection {
+    rows: HashSet<usize>,
+    anchor: Option<usize>,
+}
+
+impl RowSelection {
+    pub fn contains(&self, row: usize) -> bool {
+        self.rows.contains(&row)
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+
+    /// Selected rows, low to high -- the order they are on screen in.
+    pub fn ordered(&self) -> Vec<usize> {
+        let mut rows: Vec<usize> = self.rows.iter().copied().collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// A plain click: this row and nothing else.
+    pub fn set_single(&mut self, row: usize) {
+        self.rows.clear();
+        self.rows.insert(row);
+        self.anchor = Some(row);
+    }
+
+    /// ⌘-click: add or remove one row without disturbing the rest.
+    pub fn toggle(&mut self, row: usize) {
+        if !self.rows.remove(&row) {
+            self.rows.insert(row);
+        }
+        self.anchor = Some(row);
+    }
+
+    /// Shift-click or drag: replace the selection with anchor..=row.
+    ///
+    /// The anchor stays put so dragging back the other way shrinks the range
+    /// instead of dragging the far end along with the pointer.
+    pub fn extend_to(&mut self, row: usize) {
+        let anchor = self.anchor.unwrap_or(row);
+        self.rows.clear();
+        let (low, high) = if anchor <= row {
+            (anchor, row)
+        } else {
+            (row, anchor)
+        };
+        self.rows.extend(low..=high);
+        self.anchor = Some(anchor);
+    }
+
+    pub fn select_all(&mut self, row_count: usize) {
+        self.rows = (0..row_count).collect();
+        if self.anchor.is_none() {
+            self.anchor = Some(0);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.anchor = None;
     }
 }
 
@@ -80,34 +215,60 @@ fn display_change_text(value: &Value) -> String {
     value_editor_text(value)
 }
 
-/// Editable draft of one selected row in the detail sidebar.
+/// The token a field shows when the selected rows do not agree on its value.
+///
+/// It belongs to the same vocabulary as `NULL`, `EMPTY` and `DEFAULT`: the box
+/// says exactly what will be written. Leaving `MIXED` alone leaves every row's
+/// own value alone; replacing it writes the replacement to all of them. A cell
+/// whose real content is the word is shown quoted, like the other tokens.
+pub const MIXED: &str = "MIXED";
+
+/// Editable draft of the selected row -- or of every selected row at once.
+///
+/// Bulk editing is this same object with more than one index in `rows`. A
+/// column the rows agree on shows that value; one they disagree on shows
+/// [`MIXED`]. Keeping it one type is what stops "edit a row" and "edit a
+/// selection" from becoming two code paths that stage changes differently --
+/// the second of which would be the one nobody tested.
 pub struct RowDraft {
-    pub row_index: usize,
+    /// Rows this draft edits, in grid order.
+    pub rows: Vec<usize>,
     /// `(column name, editor, is_primary_key)`
     pub fields: Vec<(String, TextInput, bool)>,
     pub message: Option<(bool, String)>,
     pub field_search: TextInput,
 }
 
+/// One selected row, paired with the edit already staged for it.
+///
+/// Resolved once per row rather than once per cell: finding the pending edit
+/// means a primary-key comparison, and doing that for every cell on screen is
+/// the same answer computed a few thousand times.
+type StagedRow<'a> = (&'a [Value], Option<&'a PendingRowEdit>);
+
 impl RowDraft {
-    /// Build editors aligned with the result-set columns (same order as `values`).
-    /// Primary-key flags are looked up by name from table `structure` when present.
-    pub fn from_row(
-        row_index: usize,
-        result_columns: &[ColumnInfo],
-        values: &[Value],
-        structure: &[Column],
-    ) -> Self {
-        let fields = result_columns
+    /// Build editors over `rows`, showing what those rows currently say --
+    /// including edits already staged for them, so leaving a row and coming
+    /// back does not look like the edit was thrown away.
+    pub fn from_rows(rows: &[usize], view: &ResultView, staged: &[PendingRowEdit]) -> Self {
+        let rows: Vec<usize> = rows
+            .iter()
+            .copied()
+            .filter(|row| *row < view.set.rows.len())
+            .collect();
+        let resolved = resolve_staged(&rows, view, staged);
+
+        let fields = view
+            .set
+            .columns
             .iter()
             .enumerate()
-            .map(|(i, column)| {
-                let is_pk = structure
+            .map(|(index, column)| {
+                let is_pk = view
+                    .structure
                     .iter()
-                    .find(|c| c.name == column.name)
-                    .map(|c| c.is_primary_key)
-                    .unwrap_or(false);
-                let text = values.get(i).map(value_editor_text).unwrap_or_default();
+                    .any(|meta| meta.name == column.name && meta.is_primary_key);
+                let text = agreed_text(&resolved, index, &column.name);
                 (
                     column.name.clone(),
                     // Non-PK cells are always multiline editors so JSON / long
@@ -117,59 +278,86 @@ impl RowDraft {
                 )
             })
             .collect();
+
         Self {
-            row_index,
+            rows,
             fields,
             message: None,
             field_search: TextInput::new(false),
         }
     }
 
-    /// SQL / ad-hoc results: every field is an editable multiline editor.
-    pub fn from_sql_row(row_index: usize, columns: &[ColumnInfo], values: &[Value]) -> Self {
-        Self::from_row(row_index, columns, values, &[])
+    /// Whether this draft is speaking for more than one row.
+    pub fn is_bulk(&self) -> bool {
+        self.rows.len() > 1
     }
 
-    pub fn is_dirty(&self, originals: &[Value]) -> bool {
-        self.fields.iter().enumerate().any(|(i, (_, input, is_pk))| {
-            if *is_pk {
-                return false;
-            }
-            let Some(original) = originals.get(i) else {
-                return false;
-            };
-            match parse_draft_value(input.text(), original) {
-                Ok(parsed) => !values_equal(&parsed, original),
-                Err(_) => {
-                    let original_text = value_editor_text(original);
-                    !json_format::texts_equivalent(input.text(), &original_text)
-                }
-            }
-        })
+    /// The primary key of every row this draft covers.
+    ///
+    /// What the caller uses to clear out this draft's rows before restaging
+    /// them: [`to_pending_batch`] returns the whole intent for each row, so
+    /// merging into what is already there would double-count.
+    ///
+    /// [`to_pending_batch`]: RowDraft::to_pending_batch
+    pub fn row_keys(&self, view: &ResultView) -> Vec<Vec<(String, Value)>> {
+        self.rows
+            .iter()
+            .filter_map(|&row| view.set.rows.get(row))
+            .filter_map(|values| row_pk(&view.set.columns, &values.0, &view.structure).ok())
+            .collect()
     }
 
-    /// Build a pending edit from this draft, or `None` if nothing changed / parse failed.
-    pub fn to_pending(
+    /// One pending edit per covered row that would actually change.
+    ///
+    /// Two rules do the work of bulk editing. A row whose stored value already
+    /// matches what was typed produces nothing, so setting a column across a
+    /// selection writes only the rows that differ. And a column left [`MIXED`]
+    /// keeps whatever was staged for it before -- the draft never showed those
+    /// values, so it has no opinion to overwrite them with.
+    pub fn to_pending_batch(
         &self,
-        originals: &[Value],
-    ) -> Result<Option<PendingRowEdit>, String> {
-        if !self.is_dirty(originals) {
-            return Ok(None);
-        }
+        view: &ResultView,
+        staged: &[PendingRowEdit],
+    ) -> Result<Vec<PendingRowEdit>, String> {
+        let mut edits = Vec::new();
 
-        let mut pk = Vec::new();
-        let mut changes = Vec::new();
-        let mut label_parts = Vec::new();
-
-        for (index, (name, input, is_pk)) in self.fields.iter().enumerate() {
-            let Some(original) = originals.get(index) else {
+        for &row in &self.rows {
+            let Some(values) = view.set.rows.get(row) else {
                 continue;
             };
-            let parsed = parse_draft_value(input.text(), original)?;
-            if *is_pk {
-                label_parts.push(format!("{name}={}", display_change_text(&parsed)));
-                pk.push((name.clone(), parsed));
-            } else if !values_equal(&parsed, original) {
+            let pk = row_pk(&view.set.columns, &values.0, &view.structure).ok();
+            let existing = pk
+                .as_ref()
+                .and_then(|pk| staged.iter().find(|edit| edit.matches_pk(pk)));
+
+            let mut changes = Vec::new();
+            for (index, (name, input, is_pk)) in self.fields.iter().enumerate() {
+                if *is_pk {
+                    continue;
+                }
+                if is_mixed(input.text()) {
+                    if let Some(change) = existing
+                        .and_then(|edit| edit.changes.iter().find(|change| &change.column == name))
+                    {
+                        changes.push(change.clone());
+                    }
+                    continue;
+                }
+                let Some(original) = values.0.get(index) else {
+                    continue;
+                };
+                // Untouched fields are skipped before they are parsed, not
+                // after. A column this build has no decoder for round-trips as
+                // text but does not parse back, and reporting that as an error
+                // every time a row is selected would be a message about
+                // nothing the user did.
+                if input.text() == value_editor_text(original) {
+                    continue;
+                }
+                let parsed = parse_draft_value(input.text(), original)?;
+                if values_equal(&parsed, original) {
+                    continue;
+                }
                 changes.push(FieldChange {
                     column: name.clone(),
                     old_text: display_change_text(original),
@@ -178,60 +366,85 @@ impl RowDraft {
                     new_value: parsed,
                 });
             }
-        }
 
-        if changes.is_empty() {
-            return Ok(None);
-        }
-        if pk.is_empty() {
-            return Err("table has no primary key".into());
-        }
-
-        Ok(Some(PendingRowEdit {
-            pk,
-            label: label_parts.join(", "),
-            changes,
-        }))
-    }
-
-    /// Apply a pending edit's new values onto this draft's editors.
-    pub fn apply_pending(&mut self, pending: &PendingRowEdit) {
-        for change in &pending.changes {
-            if let Some((_, input, _)) = self
-                .fields
-                .iter_mut()
-                .find(|(name, _, _)| name == &change.column)
-            {
-                *input = TextInput::with_text(change.edited_text.clone(), true);
-            }
-        }
-    }
-
-    pub fn pk_values(&self, originals: &[Value]) -> Result<Vec<(String, Value)>, String> {
-        let mut pk = Vec::new();
-        for (index, (name, input, is_pk)) in self.fields.iter().enumerate() {
-            if !*is_pk {
+            if changes.is_empty() {
                 continue;
             }
-            let Some(original) = originals.get(index) else {
-                continue;
+            // Checked here rather than up front: a selection over a result with
+            // no key is only a problem once there is something to write.
+            let Some(pk) = pk else {
+                return Err("table has no primary key".into());
             };
-            pk.push((name.clone(), parse_draft_value(input.text(), original)?));
+            edits.push(PendingRowEdit {
+                label: pk_label(&pk),
+                pk,
+                changes,
+            });
         }
-        Ok(pk)
+
+        Ok(edits)
     }
 
-    pub fn reset_to(&mut self, originals: &[Value]) {
-        for (index, (_, input, _)) in self.fields.iter_mut().enumerate() {
-            let text = originals
-                .get(index)
-                .map(value_editor_text)
-                .unwrap_or_default();
+    /// Put every field back to what the rows actually hold, dropping both what
+    /// was typed and anything staged.
+    pub fn reset(&mut self, view: &ResultView) {
+        let resolved = resolve_staged(&self.rows, view, &[]);
+        for (index, (name, input, _)) in self.fields.iter_mut().enumerate() {
             let multiline = input.is_multiline();
-            *input = TextInput::with_text(text, multiline);
+            *input = TextInput::with_text(agreed_text(&resolved, index, name), multiline);
         }
         self.message = None;
     }
+}
+
+/// Whether a field is saying "the rows differ" rather than naming a value.
+fn is_mixed(text: &str) -> bool {
+    text.trim() == MIXED
+}
+
+fn resolve_staged<'a>(
+    rows: &[usize],
+    view: &'a ResultView,
+    staged: &'a [PendingRowEdit],
+) -> Vec<StagedRow<'a>> {
+    rows.iter()
+        .filter_map(|&row| view.set.rows.get(row))
+        .map(|values| {
+            let edit = if staged.is_empty() {
+                None
+            } else {
+                row_pk(&view.set.columns, &values.0, &view.structure)
+                    .ok()
+                    .and_then(|pk| staged.iter().find(|edit| edit.matches_pk(&pk)))
+            };
+            (values.0.as_slice(), edit)
+        })
+        .collect()
+}
+
+/// What one column reads across the selection: the text every row shares, or
+/// [`MIXED`] as soon as two of them disagree.
+///
+/// Returns on the first disagreement, which is what keeps selecting a few
+/// hundred rows from rendering every cell of every one of them.
+fn agreed_text(staged: &[StagedRow<'_>], index: usize, name: &str) -> String {
+    let mut shared: Option<String> = None;
+    for (values, edit) in staged {
+        let text = match edit
+            .and_then(|edit| edit.changes.iter().find(|change| change.column == name))
+        {
+            // The buffer verbatim, not the value re-rendered: coming back to a
+            // row must not hand back a reformatted copy of what was typed.
+            Some(change) => change.edited_text.clone(),
+            None => values.get(index).map(value_editor_text).unwrap_or_default(),
+        };
+        match &shared {
+            None => shared = Some(text),
+            Some(seen) if *seen == text => {}
+            Some(_) => return MIXED.to_string(),
+        }
+    }
+    shared.unwrap_or_default()
 }
 
 /// Text shown / edited in a detail field (pretty JSON when applicable).
@@ -259,7 +472,7 @@ fn value_editor_text(value: &Value) -> String {
 fn is_special_token(text: &str) -> bool {
     matches!(
         text.trim().to_ascii_uppercase().as_str(),
-        "NULL" | "EMPTY" | "DEFAULT"
+        "NULL" | "EMPTY" | "DEFAULT" | MIXED
     )
 }
 
@@ -292,13 +505,6 @@ fn unquote_draft_literal(text: &str) -> Option<String> {
     Some(out)
 }
 
-pub fn upsert_pending(pending: &mut Vec<PendingRowEdit>, edit: PendingRowEdit) {
-    if let Some(existing) = pending.iter_mut().find(|row| row.matches_pk(&edit.pk)) {
-        *existing = edit;
-    } else {
-        pending.push(edit);
-    }
-}
 
 pub enum WorkspaceTab {
     Table {
@@ -316,8 +522,12 @@ pub enum WorkspaceTab {
         hidden_columns: HashSet<String>,
         result: Option<ResultView>,
         selected_row: Option<usize>,
+        /// Every selected row. `selected_row` is the one whose detail is open;
+        /// this is what ⌘A, shift-click and drag build, and what ⌘⌫ acts on.
+        selection: RowSelection,
         draft: Option<RowDraft>,
         pending_edits: Vec<PendingRowEdit>,
+        pending_deletes: Vec<PendingRowDelete>,
         change_bubble_expanded: bool,
         /// True while a transactional save for this tab is in flight.
         saving: bool,
@@ -331,6 +541,7 @@ pub enum WorkspaceTab {
         editor: TextInput,
         result: Option<ResultView>,
         selected_row: Option<usize>,
+        selection: RowSelection,
         /// Editable detail editors for the selected result row.
         draft: Option<RowDraft>,
     },
@@ -349,8 +560,10 @@ impl WorkspaceTab {
             hidden_columns: HashSet::new(),
             result: None,
             selected_row: None,
+            selection: RowSelection::default(),
             draft: None,
             pending_edits: Vec::new(),
+            pending_deletes: Vec::new(),
             change_bubble_expanded: false,
             saving: false,
             pane: TablePane::Data,
@@ -366,6 +579,7 @@ impl WorkspaceTab {
             editor: TextInput::new(true),
             result: None,
             selected_row: None,
+            selection: RowSelection::default(),
             draft: None,
         }
     }
@@ -418,6 +632,51 @@ impl WorkspaceTab {
     pub fn selected_row(&self) -> Option<usize> {
         match self {
             Self::Table { selected_row, .. } | Self::Sql { selected_row, .. } => *selected_row,
+        }
+    }
+
+    pub fn selection(&self) -> &RowSelection {
+        match self {
+            Self::Table { selection, .. } | Self::Sql { selection, .. } => selection,
+        }
+    }
+
+    pub fn selection_mut(&mut self) -> &mut RowSelection {
+        match self {
+            Self::Table { selection, .. } | Self::Sql { selection, .. } => selection,
+        }
+    }
+
+    /// Rows staged for deletion. Only a table tab can have any: a query result
+    /// has no table to delete from.
+    pub fn pending_deletes(&self) -> &[PendingRowDelete] {
+        match self {
+            Self::Table {
+                pending_deletes, ..
+            } => pending_deletes,
+            Self::Sql { .. } => &[],
+        }
+    }
+
+    /// Whether the row at `index` is struck through as staged for deletion.
+    pub fn row_is_staged_for_delete(&self, index: usize) -> bool {
+        let Self::Table {
+            pending_deletes,
+            result: Some(view),
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if pending_deletes.is_empty() {
+            return false;
+        }
+        let Some(values) = view.set.rows.get(index) else {
+            return false;
+        };
+        match row_pk(&view.set.columns, &values.0, &view.structure) {
+            Ok(pk) => pending_deletes.iter().any(|row| row.matches_pk(&pk)),
+            Err(_) => false,
         }
     }
 
@@ -610,17 +869,20 @@ impl Tabs {
                 WorkspaceTab::Table {
                     result,
                     selected_row,
+                    selection,
                     draft,
                     ..
                 }
                 | WorkspaceTab::Sql {
                     result,
                     selected_row,
+                    selection,
                     draft,
                     ..
                 } => {
                     *result = None;
                     *selected_row = None;
+                    selection.clear();
                     *draft = None;
                 }
             }
@@ -653,6 +915,12 @@ pub fn parse_draft_value(text: &str, original: &Value) -> Result<Value, String> 
         return parse_typed_literal(&inner, original);
     }
 
+    // Callers skip a field still reading MIXED, so reaching here with one is a
+    // bug -- and writing the literal word to every selected row is the worst
+    // possible way for it to show up.
+    if trimmed.eq_ignore_ascii_case(MIXED) {
+        return Err("MIXED means the selected rows differ — type a value to set them all".into());
+    }
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Ok(Value::Null);
     }
@@ -942,20 +1210,79 @@ mod tests {
         );
     }
 
+    /// A result with an `id` primary key and one editable column.
+    fn view_with(column: &str, rows: &[(i64, Value)]) -> ResultView {
+        use crate::root::ResultSource;
+        use dbui_app::domain::{ResultSet, Row};
+
+        ResultView::new(
+            ResultSet {
+                columns: vec![
+                    ColumnInfo {
+                        name: "id".into(),
+                        type_name: "int8".into(),
+                    },
+                    ColumnInfo {
+                        name: column.to_string(),
+                        type_name: "text".into(),
+                    },
+                ],
+                rows: rows
+                    .iter()
+                    .map(|(id, value)| Row(vec![Value::Int(*id), value.clone()]))
+                    .collect(),
+                truncated: false,
+            },
+            ResultSource::Query {
+                sql: String::new(),
+            },
+            String::new(),
+            vec![Column {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                nullable: false,
+                default: None,
+                is_primary_key: true,
+                ordinal: 1,
+            }],
+        )
+    }
+
+    fn draft_over(view: &ResultView, rows: &[usize]) -> RowDraft {
+        RowDraft::from_rows(rows, view, &[])
+    }
+
+    /// One row, with `buffer` typed over its editable column.
+    fn one_row_draft(column: &str, stored: Value, buffer: &str) -> (ResultView, RowDraft) {
+        let view = view_with(column, &[(1, stored)]);
+        let mut draft = draft_over(&view, &[0]);
+        draft.fields[1].1 = TextInput::with_text(buffer, true);
+        (view, draft)
+    }
+
+    /// The single change a one-row, one-column draft should produce.
+    fn sole_change(view: &ResultView, draft: &RowDraft) -> FieldChange {
+        let edits = draft.to_pending_batch(view, &[]).unwrap();
+        assert_eq!(edits.len(), 1, "one row should change");
+        assert_eq!(edits[0].changes.len(), 1, "one column should change");
+        edits[0].changes[0].clone()
+    }
+
+    /// What each field of a draft reads, for comparing against MIXED.
+    fn texts(draft: &RowDraft) -> Vec<String> {
+        draft
+            .fields
+            .iter()
+            .map(|(_, input, _)| input.text().to_string())
+            .collect()
+    }
+
     #[test]
-    fn empty_buffer_is_not_dirty_when_cell_was_already_empty() {
-        let draft = RowDraft {
-            row_index: 0,
-            fields: vec![(
-                "name".into(),
-                TextInput::with_text("", true),
-                false,
-            )],
-            message: None,
-            field_search: TextInput::new(false),
-        };
-        assert!(!draft.is_dirty(&[Value::Text(String::new())]));
-        assert!(!draft.is_dirty(&[Value::Null]));
+    fn an_empty_buffer_over_an_empty_cell_writes_nothing() {
+        for stored in [Value::Text(String::new()), Value::Null] {
+            let (view, draft) = one_row_draft("name", stored, "");
+            assert!(draft.to_pending_batch(&view, &[]).unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -963,40 +1290,16 @@ mod tests {
         let compact = Value::Json(r#"{"Hello":"World"}"#.into());
         let pretty = value_editor_text(&compact);
         assert!(pretty.contains('\n'), "editor should pretty-print JSON");
-        let draft = RowDraft {
-            row_index: 0,
-            fields: vec![("feature_flags".into(), TextInput::with_text(pretty, true), false)],
-            message: None,
-            field_search: TextInput::new(false),
-        };
-        assert!(!draft.is_dirty(&[compact.clone()]));
-        assert!(draft.to_pending(&[compact]).unwrap().is_none());
-    }
-
-    /// Build a draft over an `id` primary key plus one editable column.
-    fn draft_with(column: &str, buffer: &str) -> RowDraft {
-        RowDraft {
-            row_index: 0,
-            fields: vec![
-                ("id".into(), TextInput::with_text("1", false), true),
-                (column.into(), TextInput::with_text(buffer, true), false),
-            ],
-            message: None,
-            field_search: TextInput::new(false),
-        }
+        let (view, draft) = one_row_draft("feature_flags", compact, &pretty);
+        assert!(draft.to_pending_batch(&view, &[]).unwrap().is_empty());
     }
 
     #[test]
     fn editing_one_key_of_a_compact_json_column_writes_compact_json() {
         let stored = Value::Json(r#"{"beta":2,"alpha":1}"#.into());
         let buffer = value_editor_text(&stored).replace("\"beta\": 2", "\"beta\": 3");
-        let draft = draft_with("flags", &buffer);
-
-        let pending = draft
-            .to_pending(&[Value::Int(1), stored])
-            .unwrap()
-            .expect("one change");
-        let change = &pending.changes[0];
+        let (view, draft) = one_row_draft("flags", stored, &buffer);
+        let change = sole_change(&view, &draft);
 
         assert_eq!(
             change.new_value,
@@ -1015,29 +1318,18 @@ mod tests {
     fn a_text_column_holding_json_also_keeps_its_layout() {
         let stored = Value::Text(r#"{"on":false}"#.into());
         let buffer = value_editor_text(&stored).replace("false", "true");
-        let draft = draft_with("settings", &buffer);
-
-        let pending = draft
-            .to_pending(&[Value::Int(1), stored])
-            .unwrap()
-            .expect("one change");
+        let (view, draft) = one_row_draft("settings", stored, &buffer);
         assert_eq!(
-            pending.changes[0].new_value,
+            sole_change(&view, &draft).new_value,
             Value::Text(r#"{"on":true}"#.into())
         );
     }
 
     #[test]
     fn plain_text_is_not_touched_by_the_json_layout_rules() {
-        let stored = Value::Text("hello".into());
-        let draft = draft_with("note", "hello there");
-
-        let pending = draft
-            .to_pending(&[Value::Int(1), stored])
-            .unwrap()
-            .expect("one change");
+        let (view, draft) = one_row_draft("note", Value::Text("hello".into()), "hello there");
         assert_eq!(
-            pending.changes[0].new_value,
+            sole_change(&view, &draft).new_value,
             Value::Text("hello there".into())
         );
     }
@@ -1046,16 +1338,202 @@ mod tests {
     /// to restore a re-serialized copy, silently reformatting the user's JSON.
     #[test]
     fn revisiting_a_row_restores_the_text_that_was_typed() {
-        let stored = Value::Json(r#"{"a":1}"#.into());
         let typed = r#"{"a":2}"#;
-        let pending = draft_with("blob", typed)
-            .to_pending(&[Value::Int(1), stored.clone()])
-            .unwrap()
-            .expect("one change");
+        let (view, draft) = one_row_draft("blob", Value::Json(r#"{"a":1}"#.into()), typed);
+        let staged = draft.to_pending_batch(&view, &[]).unwrap();
 
-        let mut reopened = draft_with("blob", &value_editor_text(&stored));
-        reopened.apply_pending(&pending);
+        let reopened = RowDraft::from_rows(&[0], &view, &staged);
         assert_eq!(reopened.fields[1].1.text(), typed);
+    }
+
+    // -- editing a selection --------------------------------------------------
+
+    /// Three rows: two share a status, all three have different names.
+    fn three_rows() -> ResultView {
+        use crate::root::ResultSource;
+        use dbui_app::domain::{ResultSet, Row};
+
+        ResultView::new(
+            ResultSet {
+                columns: ["id", "name", "status"]
+                    .iter()
+                    .map(|name| ColumnInfo {
+                        name: (*name).to_string(),
+                        type_name: "text".into(),
+                    })
+                    .collect(),
+                rows: vec![
+                    Row(vec![
+                        Value::Int(1),
+                        Value::Text("Ada".into()),
+                        Value::Text("active".into()),
+                    ]),
+                    Row(vec![
+                        Value::Int(2),
+                        Value::Text("Grace".into()),
+                        Value::Text("active".into()),
+                    ]),
+                    Row(vec![
+                        Value::Int(3),
+                        Value::Text("Alan".into()),
+                        Value::Text("paused".into()),
+                    ]),
+                ],
+                truncated: false,
+            },
+            ResultSource::Query {
+                sql: String::new(),
+            },
+            String::new(),
+            vec![Column {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                nullable: false,
+                default: None,
+                is_primary_key: true,
+                ordinal: 1,
+            }],
+        )
+    }
+
+    #[test]
+    fn a_selection_shows_what_its_rows_agree_on_and_marks_the_rest_mixed() {
+        let view = three_rows();
+
+        // Rows 0 and 1 share a status but not a name.
+        let draft = draft_over(&view, &[0, 1]);
+        assert_eq!(texts(&draft), vec![MIXED, MIXED, "active"]);
+        assert!(draft.is_bulk());
+
+        // One row on its own is not a bulk edit and shows its own values.
+        let single = draft_over(&view, &[2]);
+        assert_eq!(texts(&single), vec!["3", "Alan", "paused"]);
+        assert!(!single.is_bulk());
+    }
+
+    /// The rule the whole feature rests on: a field nobody touched is left
+    /// alone, however many rows are selected.
+    #[test]
+    fn a_field_left_mixed_writes_nothing() {
+        let view = three_rows();
+        let draft = draft_over(&view, &[0, 1, 2]);
+        assert_eq!(texts(&draft), vec![MIXED, MIXED, MIXED]);
+        assert!(draft.to_pending_batch(&view, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn editing_a_field_writes_it_to_every_row_that_differs() {
+        let view = three_rows();
+        let mut draft = draft_over(&view, &[0, 1, 2]);
+        draft.fields[2].1 = TextInput::with_text("archived", true);
+
+        let edits = draft.to_pending_batch(&view, &[]).unwrap();
+        assert_eq!(edits.len(), 3, "every selected row changes");
+        for edit in &edits {
+            assert_eq!(edit.changes.len(), 1, "only the touched column");
+            assert_eq!(edit.changes[0].column, "status");
+            assert_eq!(edit.changes[0].new_value, Value::Text("archived".into()));
+        }
+        assert_eq!(edits[0].label, "id=1");
+    }
+
+    /// Rows that already hold the typed value are not rewritten: setting a
+    /// column across a selection should touch the rows that differ and no more.
+    #[test]
+    fn rows_that_already_match_are_left_out_of_the_batch() {
+        let view = three_rows();
+        let mut draft = draft_over(&view, &[0, 1, 2]);
+        draft.fields[2].1 = TextInput::with_text("active", true);
+
+        let edits = draft.to_pending_batch(&view, &[]).unwrap();
+        assert_eq!(edits.len(), 1, "only the paused row differs");
+        assert_eq!(edits[0].label, "id=3");
+    }
+
+    /// The bug this guards: rows staged with *different* values make their
+    /// column read MIXED, and a draft with no opinion on it must not be taken
+    /// as an instruction to drop what was already staged.
+    #[test]
+    fn a_mixed_field_keeps_the_edits_already_staged_for_those_rows() {
+        let view = three_rows();
+
+        // Stage a different name on each of two rows.
+        let mut first = draft_over(&view, &[0]);
+        first.fields[1].1 = TextInput::with_text("Ada L", true);
+        let mut staged = first.to_pending_batch(&view, &[]).unwrap();
+
+        let mut second = draft_over(&view, &[1]);
+        second.fields[1].1 = TextInput::with_text("Grace H", true);
+        staged.extend(second.to_pending_batch(&view, &staged).unwrap());
+        assert_eq!(staged.len(), 2);
+
+        // Selecting both shows the names as MIXED -- they disagree.
+        let bulk = RowDraft::from_rows(&[0, 1], &view, &staged);
+        assert_eq!(texts(&bulk)[1], MIXED);
+
+        // Editing only the status must leave both staged names in place.
+        let mut bulk = bulk;
+        bulk.fields[2].1 = TextInput::with_text("archived", true);
+        let edits = bulk.to_pending_batch(&view, &staged).unwrap();
+
+        assert_eq!(edits.len(), 2);
+        for edit in &edits {
+            let columns: Vec<&str> = edit
+                .changes
+                .iter()
+                .map(|change| change.column.as_str())
+                .collect();
+            assert!(
+                columns.contains(&"name") && columns.contains(&"status"),
+                "the staged name survives alongside the new status: {columns:?}"
+            );
+        }
+    }
+
+    /// Typing a value back to what the server holds un-stages it, rather than
+    /// leaving an edit behind that would be written anyway.
+    #[test]
+    fn typing_a_value_back_drops_its_staged_edit() {
+        let view = three_rows();
+        let mut draft = draft_over(&view, &[0]);
+        draft.fields[1].1 = TextInput::with_text("Ada L", true);
+        let staged = draft.to_pending_batch(&view, &[]).unwrap();
+        assert_eq!(staged.len(), 1);
+
+        let reopened = RowDraft::from_rows(&[0], &view, &staged);
+        assert_eq!(texts(&reopened)[1], "Ada L");
+
+        let mut reverted = reopened;
+        reverted.fields[1].1 = TextInput::with_text("Ada", true);
+        assert!(reverted.to_pending_batch(&view, &staged).unwrap().is_empty());
+    }
+
+    /// `MIXED` is a write token like the others, so a cell whose real content
+    /// is the word has to survive being shown and typed back.
+    #[test]
+    fn a_cell_holding_the_word_mixed_round_trips_quoted() {
+        let stored = Value::Text(MIXED.into());
+        assert_eq!(value_editor_text(&stored), "\"MIXED\"");
+
+        let view = view_with("note", &[(1, stored.clone())]);
+        let draft = draft_over(&view, &[0]);
+        assert_eq!(
+            draft.fields[1].1.text(),
+            "\"MIXED\"",
+            "shown quoted, so it is not mistaken for the token"
+        );
+        assert!(
+            draft.to_pending_batch(&view, &[]).unwrap().is_empty(),
+            "and reading it back is not a change"
+        );
+    }
+
+    /// Reaching the parser with the token means a caller forgot to skip the
+    /// field -- writing the literal word to every selected row would be the
+    /// worst possible outcome, so it is refused.
+    #[test]
+    fn the_mixed_token_is_never_parsed_into_a_value() {
+        assert!(parse_draft_value(MIXED, &Value::Text("x".into())).is_err());
     }
 
     /// A settings blob of the shape these columns really hold: mixed key
@@ -1104,12 +1582,8 @@ mod tests {
         assert!(seed.contains(find), "`{find}` should be in the buffer");
         let buffer = seed.replacen(find, replace, 1);
 
-        let draft = draft_with("settings", &buffer);
-        let pending = draft
-            .to_pending(&[Value::Int(1), stored.clone()])
-            .unwrap()
-            .expect("one change");
-        let change = &pending.changes[0];
+        let (view, draft) = one_row_draft("settings", stored.clone(), &buffer);
+        let change = &sole_change(&view, &draft);
 
         // The bubble diffs the two normalized sides, and must report the edit
         // rather than all ~28 lines of the document.
@@ -1177,18 +1651,11 @@ mod tests {
     #[test]
     fn discard_style_reset_leaves_json_clean() {
         let compact = Value::Json(r#"{"Hello":"World"}"#.into());
-        let mut draft = RowDraft {
-            row_index: 0,
-            fields: vec![(
-                "feature_flags".into(),
-                TextInput::with_text(r#"{"Hello":"Changed"}"#, true),
-                false,
-            )],
-            message: None,
-            field_search: TextInput::new(false),
-        };
-        assert!(draft.is_dirty(&[compact.clone()]));
-        draft.reset_to(&[compact.clone()]);
-        assert!(!draft.is_dirty(&[compact]));
+        let (view, mut draft) =
+            one_row_draft("feature_flags", compact, r#"{"Hello":"Changed"}"#);
+        assert_eq!(draft.to_pending_batch(&view, &[]).unwrap().len(), 1);
+
+        draft.reset(&view);
+        assert!(draft.to_pending_batch(&view, &[]).unwrap().is_empty());
     }
 }

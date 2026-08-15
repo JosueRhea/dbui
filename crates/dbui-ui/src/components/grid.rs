@@ -5,7 +5,8 @@ use crate::tabs::WorkspaceTab;
 use crate::theme::metrics;
 use dbui_app::domain::ValueKind;
 use gpui::{
-    div, prelude::*, px, uniform_list, AnyElement, Context, SharedString, Window,
+    div, prelude::*, px, uniform_list, AnyElement, Context, MouseButton, MouseDownEvent,
+    SharedString, Window,
 };
 use std::collections::HashSet;
 
@@ -98,7 +99,7 @@ impl DbUi {
                         WorkspaceTab::Sql { .. } => true,
                     })
                     .collect();
-                let selected_row = tab.selected_row();
+                let lead_row = tab.selected_row();
                 let theme = &this.theme;
                 let total_width: f32 = visible
                     .iter()
@@ -115,7 +116,9 @@ impl DbUi {
                     .map(|index| {
                         let row = &view.set.rows[index];
                         let stripe = theme.stripe(index);
-                        let row_selected = selected_row == Some(index);
+                        let row_selected = tab.selection().contains(index)
+                            || lead_row == Some(index);
+                        let staged_delete = tab.row_is_staged_for_delete(index);
 
                         let cells: Vec<AnyElement> = visible
                             .iter()
@@ -156,10 +159,25 @@ impl DbUi {
                                     .when(kind.right_aligned(), |cell| cell.justify_end())
                                     .text_color(theme.value_color(kind))
                                     .when(is_null, |cell| cell.text_color(theme.value_null))
+                                    // A row on its way out is drawn as one:
+                                    // struck through, in the colour the change
+                                    // bubble uses for a removal.
+                                    .when(staged_delete, |cell| {
+                                        cell.line_through().text_color(theme.danger)
+                                    })
                                     .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _window, cx| {
-                                        this.select_cell(index, column, cx)
-                                    }))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.grid_pointer_down(
+                                                index,
+                                                Some(column),
+                                                event.modifiers,
+                                                cx,
+                                            );
+                                        }),
+                                    )
                                     .child(text)
                                     .into_any_element()
                             })
@@ -173,10 +191,20 @@ impl DbUi {
                             .when_some(stripe, |row, tint| row.bg(tint))
                             .when(row_selected, |row| row.bg(theme.selection))
                             .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                cx.stop_propagation();
-                                this.select_row(index, cx);
-                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.grid_pointer_down(index, None, event.modifiers, cx);
+                                }),
+                            )
+                            // Drag-select. The press marks the anchor; crossing
+                            // a row with the button down grows the range to it.
+                            .on_mouse_move(cx.listener(
+                                move |this, _: &gpui::MouseMoveEvent, _, cx| {
+                                    this.grid_drag_over(index, cx);
+                                },
+                            ))
                             .child(
                                 div()
                                     .w(metrics::row_number_width())
@@ -186,11 +214,19 @@ impl DbUi {
                                     .items_center()
                                     .justify_end()
                                     .px_2()
-                                    .text_color(theme.text_faint)
+                                    .text_color(if staged_delete {
+                                        theme.danger
+                                    } else {
+                                        theme.text_faint
+                                    })
                                     .text_size(metrics::text_size_small())
                                     .border_r_1()
                                     .border_color(theme.divider)
-                                    .child(SharedString::from((index + 1).to_string())),
+                                    .child(SharedString::from(if staged_delete {
+                                        "−".to_string()
+                                    } else {
+                                        (index + 1).to_string()
+                                    })),
                             )
                             .children(cells)
                     })

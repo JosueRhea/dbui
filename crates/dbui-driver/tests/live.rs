@@ -635,6 +635,174 @@ both_engines!(
     }
 );
 
+/// One commit, both kinds of change. This is what ⌘S sends: if the two
+/// travelled in separate transactions, a failing delete would leave the edits
+/// written, which is the state the staged batch exists to prevent.
+both_engines!(
+    a_batch_commits_edits_and_deletions_together,
+    |fx: Fixture| async move {
+        use dbui_driver::{RowBatch, RowDelete, RowUpdate};
+
+        let table = fx.people();
+        let affected = fx
+            .apply_changes(
+                &table,
+                &RowBatch {
+                    updates: vec![RowUpdate {
+                        pk: vec![("id".into(), Value::Int(1))],
+                        changes: vec![("nickname".into(), Value::Text("Lovelace".into()))],
+                    }],
+                    deletes: vec![
+                        RowDelete {
+                            pk: vec![("id".into(), Value::Int(4))],
+                        },
+                        RowDelete {
+                            pk: vec![("id".into(), Value::Int(5))],
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("mixed batch");
+        assert_eq!(affected, 3, "one update and two deletes");
+
+        assert_eq!(
+            fx.row_count(&table, "").await.expect("count"),
+            3,
+            "the seed has five rows and two were deleted"
+        );
+        let ada = fx
+            .table_rows(&table, Page::first(), "name = 'Ada'")
+            .await
+            .expect("reload ada");
+        assert_eq!(
+            ada.rows[0].get(2).map(|v| v.to_text()),
+            Some("Lovelace".into()),
+            "and the edit in the same batch stuck"
+        );
+    }
+);
+
+/// A delete that the server refuses takes the whole batch with it, including
+/// the edits that had already been applied inside the transaction.
+both_engines!(
+    a_failing_delete_rolls_the_edits_back,
+    |fx: Fixture| async move {
+        use dbui_driver::{RowBatch, RowDelete, RowUpdate};
+
+        let table = fx.people();
+        // A child row referencing Grace, so deleting her is refused by the
+        // server rather than by anything this crate checks first.
+        let children = fx.table("memberships");
+        let child_sql = children.quoted(fx.driver());
+        let parent_sql = table.quoted(fx.driver());
+        // A table-level FOREIGN KEY, not a column-level `REFERENCES`: MySQL
+        // parses the inline form and then ignores it, so the constraint this
+        // test depends on would silently not exist.
+        fx.execute(&format!(
+            "CREATE TABLE {child_sql} (
+                 id        bigint PRIMARY KEY,
+                 person_id bigint NOT NULL,
+                 FOREIGN KEY (person_id) REFERENCES {parent_sql} (id)
+             )"
+        ))
+        .await
+        .expect("create child table");
+        fx.execute(&format!(
+            "INSERT INTO {child_sql} (id, person_id) VALUES (1, 2)"
+        ))
+        .await
+        .expect("seed child row");
+
+        let err = fx
+            .apply_changes(
+                &table,
+                &RowBatch {
+                    updates: vec![RowUpdate {
+                        pk: vec![("id".into(), Value::Int(1))],
+                        changes: vec![("nickname".into(), Value::Text("should-not-stick".into()))],
+                    }],
+                    // A child row references this one, so the FK aborts the tx.
+                    deletes: vec![RowDelete {
+                        pk: vec![("id".into(), Value::Int(2))],
+                    }],
+                },
+            )
+            .await
+            .expect_err("a referenced row cannot be deleted");
+        assert!(!err.to_string().is_empty(), "and it says why");
+
+        assert_eq!(
+            fx.row_count(&table, "").await.expect("count"),
+            5,
+            "nothing was deleted"
+        );
+        let ada = fx
+            .table_rows(&table, Page::first(), "name = 'Ada'")
+            .await
+            .expect("reload ada");
+        assert!(
+            ada.rows[0].get(2).expect("nickname").is_null(),
+            "and the edit that ran before it rolled back too"
+        );
+    }
+);
+
+/// A row named by a key that matches nothing is not an error -- it is a row
+/// somebody else already deleted. The count is what says so.
+both_engines!(deleting_a_missing_row_affects_nothing, |fx: Fixture| async move {
+    use dbui_driver::{RowBatch, RowDelete};
+
+    let table = fx.people();
+    let affected = fx
+        .apply_changes(
+            &table,
+            &RowBatch {
+                updates: Vec::new(),
+                deletes: vec![RowDelete {
+                    pk: vec![("id".into(), Value::Int(9_999))],
+                }],
+            },
+        )
+        .await
+        .expect("a no-op delete is not a failure");
+    assert_eq!(affected, 0);
+    assert_eq!(fx.row_count(&table, "").await.expect("count"), 5);
+});
+
+/// The two statements the context menu offers have to be accepted as written.
+both_engines!(generated_truncate_and_drop_are_accepted, |fx: Fixture| async move {
+    use dbui_domain::TableKind;
+
+    let table = fx.table("scratch");
+    let quoted = table.quoted(fx.driver());
+    fx.execute(&format!("CREATE TABLE {quoted} (id bigint PRIMARY KEY)"))
+        .await
+        .expect("create");
+    fx.execute(&format!("INSERT INTO {quoted} (id) VALUES (1), (2)"))
+        .await
+        .expect("seed");
+
+    fx.execute(&dbui_driver::truncate_sql(fx.driver(), &table))
+        .await
+        .expect("truncate");
+    assert_eq!(fx.row_count(&table, "").await.expect("count"), 0);
+
+    fx.execute(&dbui_driver::drop_sql(fx.driver(), &table, TableKind::Table))
+        .await
+        .expect("drop");
+    assert!(
+        fx.row_count(&table, "").await.is_err(),
+        "the table is gone"
+    );
+
+    // A view needs DROP VIEW, which is why `drop_sql` takes the kind.
+    let view = fx.table("people_view");
+    fx.execute(&dbui_driver::drop_sql(fx.driver(), &view, TableKind::View))
+        .await
+        .expect("drop view");
+});
+
 both_engines!(closing_is_idempotent, |fx: Fixture| async move {
     fx.close().await;
     fx.close().await;

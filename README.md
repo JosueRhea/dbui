@@ -89,9 +89,24 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
   you were typing — only the tab that was in front reconnects, the rest wait to
   be clicked.
 - **Schema tree** — schemas and their tables, views and materialised views,
-  read from `pg_catalog` / `information_schema`.
+  read from `pg_catalog` / `information_schema`. A filter box above it (`⌘⇧F`)
+  narrows the tree as you type, unfolding whatever still matches. Right-click a
+  table for its menu: open, copy its name, put a `SELECT` in a new SQL tab,
+  copy an `INSERT` or `CREATE TABLE` scaffold — and, behind a confirmation that
+  makes you type the name, truncate or drop it.
 - **Table browser** — click a table for its rows, 500 at a time, with the
   primary key marked in the header and paging through the rest.
+- **Row selection** — click, shift-click or drag a range, ⌘-click to pick rows
+  out, `⌘A` for all of them. `⌘⌫` stages the selection for deletion: the rows
+  are struck through and listed in the change bubble beside any pending edits,
+  and nothing reaches the server until `⌘S` commits the batch in one
+  transaction. Deleting needs a primary key, and says so when there is none.
+- **Bulk editing** — with several rows selected, the detail sidebar describes
+  the whole selection: a column they agree on shows that value, one they
+  differ on shows `MIXED`. Type over a field and it is written to every
+  selected row — except the ones that already hold it, which are left out of
+  the batch. A field left reading `MIXED` is written to nobody, so setting one
+  column across forty rows does not quietly rewrite the other thirty-nine.
 - **Query editor** — write SQL with highlighting and catalog autocomplete
   (⌃Space). ⌘↵ runs the selection, or the statement under the caret; ⌘⇧↵ runs
   every statement in order. Row-producing results fill the grid (run-all keeps
@@ -107,6 +122,12 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘↵` | Run selection, or the statement under the caret |
 | `⌘⇧↵` | Run all statements (in the selection, or the whole buffer) |
 | `⌃Space` | SQL autocomplete |
+| `⌘A` | Select every row (or all the text, in an editor) |
+| `⇧↑` / `⇧↓` | Grow the row selection |
+| `⌘⌫` | Stage the selected rows for deletion |
+| `⌘S` | Commit the staged batch in one transaction |
+| `⌘⇧F` | Search the schema tree |
+| `⌘F` | Filter the rows of the open table |
 | `⌘N` | New connection |
 | `⌘R` | Refresh the result (or the catalog) |
 | `⌘E` | Open / focus the SQL editor |

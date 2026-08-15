@@ -12,7 +12,11 @@ mod postgres;
 mod sql_build;
 
 pub use error::{DriverError, Result};
-pub use port::{DatabaseDriver, RowUpdate};
+pub use port::{DatabaseDriver, RowBatch, RowDelete, RowUpdate};
+// Statements the UI offers to run but does not compose: quoting an identifier
+// is this crate's job, and there is a test that a hostile table name cannot
+// break out of one.
+pub use sql_build::{drop_sql, truncate_sql};
 
 use dbui_domain::{ConnectionConfig, Driver};
 use std::sync::Arc;

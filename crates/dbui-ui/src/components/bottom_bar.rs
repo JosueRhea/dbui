@@ -63,10 +63,18 @@ impl DbUi {
                 .child(caption("No tab selected", theme));
         };
 
-        let summary: SharedString = tab
+        let base_summary = tab
             .result()
-            .map(|view| SharedString::from(view.summary.clone()))
-            .unwrap_or_else(|| "No data".into());
+            .map(|view| view.summary.clone())
+            .unwrap_or_else(|| "No data".to_string());
+        // Only worth saying past one row: a single selected row is the row the
+        // detail sidebar is already describing.
+        let selected = tab.selection().len();
+        let summary: SharedString = if selected > 1 {
+            SharedString::from(format!("{base_summary} · {selected} selected"))
+        } else {
+            SharedString::from(base_summary)
+        };
 
         let (
             is_table,

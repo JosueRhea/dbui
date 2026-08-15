@@ -110,6 +110,21 @@ discarding it answers "is there more?" without a second `COUNT(*)` round trip.
 `skip_serializing`. Wiring in the OS keychain later means changing `store.rs`
 and nothing else.
 
+**One draft speaks for the whole selection.** `RowDraft` holds a list of rows
+rather than one, and editing several is the same object with more indices in
+it. A column the rows agree on shows that value; one they disagree on shows
+`MIXED`, which is a write token like `NULL` and `DEFAULT` — the box always says
+exactly what will be written, and a field still reading `MIXED` is written to
+nobody. That is what keeps "edit a row" and "edit a selection" from becoming
+two staging paths, the second of which would be the one nobody tested.
+
+Staging is recomputed rather than merged: `to_pending_batch` returns the whole
+of what each row should end up with, including the columns the draft
+deliberately left alone, and the caller clears those rows out before extending
+with it. Merging instead would double-count — and, worse, a `MIXED` column over
+rows staged with *different* values would look like an instruction to drop what
+was already there.
+
 **Connection tabs are two lists, not one.** `Workspace` keeps `entries` (every
 saved connection) apart from `open` (the ones with a tab, in tab order). Tab
 order is the user's arrangement and has nothing to do with the order
@@ -206,6 +221,15 @@ bug a user meets in the first five minutes:
   suffix (`TEXT[]`), not the `_text` spelling `pg_type` uses internally. The
   decoder matched the wrong one and every array fell through to
   `Value::Unsupported` — which is at least how the failure stayed legible.
+- **Every row edit failed on PostgreSQL.** Bound values all went over as
+  strings, so `UPDATE … WHERE "id" = $1` against a `bigint` key planned as
+  `bigint = text` — an operator that does not exist — and Postgres refused the
+  statement. sqlx types each parameter from the Rust type it is given and
+  always sends them in binary, so there is no "let the server work it out"
+  escape hatch: values now go over as the type they are, and the variants this
+  crate carries as strings (`numeric`, `uuid`, `json`, the temporal ones) are
+  cast back in the statement itself. MySQL coerces on its own and never showed
+  the bug, which is exactly why one engine's green run proves nothing.
 - **`TINYINT(1)` is reported as `BOOLEAN`.** sqlx tells us `BOOLEAN` for a
   column MySQL stores as `TINYINT(1)`, and there is no way to distinguish "I
   meant true/false" from "I meant a one-digit integer". It decodes as a number:

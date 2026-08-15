@@ -58,9 +58,13 @@ impl DbUi {
                 ..
             }) => {
                 if let Some(draft) = draft.as_ref() {
+                    // The lead row only decides which write tokens are on
+                    // offer; the values on screen come from the draft, which
+                    // already reconciled every selected row.
                     let originals = result
                         .as_ref()
-                        .and_then(|view| view.set.rows.get(draft.row_index))
+                        .zip(draft.rows.first())
+                        .and_then(|(view, lead)| view.set.rows.get(*lead))
                         .map(|row| row.0.as_slice())
                         .unwrap_or(&[]);
                     render_table_draft(draft, originals, open_menu, self.detail_input, theme, cx)
@@ -150,6 +154,7 @@ fn render_table_draft(
 ) -> AnyElement {
     let search = draft.field_search.text().to_ascii_lowercase();
     let search_focused = detail_input == Some(DetailInput::Search);
+    let bulk = draft.is_bulk();
 
     let fields: Vec<AnyElement> = draft
         .fields
@@ -173,8 +178,11 @@ fn render_table_draft(
                     index,
                     name,
                     *is_pk,
-                    open_menu == Some(index),
-                    allow_empty,
+                    TokenMenu {
+                        open: open_menu == Some(index),
+                        allow_empty,
+                        bulk,
+                    },
                     theme,
                     cx,
                 ))
@@ -208,6 +216,7 @@ fn render_table_draft(
         .gap_3()
         .w_full()
         .min_w(px(0.))
+        .children(bulk.then(|| bulk_banner(draft.rows.len(), theme)))
         .child(text_field(
             "detail-field-search",
             &draft.field_search,
@@ -222,12 +231,56 @@ fn render_table_draft(
         .into_any_element()
 }
 
+/// Says what editing a selection is about to do.
+///
+/// The fields alone do not: `MIXED` looks like a value until you are told it
+/// means "left alone", and a box showing one shared value gives no hint that
+/// typing in it rewrites forty rows.
+fn bulk_banner(rows: usize, theme: &Theme) -> AnyElement {
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .px_2()
+        .py_1p5()
+        .rounded_md()
+        .bg(theme.elevated)
+        .border_1()
+        .border_color(theme.accent)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_size(metrics::text_size_small())
+                .text_color(theme.text)
+                .child(SharedString::from(format!("Editing {rows} rows"))),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .child(
+                    "A field you change is written to all of them. MIXED means \
+                     they differ — leave it to keep each row's own value.",
+                ),
+        )
+        .into_any_element()
+}
+
+/// What the write-token dropdown should offer for one field.
+struct TokenMenu {
+    open: bool,
+    allow_empty: bool,
+    /// A bulk edit gets a `MIXED` entry -- the way back out of having typed
+    /// over a field you meant to leave alone.
+    bulk: bool,
+}
+
 fn field_header(
     index: usize,
     name: &str,
     is_pk: bool,
-    menu_open: bool,
-    allow_empty: bool,
+    menu: TokenMenu,
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
@@ -257,7 +310,7 @@ fn field_header(
                 .px_1()
                 .rounded_sm()
                 .text_size(metrics::text_size_small())
-                .text_color(if menu_open {
+                .text_color(if menu.open {
                     theme.text
                 } else {
                     theme.text_faint
@@ -271,8 +324,8 @@ fn field_header(
         );
     }
 
-    if menu_open && !is_pk {
-        header = header.child(special_value_menu(index, allow_empty, theme, cx));
+    if menu.open && !is_pk {
+        header = header.child(special_value_menu(index, &menu, theme, cx));
     }
 
     header.into_any_element()
@@ -280,15 +333,18 @@ fn field_header(
 
 fn special_value_menu(
     index: usize,
-    allow_empty: bool,
+    menu: &TokenMenu,
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
     let mut rows: Vec<AnyElement> = Vec::new();
     let items: &[(&'static str, &str, bool)] = &[
         ("NULL", "SQL NULL", true),
-        ("EMPTY", "Empty string", allow_empty),
+        ("EMPTY", "Empty string", menu.allow_empty),
         ("DEFAULT", "Column default", true),
+        // The way back out of a bulk edit: having typed over a field, this is
+        // how you say "never mind, leave each row as it was".
+        (crate::tabs::MIXED, "Leave each row's own", menu.bulk),
     ];
     for (item_index, &(token, hint, enabled)) in items.iter().enumerate() {
         if !enabled {

@@ -43,16 +43,35 @@ pub trait DatabaseDriver: Send + Sync {
     /// Total rows matching the same WHERE as [`table_rows`].
     async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64>;
 
+    /// Apply a whole batch of edits and deletions in one transaction.
+    ///
+    /// This is the primitive every write goes through: an editor that stages
+    /// changes and commits them together cannot honour "all or nothing" if the
+    /// updates and the deletions travel in separate transactions.
+    async fn apply_changes(&self, table: &TableRef, batch: &RowBatch) -> Result<u64>;
+
     /// Update one row identified by primary-key columns.
     async fn update_row(
         &self,
         table: &TableRef,
         pk: &[(String, Value)],
         changes: &[(String, Value)],
-    ) -> Result<u64>;
+    ) -> Result<u64> {
+        self.apply_changes(
+            table,
+            &RowBatch::of_updates(vec![RowUpdate {
+                pk: pk.to_vec(),
+                changes: changes.to_vec(),
+            }]),
+        )
+        .await
+    }
 
     /// Apply several row updates in one transaction. Any failure rolls all back.
-    async fn update_rows(&self, table: &TableRef, rows: &[RowUpdate]) -> Result<u64>;
+    async fn update_rows(&self, table: &TableRef, rows: &[RowUpdate]) -> Result<u64> {
+        self.apply_changes(table, &RowBatch::of_updates(rows.to_vec()))
+            .await
+    }
 
     /// Run one statement as typed by the user.
     async fn execute(&self, sql: &str) -> Result<QueryResult>;
@@ -61,9 +80,42 @@ pub trait DatabaseDriver: Send + Sync {
     async fn close(&self);
 }
 
-/// One pending row change for [`DatabaseDriver::update_rows`].
+/// One pending row change for [`DatabaseDriver::apply_changes`].
 #[derive(Debug, Clone)]
 pub struct RowUpdate {
     pub pk: Vec<(String, Value)>,
     pub changes: Vec<(String, Value)>,
+}
+
+/// One pending row removal for [`DatabaseDriver::apply_changes`].
+#[derive(Debug, Clone)]
+pub struct RowDelete {
+    pub pk: Vec<(String, Value)>,
+}
+
+/// Everything one commit writes.
+#[derive(Debug, Clone, Default)]
+pub struct RowBatch {
+    pub updates: Vec<RowUpdate>,
+    /// Run after the updates. Staging an edit and a delete on the same row is
+    /// the user changing their mind, and in that order the UPDATE is not left
+    /// hunting for a row that is already gone.
+    pub deletes: Vec<RowDelete>,
+}
+
+impl RowBatch {
+    pub fn of_updates(updates: Vec<RowUpdate>) -> Self {
+        Self {
+            updates,
+            deletes: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty() && self.deletes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.updates.len() + self.deletes.len()
+    }
 }

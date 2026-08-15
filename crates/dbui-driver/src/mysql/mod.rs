@@ -4,7 +4,7 @@ mod catalog;
 mod decode;
 
 use crate::error::{DriverError, Result};
-use crate::port::{DatabaseDriver, RowUpdate};
+use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
@@ -192,7 +192,7 @@ impl DatabaseDriver for MySqlDriver {
         let bound = sql_build::select_page_sql(Driver::MySql, table, where_clause);
         let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
         for value in &bound.binds {
-            query = query.bind(value);
+            query = bind_value(query, value);
         }
         query = query
             .bind(page.probe_limit())
@@ -210,11 +210,10 @@ impl DatabaseDriver for MySqlDriver {
 
     async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64> {
         let bound = sql_build::count_sql(Driver::MySql, table, where_clause);
-        let mut query = sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()));
-        for value in &bound.binds {
-            query = query.bind(value);
-        }
-        query
+        // The filter is freeform text spliced into the statement, so a count
+        // has no parameters of its own -- the same trust model as the editor.
+        debug_assert!(bound.binds.is_empty(), "count_sql binds nothing");
+        sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()))
             .fetch_one(&self.pool)
             .await
             .map_err(|error| DriverError::query(&bound.sql, &error))
@@ -226,19 +225,33 @@ impl DatabaseDriver for MySqlDriver {
         pk: &[(String, Value)],
         changes: &[(String, Value)],
     ) -> Result<u64> {
-        self.update_rows(
+        self.apply_changes(
             table,
-            &[RowUpdate {
+            &RowBatch::of_updates(vec![RowUpdate {
                 pk: pk.to_vec(),
                 changes: changes.to_vec(),
-            }],
+            }]),
         )
         .await
     }
 
-    async fn update_rows(&self, table: &TableRef, rows: &[RowUpdate]) -> Result<u64> {
-        if rows.is_empty() {
+    async fn apply_changes(&self, table: &TableRef, batch: &RowBatch) -> Result<u64> {
+        if batch.is_empty() {
             return Ok(0);
+        }
+
+        let mut statements = Vec::with_capacity(batch.len());
+        for row in &batch.updates {
+            statements.push(
+                sql_build::update_sql(Driver::MySql, table, &row.changes, &row.pk)
+                    .map_err(|message| DriverError::message("UPDATE", message))?,
+            );
+        }
+        for row in &batch.deletes {
+            statements.push(
+                sql_build::delete_sql(Driver::MySql, table, &row.pk)
+                    .map_err(|message| DriverError::message("DELETE", message))?,
+            );
         }
 
         let mut tx = self
@@ -248,12 +261,10 @@ impl DatabaseDriver for MySqlDriver {
             .map_err(|error| DriverError::query("BEGIN", &error))?;
 
         let mut total = 0u64;
-        for row in rows {
-            let bound = sql_build::update_sql(Driver::MySql, table, &row.changes, &row.pk)
-                .map_err(|message| DriverError::message("UPDATE", message))?;
+        for bound in &statements {
             let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
             for value in &bound.binds {
-                query = query.bind(value);
+                query = bind_value(query, value);
             }
             let done = query
                 .execute(&mut *tx)
@@ -326,5 +337,24 @@ fn build_result_set(rows: Vec<sqlx::mysql::MySqlRow>, keep: usize) -> ResultSet 
         columns,
         rows: decoded,
         truncated,
+    }
+}
+
+/// Bind one domain value with its own type.
+///
+/// MySQL coerces a string parameter into most column types on its own, but
+/// binding what the value actually is skips that guesswork -- and keeps the
+/// two adapters saying the same thing about the same batch.
+fn bind_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+    value: &Value,
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    match value {
+        Value::Null | Value::Default => query.bind(Option::<String>::None),
+        Value::Bool(flag) => query.bind(*flag),
+        Value::Int(number) => query.bind(*number),
+        Value::Float(number) => query.bind(*number),
+        Value::Bytes(bytes) => query.bind(bytes.clone()),
+        other => query.bind(other.to_text()),
     }
 }

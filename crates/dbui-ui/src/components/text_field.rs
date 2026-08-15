@@ -31,6 +31,10 @@ pub enum InputTarget {
     DetailField(usize),
     PageSize,
     PaletteQuery,
+    /// The table filter above the schema tree.
+    SidebarFilter,
+    /// The name typed to arm a destructive statement.
+    ConfirmName,
 }
 
 impl DbUi {
@@ -66,6 +70,8 @@ impl DbUi {
                 _ => None,
             },
             InputTarget::PaletteQuery => self.palette.as_mut().map(|p| &mut p.query),
+            InputTarget::SidebarFilter => Some(&mut self.sidebar_filter),
+            InputTarget::ConfirmName => self.confirm.as_mut().map(|prompt| &mut prompt.input),
         }
     }
 
@@ -100,6 +106,15 @@ impl DbUi {
                 self.page_size_focus = false;
                 self.detail_input = None;
             }
+            InputTarget::SidebarFilter => {
+                self.focus = crate::root::Focus::SidebarSearch;
+                self.filter_focus = None;
+                self.page_size_focus = false;
+                self.detail_input = None;
+            }
+            // The prompt is modal: it already owns the keyboard, and moving
+            // `focus` would leave the surface underneath looking active.
+            InputTarget::ConfirmName => {}
         }
         cx.notify();
     }
@@ -127,6 +142,8 @@ pub(crate) fn text_field(
         InputTarget::DetailSearch => "detail-search-scroll".into(),
         InputTarget::PageSize => "page-size-scroll".into(),
         InputTarget::PaletteQuery => "palette-query-scroll".into(),
+        InputTarget::SidebarFilter => "sidebar-filter-scroll".into(),
+        InputTarget::ConfirmName => "confirm-name-scroll".into(),
         InputTarget::DetailField(index) => ("detail-field-scroll", index).into(),
     };
 

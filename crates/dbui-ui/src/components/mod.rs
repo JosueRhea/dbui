@@ -8,6 +8,7 @@
 mod bottom_bar;
 mod change_bubble;
 mod connection_form;
+pub(crate) mod context_menu;
 mod detail_sidebar;
 mod filters;
 mod grid;

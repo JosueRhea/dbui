@@ -2,7 +2,7 @@
 
 use super::button;
 use crate::root::DbUi;
-use crate::tabs::{FieldChange, PendingRowEdit, WorkspaceTab};
+use crate::tabs::{FieldChange, PendingRowDelete, PendingRowEdit, WorkspaceTab};
 use crate::text_diff::{line_diff, DiffLine};
 use crate::theme::{metrics, Theme};
 use gpui::{div, prelude::*, px, AnyElement, Context, MouseButton, MouseDownEvent, SharedString};
@@ -19,7 +19,8 @@ const MAX_DIFF_LINES: usize = 12;
 impl DbUi {
     pub(crate) fn render_change_bubble(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let batch = self.collect_batch_edits();
-        if batch.is_empty() {
+        let deletes = self.collect_batch_deletes();
+        if batch.is_empty() && deletes.is_empty() {
             return None;
         }
 
@@ -32,12 +33,20 @@ impl DbUi {
             _ => (false, false),
         };
         let theme = &self.theme;
-        let count = batch.len();
-        let label = if count == 1 {
+        let count = batch.len() + deletes.len();
+        let mut label = if count == 1 {
             "1 change".to_string()
         } else {
             format!("{count} changes")
         };
+        // Deletions are the half of the batch worth naming in the collapsed
+        // state: an edit can be re-edited, a delete cannot be un-deleted.
+        if !deletes.is_empty() {
+            label.push_str(&format!(
+                " · {} to delete",
+                deletes.len()
+            ));
+        }
 
         let mut bubble = div()
             .id("change-bubble")
@@ -62,7 +71,7 @@ impl DbUi {
             ))
         };
 
-        let save_label = if saving { "Saving…" } else { "Save" };
+        let save_label = if saving { "Committing…" } else { "Commit  ⌘S" };
         let save = if saving {
             button("save-changes", save_label, theme, true)
                 .opacity(0.7)
@@ -121,7 +130,8 @@ impl DbUi {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .children(batch.iter().map(|edit| render_edit_group(edit, theme))),
+                    .children(batch.iter().map(|edit| render_edit_group(edit, theme)))
+                    .children(deletes.iter().map(|row| render_delete_row(row, theme))),
             );
         }
 
@@ -177,6 +187,31 @@ fn render_edit_group(edit: &PendingRowEdit, theme: &Theme) -> AnyElement {
                 .iter()
                 .map(|change| render_change(change, theme)),
         )
+        .into_any_element()
+}
+
+/// A staged deletion: the row's key, struck through, in the removal colour.
+fn render_delete_row(row: &PendingRowDelete, theme: &Theme) -> AnyElement {
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .overflow_hidden()
+        .font_family(metrics::MONO_FONT)
+        .text_size(metrics::text_size_small())
+        .text_color(theme.danger)
+        .child(div().flex_shrink_0().child("−"))
+        .child(
+            div()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .line_through()
+                .child(SharedString::from(one_line(&row.label))),
+        )
+        .child(div().flex_shrink_0().child("DELETE ROW"))
         .into_any_element()
 }
 

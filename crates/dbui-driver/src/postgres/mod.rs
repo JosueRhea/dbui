@@ -4,7 +4,7 @@ mod catalog;
 mod decode;
 
 use crate::error::{DriverError, Result};
-use crate::port::{DatabaseDriver, RowUpdate};
+use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
@@ -190,7 +190,7 @@ impl DatabaseDriver for PostgresDriver {
         let bound = sql_build::select_page_sql(Driver::Postgres, table, where_clause);
         let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
         for value in &bound.binds {
-            query = query.bind(value);
+            query = bind_value(query, value);
         }
         query = query
             .bind(page.probe_limit())
@@ -208,11 +208,10 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64> {
         let bound = sql_build::count_sql(Driver::Postgres, table, where_clause);
-        let mut query = sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()));
-        for value in &bound.binds {
-            query = query.bind(value);
-        }
-        query
+        // The filter is freeform text spliced into the statement, so a count
+        // has no parameters of its own -- the same trust model as the editor.
+        debug_assert!(bound.binds.is_empty(), "count_sql binds nothing");
+        sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()))
             .fetch_one(&self.pool)
             .await
             .map_err(|error| DriverError::query(&bound.sql, &error))
@@ -224,19 +223,33 @@ impl DatabaseDriver for PostgresDriver {
         pk: &[(String, Value)],
         changes: &[(String, Value)],
     ) -> Result<u64> {
-        self.update_rows(
+        self.apply_changes(
             table,
-            &[RowUpdate {
+            &RowBatch::of_updates(vec![RowUpdate {
                 pk: pk.to_vec(),
                 changes: changes.to_vec(),
-            }],
+            }]),
         )
         .await
     }
 
-    async fn update_rows(&self, table: &TableRef, rows: &[RowUpdate]) -> Result<u64> {
-        if rows.is_empty() {
+    async fn apply_changes(&self, table: &TableRef, batch: &RowBatch) -> Result<u64> {
+        if batch.is_empty() {
             return Ok(0);
+        }
+
+        let mut statements = Vec::with_capacity(batch.len());
+        for row in &batch.updates {
+            statements.push(
+                sql_build::update_sql(Driver::Postgres, table, &row.changes, &row.pk)
+                    .map_err(|message| DriverError::message("UPDATE", message))?,
+            );
+        }
+        for row in &batch.deletes {
+            statements.push(
+                sql_build::delete_sql(Driver::Postgres, table, &row.pk)
+                    .map_err(|message| DriverError::message("DELETE", message))?,
+            );
         }
 
         let mut tx = self
@@ -246,12 +259,10 @@ impl DatabaseDriver for PostgresDriver {
             .map_err(|error| DriverError::query("BEGIN", &error))?;
 
         let mut total = 0u64;
-        for row in rows {
-            let bound = sql_build::update_sql(Driver::Postgres, table, &row.changes, &row.pk)
-                .map_err(|message| DriverError::message("UPDATE", message))?;
+        for bound in &statements {
             let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
             for value in &bound.binds {
-                query = query.bind(value);
+                query = bind_value(query, value);
             }
             let done = query
                 .execute(&mut *tx)
@@ -339,4 +350,27 @@ fn short_version(full: &str) -> String {
         .take(2)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Bind one domain value with its own type.
+///
+/// Every parameter used to go over as text, which Postgres refuses outright:
+/// `WHERE "id" = $1` against a `bigint` column plans as `bigint = text`, and
+/// there is no such operator. Sending the value as the type it actually is --
+/// and casting the string-shaped ones in the statement itself -- is what makes
+/// a generated UPDATE or DELETE land.
+fn bind_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    value: &Value,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match value {
+        Value::Null | Value::Default => query.bind(Option::<String>::None),
+        Value::Bool(flag) => query.bind(*flag),
+        Value::Int(number) => query.bind(*number),
+        Value::Float(number) => query.bind(*number),
+        Value::Bytes(bytes) => query.bind(bytes.clone()),
+        // Decimal, Uuid, Json and Temporal ride over as text and are cast back
+        // by `sql_build::typed_placeholder`; Text needs no cast at all.
+        other => query.bind(other.to_text()),
+    }
 }

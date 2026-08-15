@@ -5,10 +5,11 @@
 //! blocks that only render -- they read state and attach listeners, they do not
 //! define it. When a task lands, exactly one of the methods here folds it in.
 
+use crate::components::context_menu::{ConfirmPrompt, ContextMenu};
 use crate::components::palette::{Palette, PaletteKind};
 use crate::components::{ConnectionForm, DetailInput, FormAction};
 use crate::sql_complete::CompletionPopup;
-use crate::tabs::{upsert_pending, RowDraft, Tabs, WorkspaceTab};
+use crate::tabs::{RowDraft, Tabs, WorkspaceTab};
 use crate::theme::{metrics, Theme};
 use dbui_app::commands;
 use dbui_app::domain::{
@@ -27,6 +28,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
+    /// The table filter box above the tree.
+    SidebarSearch,
     Editor,
     Grid,
     Detail,
@@ -102,7 +105,12 @@ pub struct ResultView {
 }
 
 impl ResultView {
-    fn new(set: ResultSet, source: ResultSource, summary: String, structure: Vec<Column>) -> Self {
+    pub(crate) fn new(
+        set: ResultSet,
+        source: ResultSource,
+        summary: String,
+        structure: Vec<Column>,
+    ) -> Self {
         let widths = column_widths(&set);
         Self {
             set,
@@ -217,6 +225,16 @@ pub struct DbUi {
     pub(crate) completion: Option<CompletionPopup>,
     /// Cached `driver.columns` results keyed by `(schema, table)`.
     pub(crate) column_cache: HashMap<(String, String), Vec<Column>>,
+    /// Substring filter over the schema tree. Empty means show everything.
+    pub(crate) sidebar_filter: crate::text_input::TextInput,
+    /// The row a drag has reached, set while the button is down. `Some` means
+    /// a drag is in progress; the value is what stops a pointer wandering
+    /// inside one row from rebuilding the range on every mouse-move.
+    pub(crate) row_drag: Option<usize>,
+    /// Right-click menu, if one is open.
+    pub(crate) context_menu: Option<ContextMenu>,
+    /// A destructive action waiting on the user typing the table's name.
+    pub(crate) confirm: Option<ConfirmPrompt>,
 }
 
 /// Starting height of the diff area, and the range the drag is allowed.
@@ -293,6 +311,10 @@ impl DbUi {
             editor_drag: None,
             completion: None,
             column_cache: HashMap::new(),
+            sidebar_filter: crate::text_input::TextInput::new(false),
+            row_drag: None,
+            context_menu: None,
+            confirm: None,
         }
     }
 
@@ -778,6 +800,84 @@ impl DbUi {
         cx.notify();
     }
 
+    // -- the table filter ---------------------------------------------------
+
+    pub(crate) fn focus_sidebar_search(&mut self, cx: &mut Context<Self>) {
+        self.close_palette(cx);
+        self.focus = Focus::SidebarSearch;
+        self.filter_focus = None;
+        self.page_size_focus = false;
+        self.detail_input = None;
+        self.sidebar_filter.select_all();
+        cx.notify();
+    }
+
+    /// Escape out of the filter: empty it if it has text, otherwise step back
+    /// to the tree. Two presses always get you out, and the first one never
+    /// throws away a search the user is still reading the results of.
+    pub(crate) fn dismiss_sidebar_search(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_filter.is_empty() {
+            self.focus = Focus::Sidebar;
+        } else {
+            self.sidebar_filter.clear();
+            self.sidebar_cursor = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn clear_sidebar_filter(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar_filter.is_empty() {
+            self.sidebar_filter.clear();
+            self.sidebar_cursor = None;
+            cx.notify();
+        }
+    }
+
+    /// The filter as typed, lowercased. Empty means "show everything".
+    pub(crate) fn sidebar_query(&self) -> String {
+        self.sidebar_filter.text().trim().to_lowercase()
+    }
+
+    /// Whether a table survives the filter. Both the bare and the qualified
+    /// name are matched, so `public.us` finds what `us` does.
+    pub(crate) fn table_matches_filter(&self, table: &dbui_app::domain::Table, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        table.name.to_lowercase().contains(query)
+            || format!("{}.{}", table.schema, table.name)
+                .to_lowercase()
+                .contains(query)
+    }
+
+    /// Move from the filter box into the tree, landing on the first match.
+    pub(crate) fn enter_filtered_tree(&mut self, cx: &mut Context<Self>) {
+        let first = self
+            .sidebar_visible_items()
+            .into_iter()
+            .find(|item| matches!(item, SidebarItem::Table { .. }));
+        if let Some(item) = first {
+            self.sidebar_cursor = Some(item);
+            self.focus = Focus::Sidebar;
+            cx.notify();
+        }
+    }
+
+    /// Enter in the filter box: open the first table it found.
+    pub(crate) fn open_first_filtered_table(&mut self, cx: &mut Context<Self>) {
+        let first = self.sidebar_visible_items().into_iter().find_map(|item| {
+            match item {
+                SidebarItem::Table { table, .. } => Some(table),
+                SidebarItem::Schema { .. } => None,
+            }
+        });
+        let Some(table) = first else {
+            return;
+        };
+        self.focus = Focus::Sidebar;
+        self.open_table_tab(table, cx);
+    }
+
     pub(crate) fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
         let Some(driver) = self.workspace.active_driver() else {
             return;
@@ -874,6 +974,7 @@ impl DbUi {
                                 page_size_draft,
                                 where_clause,
                                 selected_row,
+                                selection,
                                 draft,
                                 ..
                             }) = this.tabs.get_mut(tab_id)
@@ -885,6 +986,9 @@ impl DbUi {
                                 );
                                 *where_clause = contents.where_clause.clone();
                                 *selected_row = None;
+                                // A fresh page is fresh rows: the old indices
+                                // point at whatever now occupies them.
+                                selection.clear();
                                 *draft = None;
                                 *result = Some(ResultView::new(
                                     contents.rows,
@@ -1183,11 +1287,13 @@ impl DbUi {
                 if let Some(WorkspaceTab::Sql {
                     result: tab_result,
                     selected_row,
+                    selection,
                     draft,
                     ..
                 }) = self.tabs.get_mut(tab_id)
                 {
                     *selected_row = None;
+                    selection.clear();
                     *draft = None;
                     *tab_result = Some(ResultView::new(
                         set,
@@ -1333,70 +1439,103 @@ impl DbUi {
         // Stash the current dirty draft into the batch before switching.
         self.stash_current_draft(cx);
 
-        match self.tabs.active_mut() {
-            Some(WorkspaceTab::Table {
-                selected_row,
-                draft,
-                result,
-                pending_edits,
-                ..
-            }) => {
-                *selected_row = Some(row);
-                let mut next = result.as_ref().and_then(|view| {
-                    view.set.rows.get(row).map(|values| {
-                        RowDraft::from_row(row, &view.set.columns, &values.0, &view.structure)
-                    })
-                });
+        // Picking one row is also collapsing the selection to it: arrowing
+        // away from a range the user built has to leave them somewhere they
+        // can see, not with fifty rows still lit behind the caret.
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.selection_mut().set_single(row);
+        }
 
-                let restore = next.as_ref().and_then(|next_draft| {
-                    let view = result.as_ref()?;
-                    let values = view.set.rows.get(row)?;
-                    let pk = next_draft.pk_values(&values.0).ok()?;
-                    pending_edits
-                        .iter()
-                        .find(|edit| edit.matches_pk(&pk))
-                        .cloned()
-                });
-                if let (Some(next_draft), Some(pending)) = (next.as_mut(), restore) {
-                    next_draft.apply_pending(&pending);
-                }
-
-                *draft = next;
-                self.detail_open = true;
-                self.detail_input = None;
-                self.detail_value_menu = None;
-                self.focus = Focus::Detail;
-            }
-            Some(WorkspaceTab::Sql {
-                selected_row,
-                result,
-                draft,
-                ..
-            }) => {
-                *selected_row = Some(row);
-                *draft = result.as_ref().and_then(|view| {
-                    view.set
-                        .rows
-                        .get(row)
-                        .map(|values| RowDraft::from_sql_row(row, &view.set.columns, &values.0))
-                });
-                self.detail_open = true;
-                self.detail_input = None;
-                self.detail_value_menu = None;
-                self.focus = Focus::Detail;
-            }
-            None => {}
+        self.rebuild_draft(Some(row), cx);
+        if self.tabs.active().is_some_and(|tab| tab.result().is_some()) {
+            self.focus = Focus::Detail;
         }
         self.selected_cell = None;
         cx.notify();
     }
 
-    /// Fold the open draft into `pending_edits` when it has unsaved field changes.
+    /// Rebuild the detail draft over whatever is selected now.
+    ///
+    /// Every route into the selection ends here, which is what makes the
+    /// sidebar describe the selection rather than the last row that happened
+    /// to be clicked. `lead` is the row the detail is *about* -- the one the
+    /// pointer landed on -- and only matters for the grid's own highlight.
+    pub(crate) fn rebuild_draft(&mut self, lead: Option<usize>, cx: &mut Context<Self>) {
+        let opened = {
+            let Some(tab) = self.tabs.active_mut() else {
+                return;
+            };
+            let rows = tab.selection().ordered();
+            let lead = lead
+                .filter(|row| rows.contains(row))
+                .or_else(|| rows.first().copied());
+
+            match tab {
+                WorkspaceTab::Table {
+                    result,
+                    selected_row,
+                    draft,
+                    pending_edits,
+                    ..
+                } => {
+                    *selected_row = lead;
+                    *draft = match result.as_ref() {
+                        Some(view) if !rows.is_empty() => {
+                            Some(RowDraft::from_rows(&rows, view, pending_edits))
+                        }
+                        _ => None,
+                    };
+                }
+                // A query result has nothing staged against it: there is no
+                // table to write the edit back to.
+                WorkspaceTab::Sql {
+                    result,
+                    selected_row,
+                    draft,
+                    ..
+                } => {
+                    *selected_row = lead;
+                    *draft = match result.as_ref() {
+                        Some(view) if !rows.is_empty() => {
+                            Some(RowDraft::from_rows(&rows, view, &[]))
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            draft_is_open(tab)
+        };
+
+        if opened {
+            self.detail_open = true;
+        }
+        self.detail_input = None;
+        self.detail_value_menu = None;
+        cx.notify();
+    }
+
+    /// Fold the open draft away and rebuild it over the new selection.
+    ///
+    /// The order matters: what was typed has to reach `pending_edits` before
+    /// the editors holding it are replaced.
+    fn restage_draft(&mut self, cx: &mut Context<Self>) {
+        self.stash_current_draft(cx);
+        self.rebuild_draft(None, cx);
+    }
+
+    /// Fold the open draft into `pending_edits`.
+    ///
+    /// The draft's rows are cleared out and restaged rather than merged into:
+    /// `to_pending_batch` returns the whole of what each row should end up
+    /// with — including the columns it deliberately left alone — so anything
+    /// left over from before would be counted twice. It is also what lets a
+    /// field typed back to its stored value un-stage itself.
     fn stash_current_draft(&mut self, cx: &mut Context<Self>) {
         let Some(WorkspaceTab::Table {
             draft,
             result,
             pending_edits,
+            pending_deletes,
             ..
         }) = self.tabs.active_mut()
         else {
@@ -1408,13 +1547,21 @@ impl DbUi {
         let Some(view) = result.as_ref() else {
             return;
         };
-        let Some(values) = view.set.rows.get(draft_ref.row_index) else {
-            return;
-        };
 
-        match draft_ref.to_pending(&values.0) {
-            Ok(Some(edit)) => upsert_pending(pending_edits, edit),
-            Ok(None) => {}
+        let keys = draft_ref.row_keys(view);
+        let outcome = draft_ref.to_pending_batch(view, pending_edits);
+
+        match outcome {
+            Ok(mut edits) => {
+                // A row on its way out has nothing left to update.
+                edits.retain(|edit| {
+                    !pending_deletes
+                        .iter()
+                        .any(|staged| staged.matches_pk(&edit.pk))
+                });
+                pending_edits.retain(|edit| !keys.iter().any(|pk| edit.matches_pk(pk)));
+                pending_edits.extend(edits);
+            }
             Err(message) => {
                 if let Some(draft) = draft.as_mut() {
                     draft.message = Some((false, message));
@@ -1424,11 +1571,237 @@ impl DbUi {
         }
     }
 
-    pub(crate) fn select_cell(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+    // -- grid selection -----------------------------------------------------
+
+    /// Whether the grid's shortcuts apply right now.
+    ///
+    /// Clicking a row hands the keyboard to the detail sidebar so the fields
+    /// are typeable, and ⌘A there still means "the rows I clicked" until an
+    /// actual field takes focus — otherwise selecting rows and pressing ⌘A
+    /// would do nothing, which reads as the shortcut being broken.
+    pub(crate) fn grid_owns_keys(&self) -> bool {
+        self.focus == Focus::Grid
+            || (self.focus == Focus::Detail && self.detail_input.is_none())
+    }
+
+    fn result_row_count(&self) -> usize {
+        self.tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .map(|view| view.set.rows.len())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn select_all_rows(&mut self, cx: &mut Context<Self>) {
+        let count = self.result_row_count();
+        if count == 0 {
+            return;
+        }
+        self.stash_current_draft(cx);
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.selection_mut().select_all(count);
+        }
+        self.rebuild_draft(None, cx);
+        self.focus = Focus::Grid;
+        self.status = Status::info(format!("{count} row(s) selected"));
+        cx.notify();
+    }
+
+    pub(crate) fn clear_row_selection(&mut self, cx: &mut Context<Self>) {
+        self.stash_current_draft(cx);
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.selection_mut().clear();
+        }
+        self.rebuild_draft(None, cx);
+        cx.notify();
+    }
+
+    /// A press on a grid row. `column` is `Some` when the press landed on a
+    /// cell, which additionally makes that cell the one shown in full below.
+    pub(crate) fn grid_pointer_down(
+        &mut self,
+        row: usize,
+        column: Option<usize>,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_context_menu(cx);
+
+        // Shift and ⌘ are choosing a set of rows, not changing which row the
+        // detail sidebar is describing — so neither disturbs the open draft.
+        if modifiers.shift {
+            self.stash_current_draft(cx);
+            if let Some(tab) = self.tabs.active_mut() {
+                tab.selection_mut().extend_to(row);
+            }
+            self.rebuild_draft(Some(row), cx);
+            self.row_drag = Some(row);
+            self.focus = Focus::Grid;
+            cx.notify();
+            return;
+        }
+        if modifiers.platform {
+            self.stash_current_draft(cx);
+            if let Some(tab) = self.tabs.active_mut() {
+                tab.selection_mut().toggle(row);
+            }
+            self.rebuild_draft(Some(row), cx);
+            self.focus = Focus::Grid;
+            cx.notify();
+            return;
+        }
+
         self.select_row(row, cx);
-        self.selected_cell = Some((row, column));
+        match column {
+            Some(column) => {
+                self.selected_cell = Some((row, column));
+                self.focus = Focus::Grid;
+            }
+            None => self.selected_cell = None,
+        }
+        self.row_drag = Some(row);
+        cx.notify();
+    }
+
+    /// The pointer crossed a row with the button still down.
+    pub(crate) fn grid_drag_over(&mut self, row: usize, cx: &mut Context<Self>) {
+        // Comparing against the last row the drag reached is what keeps a
+        // pointer wandering inside one row from rebuilding the range on every
+        // mouse-move event.
+        if self.row_drag.is_none() || self.row_drag == Some(row) {
+            return;
+        }
+        self.row_drag = Some(row);
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.selection_mut().extend_to(row);
+        }
         self.focus = Focus::Grid;
         cx.notify();
+    }
+
+    pub(crate) fn end_row_drag(&mut self, cx: &mut Context<Self>) {
+        if self.row_drag.take().is_none() {
+            return;
+        }
+        // The draft is rebuilt on release rather than on every row the pointer
+        // crosses: a drag over a few hundred rows would otherwise rebuild the
+        // whole sidebar that many times on the way there.
+        self.restage_draft(cx);
+        cx.notify();
+    }
+
+    /// ⇧↑ / ⇧↓ — grow the selection a row at a time.
+    pub(crate) fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.result_row_count();
+        if count == 0 {
+            return;
+        }
+        self.stash_current_draft(cx);
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        let selection = tab.selection_mut();
+        let from = selection
+            .ordered()
+            .last()
+            .copied()
+            .or_else(|| selection.anchor())
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            from.saturating_sub(delta.unsigned_abs())
+        } else {
+            (from + delta as usize).min(count - 1)
+        };
+        selection.extend_to(next);
+        self.rebuild_draft(Some(next), cx);
+        self.focus = Focus::Grid;
+        cx.notify();
+    }
+
+    // -- staged deletes -----------------------------------------------------
+
+    /// Stage every selected row for deletion. Nothing reaches the server until
+    /// the batch is committed.
+    pub(crate) fn delete_selected_rows(&mut self, cx: &mut Context<Self>) {
+        // Fold a half-typed edit in first, so what the bubble lists is the
+        // whole of what ⌘S will write.
+        self.stash_current_draft(cx);
+
+        match self.stage_selected_deletes() {
+            Ok(0) => {}
+            Ok(count) => {
+                let plural = if count == 1 { "row" } else { "rows" };
+                self.status =
+                    Status::info(format!("{count} {plural} staged for deletion — ⌘S to commit"));
+            }
+            Err(message) => self.status = Status::error(message),
+        }
+        cx.notify();
+    }
+
+    fn stage_selected_deletes(&mut self) -> Result<usize, String> {
+        // The keys are read off the result view first because staging them
+        // needs a mutable borrow of the same tab.
+        let keys = {
+            let Some(WorkspaceTab::Table {
+                result: Some(view),
+                selection,
+                ..
+            }) = self.tabs.active()
+            else {
+                return Err("Deleting rows needs a table tab".into());
+            };
+            let rows = selection.ordered();
+            if rows.is_empty() {
+                return Err("Select a row first — ⌘A selects them all".into());
+            }
+            let mut keys = Vec::with_capacity(rows.len());
+            for row in rows {
+                let Some(values) = view.set.rows.get(row) else {
+                    continue;
+                };
+                let pk = crate::tabs::row_pk(&view.set.columns, &values.0, &view.structure)
+                    .map_err(|message| format!("Cannot delete: {message}"))?;
+                let label = crate::tabs::pk_label(&pk);
+                keys.push((pk, label));
+            }
+            keys
+        };
+
+        let Some(WorkspaceTab::Table {
+            pending_edits,
+            pending_deletes,
+            change_bubble_expanded,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return Ok(0);
+        };
+
+        let mut staged = 0usize;
+        for (pk, label) in keys {
+            // A row on its way out has nothing left to update. Dropping the
+            // edit keeps the bubble from listing a change that will never be
+            // written, and the UPDATE from running against a doomed row.
+            pending_edits.retain(|edit| !edit.matches_pk(&pk));
+            if pending_deletes.iter().any(|row| row.matches_pk(&pk)) {
+                continue;
+            }
+            pending_deletes.push(crate::tabs::PendingRowDelete { pk, label });
+            staged += 1;
+        }
+        if staged > 0 {
+            *change_bubble_expanded = true;
+        }
+        Ok(staged)
+    }
+
+    /// Rows staged for deletion on the active tab.
+    pub(crate) fn collect_batch_deletes(&self) -> Vec<crate::tabs::PendingRowDelete> {
+        self.tabs
+            .active()
+            .map(|tab| tab.pending_deletes().to_vec())
+            .unwrap_or_default()
     }
 
     pub(crate) fn toggle_change_bubble(&mut self, cx: &mut Context<Self>) {
@@ -1448,6 +1821,7 @@ impl DbUi {
             draft,
             result,
             pending_edits,
+            pending_deletes,
             ..
         }) = self.tabs.active()
         else {
@@ -1456,12 +1830,19 @@ impl DbUi {
 
         let mut batch = pending_edits.clone();
         if let (Some(draft), Some(view)) = (draft.as_ref(), result.as_ref()) {
-            if let Some(values) = view.set.rows.get(draft.row_index) {
-                if let Ok(Some(edit)) = draft.to_pending(&values.0) {
-                    upsert_pending(&mut batch, edit);
-                }
+            // Only on success: a draft mid-edit that will not parse must not
+            // take the rest of the staged batch off the screen with it.
+            if let Ok(edits) = draft.to_pending_batch(view, pending_edits) {
+                let keys = draft.row_keys(view);
+                batch.retain(|edit| !keys.iter().any(|pk| edit.matches_pk(pk)));
+                batch.extend(edits);
             }
         }
+        batch.retain(|edit| {
+            !pending_deletes
+                .iter()
+                .any(|staged| staged.matches_pk(&edit.pk))
+        });
         batch
     }
 
@@ -1476,29 +1857,29 @@ impl DbUi {
             draft,
             result,
             pending_edits,
+            pending_deletes,
             change_bubble_expanded,
             ..
         }) = self.tabs.active_mut()
         {
             pending_edits.clear();
+            pending_deletes.clear();
             *change_bubble_expanded = false;
             if let (Some(draft), Some(view)) = (draft.as_mut(), result.as_ref()) {
-                if let Some(values) = view.set.rows.get(draft.row_index) {
-                    draft.reset_to(&values.0);
-                }
+                draft.reset(view);
             }
         }
         self.status = Status::info("Changes discarded");
         cx.notify();
     }
 
+    /// Commit everything staged on the active table tab in one transaction.
+    ///
+    /// Edits and deletions go together because that is what the user staged:
+    /// splitting them into two round trips would let one succeed while the
+    /// other rolls back, which is exactly the state a batch editor exists to
+    /// prevent.
     pub(crate) fn save_pending_edits(&mut self, cx: &mut Context<Self>) {
-        let Some(driver) = self.workspace.active_driver() else {
-            self.status = Status::error("Not connected");
-            cx.notify();
-            return;
-        };
-
         if matches!(
             self.tabs.active(),
             Some(WorkspaceTab::Table { saving: true, .. })
@@ -1509,41 +1890,71 @@ impl DbUi {
         // Fold the open draft in first so Save catches in-progress edits.
         self.stash_current_draft(cx);
 
-        let (table, batch, tab_id) = match self.tabs.active() {
+        let (table, edits, deletes, tab_id) = match self.tabs.active() {
             Some(WorkspaceTab::Table {
                 id,
                 table,
                 pending_edits,
+                pending_deletes,
                 ..
-            }) => (table.clone(), pending_edits.clone(), *id),
-            _ => return,
+            }) => (
+                table.clone(),
+                pending_edits.clone(),
+                pending_deletes.clone(),
+                *id,
+            ),
+            // ⌘S is a global shortcut, so it lands on tabs with nothing to
+            // commit. Saying so beats a silent no-op.
+            Some(WorkspaceTab::Sql { .. }) => {
+                self.status = Status::info("Nothing to commit on a query tab");
+                cx.notify();
+                return;
+            }
+            None => return,
         };
 
-        if batch.is_empty() {
+        if edits.is_empty() && deletes.is_empty() {
+            self.status = Status::info("No changes to commit");
+            cx.notify();
             return;
         }
 
+        // Checked after the batch so an unsaved-but-disconnected tab says the
+        // useful thing rather than "no changes".
+        let Some(driver) = self.workspace.active_driver() else {
+            self.status = Status::error("Not connected");
+            cx.notify();
+            return;
+        };
+
+        let count = edits.len() + deletes.len();
         if let Some(WorkspaceTab::Table { saving, .. }) = self.tabs.get_mut(tab_id) {
             *saving = true;
         }
-        self.status = Status::busy(format!("Saving {} change(s)…", batch.len()));
+        self.status = Status::busy(format!("Committing {count} change(s)…"));
         cx.notify();
 
         let runtime = self.runtime.clone();
-        let rows: Vec<RowUpdate> = batch
-            .iter()
-            .map(|edit| RowUpdate {
-                pk: edit.pk.clone(),
-                changes: edit
-                    .changes
-                    .iter()
-                    .map(|c| (c.column.clone(), c.new_value.clone()))
-                    .collect(),
-            })
-            .collect();
+        let batch = dbui_app::RowBatch {
+            updates: edits
+                .iter()
+                .map(|edit| RowUpdate {
+                    pk: edit.pk.clone(),
+                    changes: edit
+                        .changes
+                        .iter()
+                        .map(|c| (c.column.clone(), c.new_value.clone()))
+                        .collect(),
+                })
+                .collect(),
+            deletes: deletes
+                .iter()
+                .map(|row| dbui_app::RowDelete { pk: row.pk.clone() })
+                .collect(),
+        };
 
         cx.spawn(async move |this, cx| {
-            let landed = commands::update_rows(&runtime, driver, table, rows).await;
+            let landed = commands::apply_changes(&runtime, driver, table, batch).await;
 
             this.update(cx, |this, cx| {
                 if let Some(WorkspaceTab::Table { saving, .. }) = this.tabs.get_mut(tab_id) {
@@ -1554,24 +1965,30 @@ impl DbUi {
                     Some(Ok(saved)) => {
                         if let Some(WorkspaceTab::Table {
                             pending_edits,
+                            pending_deletes,
                             change_bubble_expanded,
+                            selection,
                             draft,
                             ..
                         }) = this.tabs.get_mut(tab_id)
                         {
                             pending_edits.clear();
+                            pending_deletes.clear();
                             *change_bubble_expanded = false;
+                            // Row indices mean nothing once the rows below a
+                            // deleted one have moved up.
+                            selection.clear();
                             if let Some(draft) = draft.as_mut() {
                                 draft.message = Some((true, "Saved".into()));
                             }
                         }
                         if is_active {
-                            this.status = Status::info(format!("Saved {saved} change(s)"));
+                            this.status = Status::info(format!("Committed {saved} change(s)"));
                         }
                         this.load_table(tab_id, cx);
                     }
                     Some(Err(error)) => {
-                        // Transaction rolled back — leave every pending edit in place.
+                        // Transaction rolled back — leave everything staged.
                         if is_active {
                             this.status = Status::error(error.to_string());
                         }
@@ -1901,6 +2318,27 @@ impl DbUi {
             return;
         }
 
+        // A typed confirmation owns the keyboard: the whole point is that
+        // nothing else can be triggered by accident while it is up.
+        if self.confirm.is_some() {
+            self.handle_confirm_key(keystroke, cx);
+            return;
+        }
+
+        if self.context_menu.is_some() {
+            match key {
+                "escape" => {
+                    self.close_context_menu(cx);
+                    return;
+                }
+                "up" | "down" | "enter" => {
+                    self.handle_context_menu_key(key, cx);
+                    return;
+                }
+                _ => self.close_context_menu(cx),
+            }
+        }
+
         if self.modal.is_some() {
             match key {
                 "escape" => self.close_modal(cx),
@@ -1958,8 +2396,28 @@ impl DbUi {
                     self.open_palette(PaletteKind::GoToTable, cx);
                     return;
                 }
+                // ⌘⇧F searches the tree for a table, ⌘F filters the rows of
+                // the one already open. The shifted arm has to come first.
+                "f" if shift => {
+                    self.focus_sidebar_search(cx);
+                    return;
+                }
                 "f" => {
                     self.cmd_find(cx);
+                    return;
+                }
+                "s" => {
+                    self.save_pending_edits(cx);
+                    return;
+                }
+                // Grid shortcuts, claimed only when the grid has the keyboard
+                // so ⌘A in the SQL editor still selects its text.
+                "a" if self.grid_owns_keys() => {
+                    self.select_all_rows(cx);
+                    return;
+                }
+                "backspace" | "delete" if self.grid_owns_keys() => {
+                    self.delete_selected_rows(cx);
                     return;
                 }
                 "enter" if shift => {
@@ -2028,6 +2486,14 @@ impl DbUi {
             // Row chrome (no field focused): ↑/↓ walk the grid selection.
             if !command && self.detail_input.is_none() {
                 match key {
+                    "up" if shift => {
+                        self.extend_selection(-1, cx);
+                        return;
+                    }
+                    "down" if shift => {
+                        self.extend_selection(1, cx);
+                        return;
+                    }
                     "up" => {
                         self.move_selected_row(-1, cx);
                         return;
@@ -2175,6 +2641,39 @@ impl DbUi {
             }
         }
 
+        if self.focus == Focus::SidebarSearch {
+            match key {
+                "escape" => {
+                    self.dismiss_sidebar_search(cx);
+                    return;
+                }
+                "down" if !command => {
+                    self.enter_filtered_tree(cx);
+                    return;
+                }
+                "enter" if !command => {
+                    self.open_first_filtered_table(cx);
+                    return;
+                }
+                _ => {
+                    if self.sidebar_filter.handle_key(keystroke, cx) {
+                        // The cursor may be sitting on a row the filter just
+                        // hid; a cursor on nothing draws nothing.
+                        let visible = self.sidebar_visible_items();
+                        if self
+                            .sidebar_cursor
+                            .as_ref()
+                            .is_some_and(|item| !visible.contains(item))
+                        {
+                            self.sidebar_cursor = None;
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.focus == Focus::Sidebar && !command {
             match key {
                 "up" => {
@@ -2203,6 +2702,16 @@ impl DbUi {
 
         if self.focus == Focus::Grid && !command {
             match key {
+                // Shift grows the range from the anchor; a bare arrow moves
+                // the one selected row, which is also what collapses a range.
+                "up" if shift => {
+                    self.extend_selection(-1, cx);
+                    return;
+                }
+                "down" if shift => {
+                    self.extend_selection(1, cx);
+                    return;
+                }
                 "up" => {
                     self.move_selected_row(-1, cx);
                     return;
@@ -2219,6 +2728,16 @@ impl DbUi {
             if self.detail_value_menu.is_some() {
                 self.detail_value_menu = None;
                 cx.notify();
+                return;
+            }
+            // A multi-row selection is a mode of sorts, and Escape is how
+            // every other mode in this window is left.
+            if self
+                .tabs
+                .active()
+                .is_some_and(|tab| tab.selection().len() > 1)
+            {
+                self.clear_row_selection(cx);
                 return;
             }
             self.focus = Focus::Sidebar;
@@ -2283,6 +2802,13 @@ impl DbUi {
     }
 }
 
+fn draft_is_open(tab: &WorkspaceTab) -> bool {
+    matches!(
+        tab,
+        WorkspaceTab::Table { draft: Some(_), .. } | WorkspaceTab::Sql { draft: Some(_), .. }
+    )
+}
+
 fn table_summary(contents: &dbui_app::TableContents) -> String {
     let shown = contents.rows.rows.len();
     let base = match contents.total_rows {
@@ -2311,6 +2837,8 @@ impl Render for DbUi {
         let modal = self.modal.is_some().then(|| self.render_modal(cx));
         let palette = self.render_palette(cx);
         let change_bubble = self.render_change_bubble(cx);
+        let context_menu = self.render_context_menu(window, cx);
+        let confirm = self.render_confirm(cx);
 
         div()
             .size_full()
@@ -2326,7 +2854,9 @@ impl Render for DbUi {
             // The pointer leaves the 5px grab strip on the first frame of a
             // drag, so the tracking lives on the root instead.
             .when(
-                self.change_bubble_drag.is_some() || self.editor_drag.is_some(),
+                self.change_bubble_drag.is_some()
+                    || self.editor_drag.is_some()
+                    || self.row_drag.is_some(),
                 |root| {
                     root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         if this.change_bubble_drag.is_some() {
@@ -2341,13 +2871,18 @@ impl Render for DbUi {
                         cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                             this.end_change_bubble_drag(cx);
                             this.end_editor_drag(cx);
+                            this.end_row_drag(cx);
                         }),
                     )
+                    // Releasing outside the window has to end the drag too, or
+                    // the next pointer move over the grid extends a selection
+                    // nobody is still holding.
                     .on_mouse_up_out(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                             this.end_change_bubble_drag(cx);
                             this.end_editor_drag(cx);
+                            this.end_row_drag(cx);
                         }),
                     )
                 },
@@ -2365,6 +2900,18 @@ impl Render for DbUi {
                 this.open_palette(PaletteKind::Themes, cx)
             }))
             .on_action(cx.listener(|this, _: &crate::Find, _window, cx| this.cmd_find(cx)))
+            .on_action(cx.listener(|this, _: &crate::SearchTables, _window, cx| {
+                this.focus_sidebar_search(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::CommitChanges, _window, cx| {
+                this.save_pending_edits(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::SelectAllRows, _window, cx| {
+                this.select_all_rows(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::DeleteRows, _window, cx| {
+                this.delete_selected_rows(cx)
+            }))
             .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| this.open_sql_tab(cx)))
             .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| this.refresh_result(cx)))
             .on_action(cx.listener(|this, _: &crate::RunQuery, _window, cx| this.run_query(cx)))
@@ -2450,6 +2997,8 @@ impl Render for DbUi {
             .child(self.render_status_bar(cx))
             .children(modal)
             .children(palette)
+            .children(context_menu)
+            .children(confirm)
     }
 }
 

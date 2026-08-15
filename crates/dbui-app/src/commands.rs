@@ -7,9 +7,10 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, TableRef, Value,
+    Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, TableKind,
+    TableRef, Value,
 };
-use dbui_driver::{DatabaseDriver, DriverError, RowUpdate};
+use dbui_driver::{DatabaseDriver, DriverError, RowBatch, RowUpdate};
 use std::sync::Arc;
 
 pub type Outcome<T> = Result<T, DriverError>;
@@ -87,6 +88,41 @@ pub fn update_rows(
     rows: Vec<RowUpdate>,
 ) -> Task<Outcome<u64>> {
     runtime.spawn(async move { driver.update_rows(&table, &rows).await })
+}
+
+/// Commit a whole staged batch -- edits and deletions -- in one transaction.
+///
+/// One call rather than two so "commit everything" means what it says: a
+/// delete that fails takes the edits down with it instead of leaving the table
+/// half-written.
+pub fn apply_changes(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+    batch: RowBatch,
+) -> Task<Outcome<u64>> {
+    runtime.spawn(async move { driver.apply_changes(&table, &batch).await })
+}
+
+/// `TRUNCATE` a table. The statement is built by the driver, which is what
+/// quotes the identifier.
+pub fn truncate_table(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+) -> Task<Outcome<QueryResult>> {
+    let sql = dbui_driver::truncate_sql(driver.driver(), &table);
+    runtime.spawn(async move { driver.execute(&sql).await })
+}
+
+pub fn drop_relation(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+    kind: TableKind,
+) -> Task<Outcome<QueryResult>> {
+    let sql = dbui_driver::drop_sql(driver.driver(), &table, kind);
+    runtime.spawn(async move { driver.execute(&sql).await })
 }
 
 /// Run the statement in the editor.

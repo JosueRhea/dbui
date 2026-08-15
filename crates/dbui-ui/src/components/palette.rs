@@ -49,6 +49,11 @@ enum ActionId {
     RunQuery,
     RunAllQueries,
     GoToTable,
+    SearchTables,
+    SelectAllRows,
+    DeleteRows,
+    CommitChanges,
+    DiscardChanges,
     ToggleFilters,
     ToggleColumns,
     ToggleDetail,
@@ -78,6 +83,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::GoToTable,
         label: "Go to Table…",
         shortcut: Some("⌘P"),
+        section: "Navigate",
+    },
+    ActionDef {
+        id: ActionId::SearchTables,
+        label: "Search Tables",
+        shortcut: Some("⌘⇧F"),
         section: "Navigate",
     },
     ActionDef {
@@ -195,6 +206,31 @@ const ACTIONS: &[ActionDef] = &[
         label: "Next Page",
         shortcut: Some("⌘]"),
         section: "Query",
+    },
+    // Rows
+    ActionDef {
+        id: ActionId::SelectAllRows,
+        label: "Select All Rows",
+        shortcut: Some("⌘A"),
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::DeleteRows,
+        label: "Delete Selected Rows",
+        shortcut: Some("⌘⌫"),
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::CommitChanges,
+        label: "Commit Changes",
+        shortcut: Some("⌘S"),
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::DiscardChanges,
+        label: "Discard Changes",
+        shortcut: None,
+        section: "Rows",
     },
     // View
     ActionDef {
@@ -583,6 +619,7 @@ impl DbUi {
             ActionId::NewConnection
             | ActionId::ImportTablePlus
             | ActionId::GoToTable
+            | ActionId::SearchTables
             | ActionId::FocusSidebar
             | ActionId::ChangeTheme
             | ActionId::OpenSql
@@ -612,6 +649,22 @@ impl DbUi {
             | ActionId::ToggleColumns
             | ActionId::PagePrev
             | ActionId::PageNext => is_table,
+            // Selecting needs rows on screen, from either kind of tab.
+            ActionId::SelectAllRows => self
+                .tabs
+                .active()
+                .and_then(|tab| tab.result())
+                .is_some_and(|view| !view.set.rows.is_empty()),
+            ActionId::DeleteRows => {
+                is_table
+                    && self
+                        .tabs
+                        .active()
+                        .is_some_and(|tab| !tab.selection().is_empty())
+            }
+            ActionId::CommitChanges | ActionId::DiscardChanges => {
+                !self.collect_batch_edits().is_empty() || !self.collect_batch_deletes().is_empty()
+            }
             ActionId::ToggleDetail => true,
         }
     }
@@ -663,6 +716,11 @@ impl DbUi {
             ActionId::RunQuery => self.run_query(cx),
             ActionId::RunAllQueries => self.run_all_queries(cx),
             ActionId::GoToTable => self.open_palette(PaletteKind::GoToTable, cx),
+            ActionId::SearchTables => self.focus_sidebar_search(cx),
+            ActionId::SelectAllRows => self.select_all_rows(cx),
+            ActionId::DeleteRows => self.delete_selected_rows(cx),
+            ActionId::CommitChanges => self.save_pending_edits(cx),
+            ActionId::DiscardChanges => self.discard_pending_edits(cx),
             ActionId::ToggleFilters => self.toggle_filters_open(cx),
             ActionId::ToggleColumns => self.toggle_columns_open(cx),
             ActionId::ToggleDetail => self.toggle_detail(cx),

@@ -524,7 +524,7 @@ fn open_detail_draft<'a>(
         {
             *selected_row = Some(0);
             *draft = Some(RowDraft {
-                row_index: 0,
+                rows: vec![0],
                 fields,
                 message: None,
                 field_search: TextInput::new(false),
@@ -1091,6 +1091,602 @@ fn disconnecting_does_not_collapse_the_tree(cx: &mut TestAppContext) {
         view.toggle_schema(only, "public", cx);
         view.disconnect(only, cx);
         assert_eq!(view.workspace.get(only).unwrap().expanded, vec!["public"]);
+    });
+}
+
+// -- selecting rows, and staging them for deletion ------------------------
+
+/// A table tab holding `count` rows of `(id, name)`, with `id` as the key.
+///
+/// No server is involved: the point of these tests is what the keyboard and
+/// the pointer do to rows that are already on screen.
+fn open_table_with_rows<'a>(
+    cx: &'a mut TestAppContext,
+    count: usize,
+) -> (Entity<DbUi>, &'a mut VisualTestContext) {
+    use crate::root::{ResultSource, ResultView};
+    use dbui_app::domain::{Column, ColumnInfo, Page, ResultSet, Row, Value};
+
+    let (view, cx) = open(cx);
+    let table = TableRef::new("public", "users");
+    let columns = vec![
+        ColumnInfo {
+            name: "id".into(),
+            type_name: "int8".into(),
+        },
+        ColumnInfo {
+            name: "name".into(),
+            type_name: "text".into(),
+        },
+    ];
+    let structure = vec![
+        Column {
+            name: "id".into(),
+            data_type: "bigint".into(),
+            nullable: false,
+            default: None,
+            is_primary_key: true,
+            ordinal: 1,
+        },
+        Column {
+            name: "name".into(),
+            data_type: "text".into(),
+            nullable: true,
+            default: None,
+            is_primary_key: false,
+            ordinal: 2,
+        },
+    ];
+    let rows = (0..count)
+        .map(|n| {
+            Row(vec![
+                Value::Int(n as i64 + 1),
+                Value::Text(format!("row {}", n + 1)),
+            ])
+        })
+        .collect();
+
+    view.update(cx, |this, cx| {
+        this.tabs.open_table(table.clone());
+        if let Some(WorkspaceTab::Table { result, .. }) = this.tabs.active_mut() {
+            *result = Some(ResultView::new(
+                ResultSet {
+                    columns,
+                    rows,
+                    truncated: false,
+                },
+                ResultSource::Table {
+                    table,
+                    page: Page::first(),
+                    total_rows: Some(count as i64),
+                    where_clause: String::new(),
+                },
+                format!("{count} rows"),
+                structure,
+            ));
+        }
+        this.focus = Focus::Grid;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    (view, cx)
+}
+
+fn selected_rows(view: &DbUi) -> Vec<usize> {
+    view.tabs.active().unwrap().selection().ordered()
+}
+
+#[gpui::test]
+fn cmd_a_selects_every_row_in_the_grid(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, _| {
+        assert_eq!(selected_rows(view), vec![0, 1, 2, 3, 4]);
+    });
+}
+
+/// ⌘A belongs to whichever surface has the keyboard. In the SQL editor it is
+/// still "select all text", which is the reason it is not a global action.
+#[gpui::test]
+fn cmd_a_in_the_editor_selects_text_not_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select 1");
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, _| {
+        let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active() else {
+            panic!("sql tab");
+        };
+        assert_eq!(editor.selected_text(), Some("select 1"));
+    });
+}
+
+/// Clicking one row, then shift-clicking another, takes everything between --
+/// and dragging back the other way shrinks the range rather than dragging the
+/// far end along with the pointer.
+#[gpui::test]
+fn shift_click_and_drag_take_a_range(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 6);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, None, gpui::Modifiers::default(), cx);
+        assert_eq!(selected_rows(view), vec![1], "a plain click takes one row");
+
+        view.grid_pointer_down(4, None, gpui::Modifiers::shift(), cx);
+        assert_eq!(selected_rows(view), vec![1, 2, 3, 4]);
+
+        // Still holding: dragging back up measures from the anchor, not from
+        // the far end of the range it just built.
+        view.grid_drag_over(2, cx);
+        assert_eq!(selected_rows(view), vec![1, 2]);
+        view.grid_drag_over(0, cx);
+        assert_eq!(selected_rows(view), vec![0, 1]);
+        view.end_row_drag(cx);
+    });
+}
+
+#[gpui::test]
+fn cmd_click_toggles_one_row_at_a_time(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        view.grid_pointer_down(2, None, gpui::Modifiers::command(), cx);
+        assert_eq!(selected_rows(view), vec![0, 2]);
+
+        view.grid_pointer_down(2, None, gpui::Modifiers::command(), cx);
+        assert_eq!(selected_rows(view), vec![0], "clicking again removes it");
+    });
+}
+
+/// Releasing the button outside the window has to end the drag, or the next
+/// pointer move over the grid extends a selection nobody is still holding.
+#[gpui::test]
+fn a_finished_drag_stops_extending_the_range(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        view.grid_drag_over(2, cx);
+        view.end_row_drag(cx);
+        view.grid_drag_over(4, cx);
+        assert_eq!(selected_rows(view), vec![0, 1, 2]);
+    });
+}
+
+#[gpui::test]
+fn cmd_delete_stages_the_selection_without_writing_anything(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-backspace");
+
+    view.update(cx, |view, _| {
+        let staged = view.collect_batch_deletes();
+        assert_eq!(staged.len(), 4, "every selected row is staged");
+        assert_eq!(staged[0].label, "id=1");
+        assert!(
+            view.tabs.active().unwrap().row_is_staged_for_delete(0),
+            "and the grid can tell, so it can strike the row through"
+        );
+    });
+}
+
+/// Staging the same row twice is one deletion, not two.
+#[gpui::test]
+fn staging_a_row_twice_stages_it_once(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, None, gpui::Modifiers::default(), cx);
+        view.delete_selected_rows(cx);
+        view.delete_selected_rows(cx);
+        assert_eq!(view.collect_batch_deletes().len(), 1);
+    });
+}
+
+/// Nothing is selected: ⌘⌫ has to say so rather than quietly do nothing.
+#[gpui::test]
+fn deleting_with_no_selection_explains_itself(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.clear_row_selection(cx);
+        view.delete_selected_rows(cx);
+        assert!(
+            describe(&view.status).contains("Select a row"),
+            "got: {}",
+            describe(&view.status)
+        );
+        assert!(view.collect_batch_deletes().is_empty());
+    });
+}
+
+/// Discard is the way out of a staged batch, and it has to take the deletions
+/// with it -- otherwise ⌘S after a Discard still drops rows.
+#[gpui::test]
+fn discard_clears_staged_deletions_too(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-backspace");
+    view.update(cx, |view, cx| {
+        assert_eq!(view.collect_batch_deletes().len(), 3);
+        view.discard_pending_edits(cx);
+        assert!(view.collect_batch_deletes().is_empty());
+    });
+}
+
+/// ⌘S with nothing staged must not reach for a connection: "not connected" on
+/// a tab with no changes is a message about the wrong thing.
+#[gpui::test]
+fn commit_with_nothing_staged_says_so(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-s");
+    view.update(cx, |view, _| {
+        assert_eq!(describe(&view.status), "info: No changes to commit");
+    });
+}
+
+/// With a batch staged and no connection, ⌘S reports the connection.
+#[gpui::test]
+fn committing_without_a_connection_says_so(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-backspace");
+    cx.simulate_keystrokes("cmd-s");
+
+    view.update(cx, |view, _| {
+        assert_eq!(describe(&view.status), "error: Not connected");
+        assert_eq!(
+            view.collect_batch_deletes().len(),
+            3,
+            "and nothing is thrown away, so the user can connect and retry"
+        );
+    });
+}
+
+/// Escape is how every other mode in this window is left, and a range of rows
+/// is a mode.
+#[gpui::test]
+fn escape_drops_a_multi_row_selection(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        assert!(selected_rows(view).is_empty());
+        assert_eq!(view.focus, Focus::Grid, "and the grid keeps the keyboard");
+    });
+
+    // A second Escape then does what it always did.
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert_eq!(view.focus, Focus::Sidebar));
+}
+
+/// Arrowing away from a range collapses it: leaving fifty rows lit behind the
+/// caret is how a selection gets committed by accident.
+#[gpui::test]
+fn arrowing_collapses_the_range_and_shift_grows_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("down");
+    view.update(cx, |view, _| assert_eq!(selected_rows(view).len(), 1));
+
+    cx.simulate_keystrokes("shift-down shift-down");
+    view.update(cx, |view, _| assert_eq!(selected_rows(view).len(), 3));
+}
+
+// -- editing a selection --------------------------------------------------
+
+/// What the detail sidebar's editors currently read.
+fn draft_texts(view: &DbUi) -> Vec<String> {
+    let draft = match view.tabs.active() {
+        Some(WorkspaceTab::Table { draft, .. }) | Some(WorkspaceTab::Sql { draft, .. }) => {
+            draft.as_ref().expect("a draft is open")
+        }
+        None => panic!("no tab"),
+    };
+    draft
+        .fields
+        .iter()
+        .map(|(_, input, _)| input.text().to_string())
+        .collect()
+}
+
+fn type_into_draft(view: &mut DbUi, field: usize, text: &str) {
+    let draft = match view.tabs.active_mut() {
+        Some(WorkspaceTab::Table { draft, .. }) | Some(WorkspaceTab::Sql { draft, .. }) => {
+            draft.as_mut().expect("a draft is open")
+        }
+        None => panic!("no tab"),
+    };
+    draft.fields[field].1 = crate::text_input::TextInput::with_text(text, true);
+}
+
+/// Selecting a range has to re-point the sidebar at the whole selection, not
+/// leave it describing the row that happened to be clicked first.
+#[gpui::test]
+fn selecting_a_range_points_the_sidebar_at_all_of_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        assert_eq!(draft_texts(view), vec!["1", "row 1"]);
+
+        view.grid_pointer_down(2, None, gpui::Modifiers::shift(), cx);
+        assert_eq!(
+            draft_texts(view),
+            vec![crate::tabs::MIXED, crate::tabs::MIXED],
+            "three rows agreeing on nothing"
+        );
+        assert!(view.detail_open, "and the sidebar is open to show it");
+    });
+}
+
+/// The headline behaviour: type into one field, every selected row gets it.
+#[gpui::test]
+fn editing_a_field_stages_it_for_every_selected_row(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, cx| {
+        type_into_draft(view, 1, "renamed");
+        // Leaving the draft is what folds it into the batch, the same as
+        // clicking another row would.
+        view.clear_row_selection(cx);
+
+        let batch = view.collect_batch_edits();
+        assert_eq!(batch.len(), 4, "one edit per selected row");
+        for edit in &batch {
+            assert_eq!(edit.changes.len(), 1);
+            assert_eq!(edit.changes[0].column, "name");
+            assert_eq!(edit.changes[0].new_text, "renamed");
+        }
+    });
+}
+
+/// A field left reading MIXED is the rows disagreeing, not an instruction --
+/// committing must not write the word to any of them.
+#[gpui::test]
+fn a_selection_left_untouched_stages_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            draft_texts(view),
+            vec![crate::tabs::MIXED, crate::tabs::MIXED]
+        );
+        view.clear_row_selection(cx);
+        assert!(view.collect_batch_edits().is_empty());
+    });
+}
+
+/// Reopening a selection has to show the edit that was staged for it rather
+/// than the values the server sent.
+#[gpui::test]
+fn a_staged_bulk_edit_comes_back_when_the_rows_are_reselected(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, cx| {
+        type_into_draft(view, 1, "renamed");
+        view.clear_row_selection(cx);
+        assert_eq!(view.collect_batch_edits().len(), 3);
+    });
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, _| {
+        assert_eq!(
+            draft_texts(view)[1],
+            "renamed",
+            "the staged value, not the stored one"
+        );
+    });
+}
+
+/// Rows on their way out have nothing left to update, so an edit staged over
+/// a deletion must not be written alongside it.
+#[gpui::test]
+fn editing_rows_staged_for_deletion_writes_no_update(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-backspace");
+    view.update(cx, |view, cx| {
+        assert_eq!(view.collect_batch_deletes().len(), 3);
+        type_into_draft(view, 1, "renamed");
+        view.clear_row_selection(cx);
+
+        assert!(
+            view.collect_batch_edits().is_empty(),
+            "a row being deleted is not also updated"
+        );
+        assert_eq!(view.collect_batch_deletes().len(), 3);
+    });
+}
+
+// -- searching the tree ---------------------------------------------------
+
+#[gpui::test]
+fn cmd_shift_f_focuses_the_table_filter(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    cx.simulate_keystrokes("cmd-shift-f");
+    view.update(cx, |view, _| assert_eq!(view.focus, Focus::SidebarSearch));
+
+    cx.simulate_keystrokes(&typing("user"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.sidebar_filter.text(), "user");
+        assert_eq!(view.sidebar_query(), "user");
+    });
+}
+
+/// The first Escape empties a filter the user is still reading the results of;
+/// the second gives the keyboard back to the tree.
+#[gpui::test]
+fn escape_empties_the_filter_then_leaves_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.simulate_keystrokes(&typing("abc"));
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        assert!(view.sidebar_filter.is_empty());
+        assert_eq!(view.focus, Focus::SidebarSearch, "still in the box");
+    });
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert_eq!(view.focus, Focus::Sidebar));
+}
+
+/// Both spellings of a name have to find it, because both are what people
+/// type: the bare one from the tree and the qualified one from an error.
+#[gpui::test]
+fn the_filter_matches_bare_and_qualified_names(cx: &mut TestAppContext) {
+    use dbui_app::domain::{Table, TableKind};
+
+    let (view, cx) = open(cx);
+    let table = Table {
+        schema: "public".into(),
+        name: "user_sessions".into(),
+        kind: TableKind::Table,
+    };
+
+    view.update(cx, |view, _| {
+        assert!(view.table_matches_filter(&table, ""), "no filter keeps all");
+        assert!(view.table_matches_filter(&table, "sessions"));
+        assert!(view.table_matches_filter(&table, "public.user"));
+        assert!(!view.table_matches_filter(&table, "orders"));
+    });
+}
+
+// -- the context menu -----------------------------------------------------
+
+#[gpui::test]
+fn right_clicking_a_table_opens_a_menu_that_escape_closes(cx: &mut TestAppContext) {
+    use crate::components::context_menu::ContextTarget;
+    use dbui_app::domain::TableKind;
+
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        view.open_context_menu(
+            ContextTarget::Table {
+                table: TableRef::new("public", "users"),
+                kind: TableKind::Table,
+            },
+            gpui::point(gpui::px(40.), gpui::px(120.)),
+            cx,
+        );
+        assert!(view.context_menu.is_some());
+    });
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert!(view.context_menu.is_none()));
+}
+
+/// Copying a name is the one menu entry that must work with no connection at
+/// all -- it does not need the server to answer anything.
+#[gpui::test]
+fn copying_a_table_name_needs_no_connection(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+    use dbui_app::domain::TableKind;
+
+    let (view, cx) = open(cx);
+    view.update(cx, |view, cx| {
+        view.open_context_menu(
+            ContextTarget::Table {
+                table: TableRef::new("public", "users"),
+                kind: TableKind::Table,
+            },
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::CopyQualifiedName, cx);
+    });
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("public.users".to_string())
+        );
+    });
+    view.update(cx, |view, _| {
+        assert!(view.context_menu.is_none(), "picking closes the menu");
+    });
+}
+
+/// A destructive pick opens the confirmation instead of running, and the
+/// confirmation owns the keyboard until it is answered.
+#[gpui::test]
+fn dropping_a_table_asks_before_it_does_anything(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+    use dbui_app::domain::TableKind;
+
+    let (view, cx) = open_with(cx, saved_connections(1));
+    view.update(cx, |view, cx| {
+        view.open_context_menu(
+            ContextTarget::Table {
+                table: TableRef::new("public", "users"),
+                kind: TableKind::Table,
+            },
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::Drop, cx);
+        let prompt = view.confirm.as_ref().expect("a confirmation is up");
+        assert_eq!(prompt.expected(), "users");
+        assert!(!prompt.armed(), "an empty box cannot fire it");
+    });
+
+    // A wrong name leaves it disarmed, and Enter is refused with a reason.
+    cx.simulate_keystrokes(&typing("order"));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        let prompt = view.confirm.as_ref().expect("still up");
+        assert!(!prompt.armed());
+        assert!(prompt.error.is_some(), "and it says what it wanted");
+    });
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert!(view.confirm.is_none()));
+}
+
+/// The bug this fixes: the confirmation blocked the keyboard but not the
+/// pointer, so a right-click still opened the tree's menu behind an unanswered
+/// "drop this table" -- offering a second destructive statement over the top
+/// of the first.
+#[gpui::test]
+fn a_confirmation_blocks_the_context_menu_behind_it(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+    use dbui_app::domain::TableKind;
+
+    let (view, cx) = open_with(cx, saved_connections(1));
+    let target = || ContextTarget::Table {
+        table: TableRef::new("public", "users"),
+        kind: TableKind::Table,
+    };
+
+    view.update(cx, |view, cx| {
+        view.open_context_menu(target(), gpui::point(gpui::px(0.), gpui::px(0.)), cx);
+        view.run_context_action(MenuAction::Drop, cx);
+        assert!(view.confirm.is_some());
+
+        view.open_context_menu(target(), gpui::point(gpui::px(0.), gpui::px(0.)), cx);
+        assert!(
+            view.context_menu.is_none(),
+            "no menu may open while a confirmation is unanswered"
+        );
     });
 }
 
