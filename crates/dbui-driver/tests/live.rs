@@ -34,6 +34,9 @@ fn env_or(driver: Driver, key: &str, fallback: &str) -> String {
     let prefix = match driver {
         Driver::Postgres => "DBUI_PG",
         Driver::MySql => "DBUI_MYSQL",
+        // SQLite needs no server, so it has no environment to read; its tests
+        // are at the bottom of this file and always run.
+        Driver::Sqlite => "DBUI_SQLITE",
     };
     std::env::var(format!("{prefix}_{key}")).unwrap_or_else(|_| fallback.to_string())
 }
@@ -49,6 +52,7 @@ fn config(driver: Driver) -> ConnectionConfig {
         match driver {
             Driver::Postgres => "55432",
             Driver::MySql => "53306",
+            Driver::Sqlite => "0",
         },
     )
     .parse()
@@ -59,6 +63,7 @@ fn config(driver: Driver) -> ConnectionConfig {
         match driver {
             Driver::Postgres => "postgres",
             Driver::MySql => "root",
+            Driver::Sqlite => "",
         },
     );
     config.password = env_or(driver, "PASSWORD", "dbui");
@@ -138,6 +143,7 @@ impl Fixture {
         let quoted = Driver::quote_identifier(self.driver(), schema);
 
         let statements: Vec<String> = match self.driver() {
+            Driver::Sqlite => unreachable!("the file-based tests seed themselves"),
             Driver::Postgres => vec![
                 format!("DROP SCHEMA IF EXISTS {quoted} CASCADE"),
                 format!("CREATE SCHEMA {quoted}"),
@@ -387,6 +393,7 @@ both_engines!(values_decode_to_the_right_variants, |fx: Fixture| async move {
             assert_eq!(at(0, "active"), Value::Int(1));
             assert_eq!(at(1, "active"), Value::Int(0));
         }
+        Driver::Sqlite => unreachable!("not part of the two-engine suite"),
     }
 
     let meta = at(0, "meta");
@@ -494,7 +501,7 @@ both_engines!(a_hostile_table_name_survives_quoting, |fx: Fixture| async move {
     // in raw. Nothing binds identifiers as parameters, so this is the property
     // `TableRef::quoted` exists to hold.
     let nasty = match fx.driver() {
-        Driver::Postgres => "we\"ird; DROP TABLE people; --",
+        Driver::Postgres | Driver::Sqlite => "we\"ird; DROP TABLE people; --",
         Driver::MySql => "we`ird; DROP TABLE people; --",
     };
     let table = fx.table(nasty);

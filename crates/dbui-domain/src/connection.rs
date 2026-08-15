@@ -13,22 +13,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum Driver {
     Postgres,
     MySql,
+    Sqlite,
 }
 
 impl Driver {
-    pub const ALL: [Driver; 2] = [Driver::Postgres, Driver::MySql];
+    pub const ALL: [Driver; 3] = [Driver::Postgres, Driver::MySql, Driver::Sqlite];
 
     pub fn label(self) -> &'static str {
         match self {
             Driver::Postgres => "PostgreSQL",
             Driver::MySql => "MySQL",
+            Driver::Sqlite => "SQLite",
         }
+    }
+
+    /// Whether this engine is reached over the network.
+    ///
+    /// SQLite is a file. Host, port, user and password mean nothing to it, and
+    /// the connection form hides them rather than asking for values that are
+    /// then ignored.
+    pub fn is_file_based(self) -> bool {
+        matches!(self, Driver::Sqlite)
     }
 
     pub fn default_port(self) -> u16 {
         match self {
             Driver::Postgres => 5432,
             Driver::MySql => 3306,
+            // Not a port at all; kept so the field has something in it.
+            Driver::Sqlite => 0,
         }
     }
 
@@ -41,6 +54,9 @@ impl Driver {
         match self {
             Driver::Postgres => "postgres",
             Driver::MySql => "",
+            // For SQLite the "database" is the path to the file, and there is
+            // no sensible default for that.
+            Driver::Sqlite => "",
         }
     }
 
@@ -53,6 +69,9 @@ impl Driver {
         match self {
             Driver::Postgres => format!("\"{}\"", ident.replace('"', "\"\"")),
             Driver::MySql => format!("`{}`", ident.replace('`', "``")),
+            // SQLite accepts both spellings; double quotes are the standard
+            // one and match what the Postgres branch emits.
+            Driver::Sqlite => format!("\"{}\"", ident.replace('"', "\"\"")),
         }
     }
 }
@@ -168,6 +187,7 @@ impl ConnectionConfig {
             username: match driver {
                 Driver::Postgres => "postgres".into(),
                 Driver::MySql => "root".into(),
+                Driver::Sqlite => String::new(),
             },
             password: String::new(),
             database: driver.default_database().into(),
@@ -202,6 +222,16 @@ impl ConnectionConfig {
         if self.name.trim().is_empty() {
             problems.push("Name is required");
         }
+
+        // A file-based engine has no host, port or user to check -- demanding
+        // them would be asking for values that are then ignored.
+        if self.driver.is_file_based() {
+            if self.database.trim().is_empty() {
+                problems.push("A database file path is required");
+            }
+            return problems;
+        }
+
         if self.host.trim().is_empty() {
             problems.push("Host is required");
         }

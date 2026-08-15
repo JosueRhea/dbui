@@ -9,6 +9,7 @@ mod error;
 mod mysql;
 mod port;
 mod postgres;
+mod sqlite;
 mod sql_build;
 
 pub use error::{DriverError, Result};
@@ -29,5 +30,6 @@ pub async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver
     match config.driver {
         Driver::Postgres => Ok(Arc::new(postgres::PostgresDriver::connect(config).await?)),
         Driver::MySql => Ok(Arc::new(mysql::MySqlDriver::connect(config).await?)),
+        Driver::Sqlite => Ok(Arc::new(sqlite::SqliteDriver::connect(config).await?)),
     }
 }

@@ -105,6 +105,7 @@ impl Theme {
         match driver {
             Driver::Postgres => rgb(0x4a90d9),
             Driver::MySql => rgb(0xe48e00),
+            Driver::Sqlite => rgb(0x6bbf59),
         }
     }
 

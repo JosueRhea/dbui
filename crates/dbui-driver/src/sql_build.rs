@@ -71,7 +71,8 @@ pub fn select_page_sql(
             placeholder(Driver::Postgres, 1),
             placeholder(Driver::Postgres, 2),
         ),
-        Driver::MySql => ("?".to_string(), "?".to_string()),
+        // Both use positional `?`.
+        Driver::MySql | Driver::Sqlite => ("?".to_string(), "?".to_string()),
     };
     BoundSql {
         sql: format!(
@@ -205,7 +206,10 @@ pub fn insert_sql(
     if values.is_empty() {
         return Ok(BoundSql {
             sql: match driver {
-                Driver::Postgres => format!("INSERT INTO {} DEFAULT VALUES", table.quoted(driver)),
+                // SQLite spells "all defaults" the same way Postgres does.
+                Driver::Postgres | Driver::Sqlite => {
+                    format!("INSERT INTO {} DEFAULT VALUES", table.quoted(driver))
+                }
                 Driver::MySql => format!("INSERT INTO {} () VALUES ()", table.quoted(driver)),
             },
             binds: Vec::new(),
@@ -247,6 +251,9 @@ pub fn truncate_sql(driver: Driver, table: &TableRef) -> String {
     match driver {
         Driver::Postgres => format!("TRUNCATE TABLE {} RESTART IDENTITY", table.quoted(driver)),
         Driver::MySql => format!("TRUNCATE TABLE {}", table.quoted(driver)),
+        // SQLite has no TRUNCATE; an unqualified DELETE is what its own docs
+        // point at, and it optimises into the same thing.
+        Driver::Sqlite => format!("DELETE FROM {}", table.quoted(driver)),
     }
 }
 
@@ -266,7 +273,7 @@ pub fn drop_sql(driver: Driver, table: &TableRef, kind: TableKind) -> String {
 fn placeholder(driver: Driver, index: usize) -> String {
     match driver {
         Driver::Postgres => format!("${index}"),
-        Driver::MySql => "?".to_string(),
+        Driver::MySql | Driver::Sqlite => "?".to_string(),
     }
 }
 

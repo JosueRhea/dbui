@@ -40,8 +40,16 @@ engine-specific lives here and nowhere else:
 `dbui_driver::connect` is the only function in the codebase that names a
 concrete adapter. Everyone else holds an `Arc<dyn DatabaseDriver>`.
 
-**Adding SQLite** means: a `Driver` variant, an adapter module, one arm in
-`connect`. The UI does not change.
+**SQLite was added exactly as this predicted**: a `Driver` variant, an adapter
+module, one arm in `connect`. The UI changed in two places, and neither was
+about SQL — the connection form hides host, port, user and password for a
+file-based engine, and validation asks for a path instead. Everything else
+above the port was untouched.
+
+Its tests are the ones worth copying: they need no server, because the engine
+is linked in and the database is a temp file the test makes and deletes. So
+`crates/dbui-driver/tests/sqlite.rs` runs on every `cargo test` and proves the
+same things `live.rs` can only prove when someone has Docker running.
 
 ### `dbui-app` — use cases and state
 
@@ -247,10 +255,18 @@ These are deliberate omissions in a starter, not oversights:
   autocomplete are implemented on top of that model.
 - **Grid text is `div`-per-cell.** Fine at viewport scale, wrong long-term: the
   grid should be a custom `Element` painting shaped glyph runs.
-- **Multi-statement results share one grid.** Run-all executes statements in
-  order and keeps the last row-producing result; there are no per-statement
-  result tabs.
-- **Column widths are estimated**, not measured, from a 200-row sample.
+- **Column widths are estimated**, not measured, from a 200-row sample. They
+  can be dragged, and a dragged width is remembered by column name so it
+  survives a reload — but it is not written to the session.
+- **SQLite has no exact numeric type.** A `NUMERIC` column stores an IEEE
+  double, so a price arrives as `Value::Float`. Reporting it as `Decimal`
+  would claim an exactness the file does not have. sqlx also reports the
+  declared type only for the spellings it knows, so a `JSON` column decodes as
+  the text it is stored as; the structure pane still shows what was declared,
+  because that comes from `pragma_table_info` rather than from the wire.
+- **Composite foreign keys are not followable.** One cell holds one part of
+  the key, and jumping on it would land on rows that merely share that part —
+  so the introspection filters them out rather than offering a jump that lies.
 - **The live tests cover the two engines' common ground**, not their corners:
   no `INTERVAL`, ranges, enums, `BIT`, spatial types, or generated columns. The
   decoders have arms for several of those; they are untested until a fixture

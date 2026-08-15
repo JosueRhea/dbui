@@ -22,6 +22,17 @@ pub enum Field {
 }
 
 impl Field {
+    /// Whether this field means anything for a file-based engine.
+    ///
+    /// SQLite has no host, port, user or password. Drawing them would be
+    /// asking for values that are then ignored.
+    pub fn applies_to(self, driver: Driver) -> bool {
+        if !driver.is_file_based() {
+            return true;
+        }
+        matches!(self, Field::Name | Field::Database)
+    }
+
     /// Tab order, which is also the order they are drawn in.
     pub const ORDER: [Field; 6] = [
         Field::Name,
@@ -275,12 +286,20 @@ impl DbUi {
             "New Connection"
         };
 
+        let engine = form.config.driver;
         let rows: Vec<_> = Field::ORDER
             .iter()
             .enumerate()
+            // A file-based engine has no host, port, user or password.
+            .filter(|(_, field)| field.applies_to(engine))
             .map(|(index, field)| {
                 let focused = form.focused == index;
                 let input = &form.fields[index];
+                let label = if engine.is_file_based() && *field == Field::Database {
+                    "File"
+                } else {
+                    field.label()
+                };
                 let hit_slot = input.hit_bounds_slot();
                 let field = *field;
 
@@ -293,7 +312,7 @@ impl DbUi {
                             .w(px(72.))
                             .flex_shrink_0()
                             .text_color(theme.text_muted)
-                            .child(field.label()),
+                            .child(label),
                     )
                     .child(
                         div()

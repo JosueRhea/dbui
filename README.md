@@ -78,7 +78,8 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 
 ## What works
 
-- **Connections** — add, edit and save PostgreSQL and MySQL connections, with a
+- **Connections** — add, edit and save PostgreSQL, MySQL and SQLite
+  connections, with a
   Test button that dials the server without keeping the socket. Saved to
   `~/.config/dbui/connections.json`; passwords are kept in memory only and never
   written.
@@ -89,13 +90,28 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
   you were typing — only the tab that was in front reconnects, the rest wait to
   be clicked.
 - **Schema tree** — schemas and their tables, views and materialised views,
-  read from `pg_catalog` / `information_schema`. A filter box above it (`⌘⇧F`)
+  read from `pg_catalog` / `information_schema` / `sqlite_master`. A filter box above it (`⌘⇧F`)
   narrows the tree as you type, unfolding whatever still matches. Right-click a
   table for its menu: open, copy its name, put a `SELECT` in a new SQL tab,
   copy an `INSERT` or `CREATE TABLE` scaffold — and, behind a confirmation that
   makes you type the name, truncate or drop it.
 - **Table browser** — click a table for its rows, 500 at a time, with the
-  primary key marked in the header and paging through the rest.
+  primary key marked in the header and paging through the rest. Click a header
+  to sort; the key trails the sort so paging stays stable. Drag a header's edge
+  to widen a column. Double-click a cell — or press `↵` — to edit it in place.
+- **New rows** — `+ Row` stages a blank row under the others. Columns left
+  reading `DEFAULT` are left out of the `INSERT`, so sequences and column
+  defaults still fire. It commits in the same transaction as everything else.
+- **Foreign keys** — a value that references another table is underlined;
+  `⌘↵` (or the right-click menu) opens that table filtered to the row it points
+  at. Composite keys are not offered: one cell is not the whole key.
+- **Copy out** — `⌘C` copies the selected rows as TSV for a spreadsheet, or as
+  JSON or `INSERT` statements from the right-click menu.
+- **Query history** — every statement run is kept and searchable with `⌘⇧H`;
+  picking one loads it back into the editor rather than running it.
+- **Read-only connections** — a per-connection switch that refuses every write
+  and says so in the titlebar. For SQLite the file itself is opened read-only,
+  so the engine enforces it too.
 - **Row selection** — click, shift-click or drag a range, ⌘-click to pick rows
   out, `⌘A` for all of them. `⌘⌫` stages the selection for deletion: the rows
   are struck through and listed in the change bubble beside any pending edits,
@@ -129,6 +145,10 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘S` | Commit the staged batch in one transaction |
 | `⌘Z` | Discard the staged batch (undo, inside an editor) |
 | `⌘⇧F` | Search the schema tree |
+| `⌘⇧H` | Query history |
+| `⌘C` | Copy the selected rows as TSV |
+| `↵` | Edit the selected cell in place |
+| `⌘↵` | Follow the foreign key under the cursor (run, in the editor) |
 | `⌘F` | Filter the rows of the open table |
 | `⌘N` | New connection |
 | `⌘R` | Refresh the result (or the catalog) |

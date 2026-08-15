@@ -32,6 +32,7 @@ sqlx = { version = "0.9", default-features = false, features = [
     "tls-rustls-ring",
     "postgres",
     "mysql",
+    "sqlite",
     # MySQL 8 defaults to `caching_sha2_password`, which needs either TLS or an
     # RSA public-key exchange to send the password. Without this feature every
     # connection to a stock MySQL 8 with TLS disabled fails outright -- which is
