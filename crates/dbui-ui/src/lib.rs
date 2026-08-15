@@ -8,6 +8,7 @@ mod components;
 mod highlight;
 mod json_format;
 mod root;
+mod row_export;
 mod sql_complete;
 mod sql_format;
 mod sql_scaffold;

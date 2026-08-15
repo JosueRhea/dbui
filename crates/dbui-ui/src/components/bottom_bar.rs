@@ -177,9 +177,9 @@ impl DbUi {
                     cx.listener(|this, _, _window, cx| this.toggle_columns_open(cx)),
                 ))
                 .child(
-                    button("add-row", "+ Row", theme, false)
-                        .text_color(theme.text_faint)
-                        .cursor_default(),
+                    button("add-row", "+ Row", theme, false).on_click(
+                        cx.listener(|this, _, _window, cx| this.add_row(cx)),
+                    ),
                 )
             })
             .child(

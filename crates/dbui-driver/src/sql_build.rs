@@ -4,7 +4,7 @@
 //! strip is appended as typed (same trust model as the SQL editor). UPDATE
 //! values are bound, never interpolated.
 
-use dbui_domain::{Driver, TableKind, TableRef, Value};
+use dbui_domain::{Driver, SortKey, TableKind, TableRef, Value};
 
 /// A SQL fragment plus the values to bind, in order.
 pub struct BoundSql {
@@ -38,7 +38,33 @@ pub fn where_clause(raw: &str) -> BoundSql {
     }
 }
 
-pub fn select_page_sql(driver: Driver, table: &TableRef, where_raw: &str) -> BoundSql {
+/// ` ORDER BY "a" ASC, "b" DESC`, or empty when there is nothing to order by.
+///
+/// Column names are quoted rather than bound: an identifier cannot be a
+/// parameter, and these come from the result set's own headers.
+pub fn order_by(driver: Driver, order: &[SortKey]) -> String {
+    if order.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = order
+        .iter()
+        .map(|key| {
+            format!(
+                "{} {}",
+                driver.quote_identifier(&key.column),
+                if key.ascending { "ASC" } else { "DESC" }
+            )
+        })
+        .collect();
+    format!(" ORDER BY {}", parts.join(", "))
+}
+
+pub fn select_page_sql(
+    driver: Driver,
+    table: &TableRef,
+    where_raw: &str,
+    order: &[SortKey],
+) -> BoundSql {
     let where_part = where_clause(where_raw);
     let (limit_ph, offset_ph) = match driver {
         Driver::Postgres => (
@@ -49,9 +75,10 @@ pub fn select_page_sql(driver: Driver, table: &TableRef, where_raw: &str) -> Bou
     };
     BoundSql {
         sql: format!(
-            "SELECT * FROM {}{} LIMIT {limit_ph} OFFSET {offset_ph}",
+            "SELECT * FROM {}{}{} LIMIT {limit_ph} OFFSET {offset_ph}",
             table.quoted(driver),
-            where_part.sql
+            where_part.sql,
+            order_by(driver, order)
         ),
         binds: where_part.binds,
     }
@@ -159,6 +186,56 @@ pub fn delete_sql(
             "DELETE FROM {} WHERE {}",
             table.quoted(driver),
             wheres.join(" AND ")
+        ),
+        binds,
+    })
+}
+
+/// `INSERT INTO table (…) VALUES (…)` for one new row.
+///
+/// Columns the caller left out are simply absent from the statement, which is
+/// how the server's own defaults and generated keys still fire. A row naming
+/// no columns at all is the engine's "all defaults" spelling, which differs
+/// between the two.
+pub fn insert_sql(
+    driver: Driver,
+    table: &TableRef,
+    values: &[(String, Value)],
+) -> Result<BoundSql, String> {
+    if values.is_empty() {
+        return Ok(BoundSql {
+            sql: match driver {
+                Driver::Postgres => format!("INSERT INTO {} DEFAULT VALUES", table.quoted(driver)),
+                Driver::MySql => format!("INSERT INTO {} () VALUES ()", table.quoted(driver)),
+            },
+            binds: Vec::new(),
+        });
+    }
+
+    let mut binds = Vec::new();
+    let mut param = 1usize;
+    let mut columns = Vec::new();
+    let mut slots = Vec::new();
+
+    for (name, value) in values {
+        columns.push(driver.quote_identifier(name));
+        match value {
+            Value::Null => slots.push("NULL".to_string()),
+            Value::Default => slots.push("DEFAULT".to_string()),
+            _ => {
+                slots.push(typed_placeholder(driver, param, value));
+                param += 1;
+                binds.push(value_to_bind(value));
+            }
+        }
+    }
+
+    Ok(BoundSql {
+        sql: format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table.quoted(driver),
+            columns.join(", "),
+            slots.join(", ")
         ),
         binds,
     })
@@ -280,10 +357,45 @@ mod tests {
     #[test]
     fn select_page_embeds_the_predicate() {
         let table = TableRef::new("public", "people");
-        let bound = select_page_sql(Driver::Postgres, &table, "name = 'Ada'");
+        let bound = select_page_sql(Driver::Postgres, &table, "name = 'Ada'", &[]);
         assert!(bound.sql.contains(" WHERE name = 'Ada'"));
         assert!(bound.sql.contains("LIMIT $1 OFFSET $2"));
         assert!(bound.binds.is_empty());
+    }
+
+    /// The order has to sit between the predicate and the window, or the
+    /// engine rejects the statement outright.
+    #[test]
+    fn the_order_goes_after_the_where_and_before_the_limit() {
+        let table = TableRef::new("public", "people");
+        let bound = select_page_sql(
+            Driver::Postgres,
+            &table,
+            "active",
+            &[SortKey::desc("name"), SortKey::asc("id")],
+        );
+        assert_eq!(
+            bound.sql,
+            "SELECT * FROM \"public\".\"people\" WHERE active \
+             ORDER BY \"name\" DESC, \"id\" ASC LIMIT $1 OFFSET $2"
+        );
+    }
+
+    /// Nothing to order by leaves the clause out rather than emitting an
+    /// empty `ORDER BY`.
+    #[test]
+    fn an_empty_order_is_omitted() {
+        assert!(order_by(Driver::MySql, &[]).is_empty());
+        let bound = select_page_sql(Driver::MySql, &TableRef::new("s", "t"), "", &[]);
+        assert!(!bound.sql.contains("ORDER BY"), "got: {}", bound.sql);
+    }
+
+    /// A column name is pasted, not bound -- so it is quoted like every other
+    /// identifier this crate emits.
+    #[test]
+    fn a_hostile_column_name_cannot_escape_the_order() {
+        let order = order_by(Driver::Postgres, &[SortKey::asc("x\"; DROP TABLE t; --")]);
+        assert_eq!(order, " ORDER BY \"x\"\"; DROP TABLE t; --\" ASC");
     }
 
     #[test]
@@ -405,6 +517,61 @@ mod tests {
         assert_eq!(temporal_type("2024-01-01"), "date");
         assert_eq!(temporal_type("12:30:00"), "time");
         assert_eq!(temporal_type("1 day"), "interval");
+    }
+
+    /// Columns the user never filled in are absent from the statement, which
+    /// is what lets a sequence or a `DEFAULT` still fire.
+    #[test]
+    fn insert_names_only_the_columns_it_was_given() {
+        let table = TableRef::new("public", "people");
+        let bound = insert_sql(
+            Driver::Postgres,
+            &table,
+            &[
+                ("name".into(), Value::Text("Ada".into())),
+                ("score".into(), Value::Decimal("1.50".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            bound.sql,
+            "INSERT INTO \"public\".\"people\" (\"name\", \"score\") \
+             VALUES ($1, $2::numeric)"
+        );
+        assert!(!bound.sql.contains("\"id\""), "an untouched key is left out");
+    }
+
+    /// NULL and DEFAULT are written into the statement, not bound -- DEFAULT
+    /// is not a value any parameter could carry.
+    #[test]
+    fn insert_writes_null_and_default_inline() {
+        let bound = insert_sql(
+            Driver::Postgres,
+            &TableRef::new("s", "t"),
+            &[
+                ("a".into(), Value::Null),
+                ("b".into(), Value::Default),
+                ("c".into(), Value::Int(1)),
+            ],
+        )
+        .unwrap();
+        assert!(bound.sql.contains("VALUES (NULL, DEFAULT, $1)"), "got: {}", bound.sql);
+        assert_eq!(bound.binds, vec![Value::Int(1)]);
+    }
+
+    /// A row with nothing filled in is still a legal statement -- and the two
+    /// engines spell "all defaults" differently.
+    #[test]
+    fn an_all_defaults_insert_uses_each_engines_spelling() {
+        let table = TableRef::new("s", "t");
+        assert_eq!(
+            insert_sql(Driver::Postgres, &table, &[]).unwrap().sql,
+            "INSERT INTO \"s\".\"t\" DEFAULT VALUES"
+        );
+        assert_eq!(
+            insert_sql(Driver::MySql, &table, &[]).unwrap().sql,
+            "INSERT INTO `s`.`t` () VALUES ()"
+        );
     }
 
     /// A hostile table name must not break out of the identifier.

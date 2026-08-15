@@ -58,7 +58,17 @@ impl DbUi {
                 .into_any_element();
         }
 
-        let row_count = view.set.rows.len();
+        // Staged inserts are drawn under the stored rows: indices past the
+        // result belong to `pending_inserts`, which is what lets one list
+        // render both without the virtualizer knowing the difference.
+        let stored_rows = view.set.rows.len();
+        let insert_count = self
+            .tabs
+            .items
+            .get(active_index)
+            .map(|tab| tab.pending_inserts().len())
+            .unwrap_or(0);
+        let row_count = stored_rows + insert_count;
         let total_width: f32 = visible
             .iter()
             .map(|(index, _)| {
@@ -70,7 +80,11 @@ impl DbUi {
             .sum::<f32>()
             + f32::from(metrics::row_number_width());
 
-        let header = render_header(view, &visible, &self.theme, total_width);
+        let sort = self.active_sort().cloned();
+        // Only a table tab can be sorted: a query's order is whatever its own
+        // ORDER BY says, and re-reading it with one bolted on would be
+        // rewriting the user's SQL behind their back.
+        let header = render_header(view, &visible, &self.theme, total_width, sort, is_table_tab, cx);
 
         // Virtualized rows (fast). Parent H-scrolls; list only scrolls vertically.
         // `overflow_hidden` then `overflow_x_scroll` keeps Y clipped so the list
@@ -112,8 +126,20 @@ impl DbUi {
                     .sum::<f32>()
                     + f32::from(metrics::row_number_width());
 
+                let stored_rows = view.set.rows.len();
+
                 range
                     .map(|index| {
+                        if index >= stored_rows {
+                            return render_insert_row(
+                                this,
+                                tab,
+                                index - stored_rows,
+                                &visible,
+                                total_width,
+                                cx,
+                            );
+                        }
                         let row = &view.set.rows[index];
                         let stripe = theme.stripe(index);
                         let row_selected = tab.selection().contains(index)
@@ -198,6 +224,34 @@ impl DbUi {
                                     this.grid_pointer_down(index, None, event.modifiers, cx);
                                 }),
                             )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    // Right-clicking outside the selection
+                                    // moves it, the way every list does --
+                                    // otherwise the menu acts on rows the
+                                    // pointer is nowhere near.
+                                    let inside = this
+                                        .tabs
+                                        .active()
+                                        .is_some_and(|tab| tab.selection().contains(index));
+                                    if !inside {
+                                        this.grid_pointer_down(
+                                            index,
+                                            None,
+                                            gpui::Modifiers::default(),
+                                            cx,
+                                        );
+                                        this.end_row_drag(cx);
+                                    }
+                                    this.open_context_menu(
+                                        crate::components::context_menu::ContextTarget::Rows,
+                                        event.position,
+                                        cx,
+                                    );
+                                }),
+                            )
                             // Drag-select. The press marks the anchor; crossing
                             // a row with the button down grows the range to it.
                             .on_mouse_move(cx.listener(
@@ -276,6 +330,92 @@ impl DbUi {
     }
 }
 
+/// One staged insert, drawn as a row under the stored ones.
+///
+/// Marked `+` in the gutter and tinted with the success colour, so a row that
+/// is not on the server yet never looks like one that is.
+fn render_insert_row(
+    this: &DbUi,
+    tab: &WorkspaceTab,
+    insert_index: usize,
+    visible: &[(usize, &dbui_app::domain::ColumnInfo)],
+    total_width: f32,
+    cx: &mut Context<DbUi>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = &this.theme;
+    let inserts = tab.pending_inserts();
+    let Some(row) = inserts.get(insert_index) else {
+        return div().id(("insert-row-missing", insert_index));
+    };
+    let being_edited = tab.editing_insert() == Some(insert_index);
+
+    let cells: Vec<AnyElement> = visible
+        .iter()
+        .map(|(column, info)| {
+            let width = this
+                .tabs
+                .active()
+                .and_then(|tab| tab.result())
+                .and_then(|view| view.widths.get(*column).copied())
+                .unwrap_or(metrics::column_min_width());
+            let text: SharedString = row
+                .fields
+                .iter()
+                .find(|(name, _, _)| name == &info.name)
+                .map(|(_, input, _)| input.text().to_string())
+                .unwrap_or_default()
+                .into();
+
+            div()
+                .w(px(width))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .px_2()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .border_r_1()
+                .border_color(theme.divider)
+                .text_color(theme.text_muted)
+                .child(text)
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .id(("insert-row", insert_index))
+        .flex()
+        .w(px(total_width))
+        .h(metrics::row_height())
+        .bg(theme.selection)
+        .when(being_edited, |row| row.bg(theme.hover))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.edit_insert(insert_index, cx);
+            }),
+        )
+        .child(
+            div()
+                .w(metrics::row_number_width())
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_end()
+                .px_2()
+                .text_color(theme.success)
+                .text_size(metrics::text_size_small())
+                .border_r_1()
+                .border_color(theme.divider)
+                .child("+"),
+        )
+        .children(cells)
+}
+
 fn empty_state(theme: &crate::theme::Theme, connected: bool) -> impl IntoElement {
     let message = if connected {
         "Pick a table, or press ⌘E to write a query."
@@ -298,6 +438,9 @@ fn render_header(
     visible: &[(usize, &dbui_app::domain::ColumnInfo)],
     theme: &crate::theme::Theme,
     total_width: f32,
+    sort: Option<dbui_app::domain::SortKey>,
+    sortable: bool,
+    cx: &mut Context<DbUi>,
 ) -> AnyElement {
     let columns: Vec<AnyElement> = visible
         .iter()
@@ -312,8 +455,11 @@ fn render_header(
                 .structure
                 .iter()
                 .any(|meta| meta.name == column.name && meta.is_primary_key);
+            let sorted = sort.as_ref().filter(|key| key.column == column.name);
+            let name = column.name.clone();
 
             div()
+                .id(("header", *index))
                 .w(px(width))
                 .flex_shrink_0()
                 .h_full()
@@ -325,6 +471,19 @@ fn render_header(
                 .border_r_1()
                 .border_color(theme.border)
                 .when(is_key, |header| header.text_color(theme.warning))
+                .when(sorted.is_some(), |header| header.text_color(theme.text))
+                .when(sortable, |header| {
+                    header
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_sort(&name, cx);
+                            }),
+                        )
+                })
                 .child(SharedString::from(column.name.clone()))
                 .child(
                     div()
@@ -332,6 +491,12 @@ fn render_header(
                         .text_color(theme.text_faint)
                         .child(SharedString::from(column.type_name.to_lowercase())),
                 )
+                .children(sorted.map(|key| {
+                    div()
+                        .flex_shrink_0()
+                        .text_color(theme.accent)
+                        .child(if key.ascending { "↑" } else { "↓" })
+                }))
                 .into_any_element()
         })
         .collect();

@@ -932,13 +932,14 @@ impl DbUi {
             return;
         };
 
-        let (table, page, where_clause) = match self.tabs.get_mut(tab_id) {
+        let (table, page, where_clause, sort) = match self.tabs.get_mut(tab_id) {
             Some(WorkspaceTab::Table {
                 table,
                 page,
                 where_clause,
+                sort,
                 ..
-            }) => (table.clone(), *page, where_clause.clone()),
+            }) => (table.clone(), *page, where_clause.clone(), sort.clone()),
             _ => return,
         };
 
@@ -958,6 +959,7 @@ impl DbUi {
             table.clone(),
             page,
             where_clause.clone(),
+            sort,
         );
         cx.spawn(async move |this, cx| {
             let landed = task.await;
@@ -1034,6 +1036,56 @@ impl DbUi {
         self.loads_in_flight = self.loads_in_flight.saturating_sub(1);
         if self.loads_in_flight == 0 && matches!(self.status, Status::Busy(_)) {
             self.status = Status::Idle;
+        }
+    }
+
+    /// Click a header: sort ascending, then descending, then back to the
+    /// table's own key order.
+    ///
+    /// Sorting reads a fresh page rather than reordering what is on screen —
+    /// the rows here are one window onto the table, and sorting only that
+    /// window would order five hundred rows out of five million and call it
+    /// sorted.
+    pub(crate) fn toggle_sort(&mut self, column: &str, cx: &mut Context<Self>) {
+        // Whatever is staged refers to rows by key, not by position, so it
+        // survives the reload -- but a half-typed draft has to be folded in
+        // before the rows underneath it move.
+        self.stash_current_draft(cx);
+
+        let Some(WorkspaceTab::Table { sort, page, .. }) = self.tabs.active_mut() else {
+            return;
+        };
+        let next = dbui_app::domain::SortKey::cycled(sort.as_ref(), column);
+        *sort = next.clone();
+        // A new order makes the old offset meaningless.
+        page.offset = 0;
+
+        self.status = match &next {
+            Some(key) if key.ascending => Status::info(format!("Sorted by {column} ↑")),
+            Some(_) => Status::info(format!("Sorted by {column} ↓")),
+            None => Status::info("Sort cleared"),
+        };
+        self.load_active_table(cx);
+    }
+
+    /// Drop the sort and go back to the table's own key order.
+    pub(crate) fn clear_sort(&mut self, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Table { sort, page, .. }) = self.tabs.active_mut() else {
+            return;
+        };
+        if sort.take().is_none() {
+            return;
+        }
+        page.offset = 0;
+        self.status = Status::info("Sort cleared");
+        self.load_active_table(cx);
+    }
+
+    /// The sort the active tab is showing, for the header arrow.
+    pub(crate) fn active_sort(&self) -> Option<&dbui_app::domain::SortKey> {
+        match self.tabs.active() {
+            Some(WorkspaceTab::Table { sort, .. }) => sort.as_ref(),
+            _ => None,
         }
     }
 
@@ -1738,6 +1790,13 @@ impl DbUi {
     /// Stage every selected row for deletion. Nothing reaches the server until
     /// the batch is committed.
     pub(crate) fn delete_selected_rows(&mut self, cx: &mut Context<Self>) {
+        // A new row was never on the server, so there is nothing to delete --
+        // ⌘⌫ simply takes it back off the staging list.
+        if let Some(index) = self.tabs.active().and_then(|tab| tab.editing_insert()) {
+            self.remove_insert(index, cx);
+            return;
+        }
+
         // Fold a half-typed edit in first, so what the bubble lists is the
         // whole of what ⌘S will write.
         self.stash_current_draft(cx);
@@ -1811,6 +1870,189 @@ impl DbUi {
         Ok(staged)
     }
 
+    // -- staged inserts -----------------------------------------------------
+
+    /// Stage a blank new row and open it for editing.
+    ///
+    /// The row is drawn under the real ones rather than hidden in a dialog, so
+    /// it is filled in with the same columns, in the same order, in the same
+    /// sidebar as every other row on screen.
+    pub(crate) fn add_row(&mut self, cx: &mut Context<Self>) {
+        self.stash_current_draft(cx);
+
+        let (columns, structure) = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                result: Some(view), ..
+            }) => (view.set.columns.clone(), view.structure.clone()),
+            Some(WorkspaceTab::Table { result: None, .. }) => {
+                self.status = Status::info("Load the table first");
+                cx.notify();
+                return;
+            }
+            _ => {
+                self.status = Status::info("New rows need a table tab");
+                cx.notify();
+                return;
+            }
+        };
+
+        let Some(WorkspaceTab::Table {
+            pending_inserts,
+            editing_insert,
+            selection,
+            draft,
+            selected_row,
+            change_bubble_expanded,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+
+        pending_inserts.push(crate::tabs::PendingRowInsert::blank(&columns, &structure));
+        *editing_insert = Some(pending_inserts.len() - 1);
+        *change_bubble_expanded = true;
+        // A new row is not one of the stored ones, so nothing in the grid is
+        // selected while it is being filled in.
+        selection.clear();
+        *selected_row = None;
+        *draft = None;
+
+        self.detail_open = true;
+        self.detail_input = None;
+        self.detail_value_menu = None;
+        self.focus = Focus::Detail;
+        self.status = Status::info("New row staged — ⌘S to commit");
+        cx.notify();
+    }
+
+    /// Open one of the staged inserts in the detail sidebar.
+    pub(crate) fn edit_insert(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.stash_current_draft(cx);
+        let Some(WorkspaceTab::Table {
+            pending_inserts,
+            editing_insert,
+            selection,
+            draft,
+            selected_row,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+        if index >= pending_inserts.len() {
+            return;
+        }
+        *editing_insert = Some(index);
+        selection.clear();
+        *selected_row = None;
+        *draft = None;
+
+        self.detail_open = true;
+        self.detail_input = None;
+        self.focus = Focus::Detail;
+        cx.notify();
+    }
+
+    /// Drop a staged insert. This is what ⌘⌫ means on a new row: it was never
+    /// on the server, so there is nothing to delete — it is simply unstaged.
+    pub(crate) fn remove_insert(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Table {
+            pending_inserts,
+            editing_insert,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+        if index >= pending_inserts.len() {
+            return;
+        }
+        pending_inserts.remove(index);
+        *editing_insert = match *editing_insert {
+            Some(open) if open == index => None,
+            // Everything after the removed row shifted down by one.
+            Some(open) if open > index => Some(open - 1),
+            other => other,
+        };
+        self.status = Status::info("New row discarded");
+        cx.notify();
+    }
+
+    /// How many new rows are staged, whether or not they parse yet.
+    pub(crate) fn staged_insert_count(&self) -> usize {
+        self.tabs
+            .active()
+            .map(|tab| tab.pending_inserts().len())
+            .unwrap_or(0)
+    }
+
+    /// The staged inserts as values ready to bind, or the first parse failure.
+    pub(crate) fn collect_batch_inserts(&self) -> Result<Vec<dbui_app::RowInsert>, String> {
+        let Some(WorkspaceTab::Table {
+            pending_inserts, ..
+        }) = self.tabs.active()
+        else {
+            return Ok(Vec::new());
+        };
+        pending_inserts
+            .iter()
+            .map(|row| {
+                row.to_values()
+                    .map(|values| dbui_app::RowInsert { values })
+            })
+            .collect()
+    }
+
+    /// Copy the selected rows to the clipboard.
+    ///
+    /// Falls back to the whole page when nothing is selected: "copy" with no
+    /// selection meaning "copy nothing" is a shortcut that looks broken.
+    pub(crate) fn copy_selected_rows(
+        &mut self,
+        format: crate::row_export::RowFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let Some(view) = tab.result() else {
+            self.status = Status::info("Nothing to copy");
+            cx.notify();
+            return;
+        };
+
+        let selected = tab.selection().ordered();
+        let rows: Vec<Vec<dbui_app::domain::Value>> = if selected.is_empty() {
+            view.set.rows.iter().map(|row| row.0.clone()).collect()
+        } else {
+            selected
+                .iter()
+                .filter_map(|index| view.set.rows.get(*index))
+                .map(|row| row.0.clone())
+                .collect()
+        };
+
+        if rows.is_empty() {
+            self.status = Status::info("Nothing to copy");
+            cx.notify();
+            return;
+        }
+
+        let columns = view.set.columns.clone();
+        let table = tab.table_ref().cloned();
+        let driver = self
+            .active_driver_kind()
+            .unwrap_or(dbui_app::domain::Driver::Postgres);
+        let text = crate::row_export::render(format, &columns, &rows, driver, table.as_ref());
+
+        let count = rows.len();
+        let plural = if count == 1 { "row" } else { "rows" };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = Status::info(format!("Copied {count} {plural}"));
+        cx.notify();
+    }
+
     /// Rows staged for deletion on the active tab.
     pub(crate) fn collect_batch_deletes(&self) -> Vec<crate::tabs::PendingRowDelete> {
         self.tabs
@@ -1877,7 +2119,9 @@ impl DbUi {
 
         // Counted before anything is cleared, and including the open draft:
         // what is being thrown away is everything ⌘S would have written.
-        let discarded = self.collect_batch_edits().len() + self.collect_batch_deletes().len();
+        let discarded = self.collect_batch_edits().len()
+            + self.collect_batch_deletes().len()
+            + self.staged_insert_count();
         if discarded == 0 {
             // Saying "changes discarded" with nothing staged would be
             // reporting an undo that never happened.
@@ -1889,12 +2133,16 @@ impl DbUi {
             result,
             pending_edits,
             pending_deletes,
+            pending_inserts,
+            editing_insert,
             change_bubble_expanded,
             ..
         }) = self.tabs.active_mut()
         {
             pending_edits.clear();
             pending_deletes.clear();
+            pending_inserts.clear();
+            *editing_insert = None;
             *change_bubble_expanded = false;
             if let (Some(draft), Some(view)) = (draft.as_mut(), result.as_ref()) {
                 draft.reset(view);
@@ -1923,6 +2171,18 @@ impl DbUi {
         // Fold the open draft in first so Save catches in-progress edits.
         self.stash_current_draft(cx);
 
+        // The staged inserts are turned into values here rather than later:
+        // a row that will not parse has to stop the commit before anything is
+        // sent, not halfway through the transaction.
+        let inserts = match self.collect_batch_inserts() {
+            Ok(inserts) => inserts,
+            Err(message) => {
+                self.status = Status::error(message);
+                cx.notify();
+                return;
+            }
+        };
+
         let (table, edits, deletes, tab_id) = match self.tabs.active() {
             Some(WorkspaceTab::Table {
                 id,
@@ -1946,7 +2206,7 @@ impl DbUi {
             None => return,
         };
 
-        if edits.is_empty() && deletes.is_empty() {
+        if edits.is_empty() && deletes.is_empty() && inserts.is_empty() {
             self.status = Status::info("No changes to commit");
             cx.notify();
             return;
@@ -1960,7 +2220,7 @@ impl DbUi {
             return;
         };
 
-        let count = edits.len() + deletes.len();
+        let count = edits.len() + deletes.len() + inserts.len();
         if let Some(WorkspaceTab::Table { saving, .. }) = self.tabs.get_mut(tab_id) {
             *saving = true;
         }
@@ -1969,6 +2229,7 @@ impl DbUi {
 
         let runtime = self.runtime.clone();
         let batch = dbui_app::RowBatch {
+            inserts,
             updates: edits
                 .iter()
                 .map(|edit| RowUpdate {
@@ -1999,6 +2260,8 @@ impl DbUi {
                         if let Some(WorkspaceTab::Table {
                             pending_edits,
                             pending_deletes,
+                            pending_inserts,
+                            editing_insert,
                             change_bubble_expanded,
                             selection,
                             draft,
@@ -2007,6 +2270,8 @@ impl DbUi {
                         {
                             pending_edits.clear();
                             pending_deletes.clear();
+                            pending_inserts.clear();
+                            *editing_insert = None;
                             *change_bubble_expanded = false;
                             // Row indices mean nothing once the rows below a
                             // deleted one have moved up.
@@ -2453,6 +2718,12 @@ impl DbUi {
                     self.delete_selected_rows(cx);
                     return;
                 }
+                // ⌘C over the grid copies rows; inside an editor it is still
+                // "copy the selected text".
+                "c" if !self.text_undo_has_focus() => {
+                    self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx);
+                    return;
+                }
                 // Unshifted only: ⌘⇧Z is redo, and a staged batch has nothing
                 // to redo — so it falls through rather than discarding twice.
                 "z" if !shift && !self.text_undo_has_focus() => {
@@ -2544,6 +2815,26 @@ impl DbUi {
                     _ => {}
                 }
             }
+            // A staged insert owns the sidebar while it is open.
+            if let Some(DetailInput::Field(index)) = self.detail_input {
+                let typed = match self.tabs.active_mut() {
+                    Some(WorkspaceTab::Table {
+                        pending_inserts,
+                        editing_insert: Some(open),
+                        ..
+                    }) => pending_inserts
+                        .get_mut(*open)
+                        .and_then(|row| row.fields.get_mut(index))
+                        .map(|(_, input, _)| input.handle_key(keystroke, cx))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if typed {
+                    cx.notify();
+                    return;
+                }
+            }
+
             let handled = match self.tabs.active_mut() {
                 Some(WorkspaceTab::Table {
                     draft: Some(draft), ..

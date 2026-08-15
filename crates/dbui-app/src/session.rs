@@ -10,7 +10,7 @@
 //! leave a tab pointing at a server that is gone.
 
 use crate::store::StoreError;
-use dbui_domain::ConnectionId;
+use dbui_domain::{ConnectionId, SortKey};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +36,10 @@ pub enum SavedTab {
         where_clause: String,
         #[serde(default)]
         hidden_columns: Vec<String>,
+        /// Which column the grid was sorted by. `default` so a session
+        /// written before sorting existed still loads.
+        #[serde(default)]
+        sort: Option<SortKey>,
     },
     Sql {
         #[serde(default)]
@@ -186,6 +190,7 @@ mod tests {
             name: name.into(),
             where_clause: String::new(),
             hidden_columns: Vec::new(),
+            sort: None,
         }
     }
 
@@ -206,6 +211,7 @@ mod tests {
                     name: "users".into(),
                     where_clause: "id > 10".into(),
                     hidden_columns: vec!["secret".into()],
+                    sort: None,
                 },
                 SavedTab::Sql {
                     text: "select 1".into(),

@@ -20,7 +20,12 @@ impl DbUi {
     pub(crate) fn render_change_bubble(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let batch = self.collect_batch_edits();
         let deletes = self.collect_batch_deletes();
-        if batch.is_empty() && deletes.is_empty() {
+        let inserts: Vec<String> = self
+            .tabs
+            .active()
+            .map(|tab| tab.pending_inserts().iter().map(|row| row.label()).collect())
+            .unwrap_or_default();
+        if batch.is_empty() && deletes.is_empty() && inserts.is_empty() {
             return None;
         }
 
@@ -33,7 +38,7 @@ impl DbUi {
             _ => (false, false),
         };
         let theme = &self.theme;
-        let count = batch.len() + deletes.len();
+        let count = batch.len() + deletes.len() + inserts.len();
         let mut label = if count == 1 {
             "1 change".to_string()
         } else {
@@ -41,6 +46,9 @@ impl DbUi {
         };
         // Deletions are the half of the batch worth naming in the collapsed
         // state: an edit can be re-edited, a delete cannot be un-deleted.
+        if !inserts.is_empty() {
+            label.push_str(&format!(" · {} new", inserts.len()));
+        }
         if !deletes.is_empty() {
             label.push_str(&format!(
                 " · {} to delete",
@@ -130,6 +138,7 @@ impl DbUi {
                     .flex()
                     .flex_col()
                     .gap_3()
+                    .children(inserts.iter().map(|label| render_insert_row(label, theme)))
                     .children(batch.iter().map(|edit| render_edit_group(edit, theme)))
                     .children(deletes.iter().map(|row| render_delete_row(row, theme))),
             );
@@ -187,6 +196,30 @@ fn render_edit_group(edit: &PendingRowEdit, theme: &Theme) -> AnyElement {
                 .iter()
                 .map(|change| render_change(change, theme)),
         )
+        .into_any_element()
+}
+
+/// A staged insert: what little is known about a row that does not exist yet.
+fn render_insert_row(label: &str, theme: &Theme) -> AnyElement {
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .overflow_hidden()
+        .font_family(metrics::MONO_FONT)
+        .text_size(metrics::text_size_small())
+        .text_color(theme.success)
+        .child(div().flex_shrink_0().child("+"))
+        .child(
+            div()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(SharedString::from(one_line(label))),
+        )
+        .child(div().flex_shrink_0().child("NEW ROW"))
         .into_any_element()
 }
 

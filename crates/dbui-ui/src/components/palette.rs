@@ -51,7 +51,12 @@ enum ActionId {
     GoToTable,
     SearchTables,
     SelectAllRows,
+    AddRow,
     DeleteRows,
+    CopyRowsTsv,
+    CopyRowsJson,
+    CopyRowsInsert,
+    ClearSort,
     CommitChanges,
     DiscardChanges,
     ToggleFilters,
@@ -215,9 +220,39 @@ const ACTIONS: &[ActionDef] = &[
         section: "Rows",
     },
     ActionDef {
+        id: ActionId::AddRow,
+        label: "New Row",
+        shortcut: None,
+        section: "Rows",
+    },
+    ActionDef {
         id: ActionId::DeleteRows,
         label: "Delete Selected Rows",
         shortcut: Some("⌘⌫"),
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::CopyRowsTsv,
+        label: "Copy Rows as TSV",
+        shortcut: Some("⌘C"),
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::CopyRowsJson,
+        label: "Copy Rows as JSON",
+        shortcut: None,
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::CopyRowsInsert,
+        label: "Copy Rows as INSERT",
+        shortcut: None,
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::ClearSort,
+        label: "Clear Sort",
+        shortcut: None,
         section: "Rows",
     },
     ActionDef {
@@ -662,6 +697,15 @@ impl DbUi {
                         .active()
                         .is_some_and(|tab| !tab.selection().is_empty())
             }
+            ActionId::AddRow => {
+                is_table && self.tabs.active().and_then(|tab| tab.result()).is_some()
+            }
+            ActionId::CopyRowsTsv | ActionId::CopyRowsJson | ActionId::CopyRowsInsert => self
+                .tabs
+                .active()
+                .and_then(|tab| tab.result())
+                .is_some_and(|view| !view.set.rows.is_empty()),
+            ActionId::ClearSort => self.active_sort().is_some(),
             ActionId::CommitChanges | ActionId::DiscardChanges => {
                 !self.collect_batch_edits().is_empty() || !self.collect_batch_deletes().is_empty()
             }
@@ -719,6 +763,17 @@ impl DbUi {
             ActionId::SearchTables => self.focus_sidebar_search(cx),
             ActionId::SelectAllRows => self.select_all_rows(cx),
             ActionId::DeleteRows => self.delete_selected_rows(cx),
+            ActionId::AddRow => self.add_row(cx),
+            ActionId::CopyRowsTsv => {
+                self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx)
+            }
+            ActionId::CopyRowsJson => {
+                self.copy_selected_rows(crate::row_export::RowFormat::Json, cx)
+            }
+            ActionId::CopyRowsInsert => {
+                self.copy_selected_rows(crate::row_export::RowFormat::Insert, cx)
+            }
+            ActionId::ClearSort => self.clear_sort(cx),
             ActionId::CommitChanges => self.save_pending_edits(cx),
             ActionId::DiscardChanges => self.discard_pending_edits(cx),
             ActionId::ToggleFilters => self.toggle_filters_open(cx),

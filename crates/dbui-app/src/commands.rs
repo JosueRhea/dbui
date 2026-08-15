@@ -7,8 +7,8 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, TableKind,
-    TableRef, Value,
+    Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, SortKey,
+    TableKind, TableRef, Value,
 };
 use dbui_driver::{DatabaseDriver, DriverError, RowBatch, RowUpdate};
 use std::sync::Arc;
@@ -36,22 +36,31 @@ pub fn refresh_catalog(
 }
 
 /// A page of a table's rows, plus its columns and total size.
+///
+/// The columns are read *first*, because their primary key is what the page is
+/// ordered by. An unordered `LIMIT`/`OFFSET` is not pagination: the engine may
+/// return rows in any order it likes, so the same row can appear on two pages
+/// while another never appears at all.
 pub fn open_table(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
     table: TableRef,
     page: Page,
     where_clause: String,
+    sort: Option<SortKey>,
 ) -> Task<Outcome<TableContents>> {
     runtime.spawn(async move {
-        let rows = driver.table_rows(&table, page, &where_clause).await?;
         let columns = driver.columns(&table).await.unwrap_or_default();
+        let order = dbui_domain::order_for(sort.as_ref(), &key_columns(&columns));
+
+        let rows = driver.table_rows(&table, page, &where_clause, &order).await?;
         let total_rows = driver.row_count(&table, &where_clause).await.ok();
 
         Ok(TableContents {
             table,
             page,
             where_clause,
+            sort,
             rows,
             columns,
             total_rows,
@@ -59,14 +68,35 @@ pub fn open_table(
     })
 }
 
+/// The primary-key columns, in the order the table declares them.
+fn key_columns(columns: &[Column]) -> Vec<String> {
+    let mut key: Vec<&Column> = columns.iter().filter(|c| c.is_primary_key).collect();
+    key.sort_by_key(|column| column.ordinal);
+    key.into_iter().map(|column| column.name.clone()).collect()
+}
+
 /// Everything the table view shows at once.
 pub struct TableContents {
     pub table: TableRef,
     pub page: Page,
     pub where_clause: String,
+    /// The sort this page was read with, echoed back so the header can draw
+    /// its arrow against the data actually on screen.
+    pub sort: Option<SortKey>,
     pub rows: ResultSet,
     pub columns: Vec<Column>,
     pub total_rows: Option<i64>,
+}
+
+impl TableContents {
+    /// Whether this page is in a defined order at all.
+    ///
+    /// False for a keyless table or view with no sort chosen: there is nothing
+    /// to order by that is guaranteed cheap, so the read is left unordered and
+    /// the UI says so rather than pretending the paging is stable.
+    pub fn is_ordered(&self) -> bool {
+        self.sort.is_some() || self.columns.iter().any(|column| column.is_primary_key)
+    }
 }
 
 /// Persist edits to one row identified by its primary key.

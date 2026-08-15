@@ -323,14 +323,14 @@ both_engines!(
         let table = fx.people();
 
         let first = fx
-            .table_rows(&table, Page { limit: 2, offset: 0 }, "")
+            .table_rows(&table, Page { limit: 2, offset: 0 }, "", &[])
             .await
             .expect("first page");
         assert_eq!(first.rows.len(), 2, "the probe row must not be shown");
         assert!(first.truncated, "five rows exist, two were asked for");
 
         let second = fx
-            .table_rows(&table, Page { limit: 2, offset: 2 }, "")
+            .table_rows(&table, Page { limit: 2, offset: 2 }, "", &[])
             .await
             .expect("second page");
         assert_eq!(second.rows.len(), 2);
@@ -340,7 +340,7 @@ both_engines!(
         );
 
         let all = fx
-            .table_rows(&table, Page { limit: 100, offset: 0 }, "")
+            .table_rows(&table, Page { limit: 100, offset: 0 }, "", &[])
             .await
             .expect("everything");
         assert_eq!(all.rows.len(), 5);
@@ -352,7 +352,7 @@ both_engines!(
 
 both_engines!(values_decode_to_the_right_variants, |fx: Fixture| async move {
     let rows = fx
-        .table_rows(&fx.people(), Page { limit: 100, offset: 0 }, "")
+        .table_rows(&fx.people(), Page { limit: 100, offset: 0 }, "", &[])
         .await
         .expect("rows");
 
@@ -508,7 +508,7 @@ both_engines!(a_hostile_table_name_survives_quoting, |fx: Fixture| async move {
         .expect("insert");
 
     let rows = fx
-        .table_rows(&table, Page::first(), "")
+        .table_rows(&table, Page::first(), "", &[])
         .await
         .expect("the generated SELECT must quote the name too");
     assert_eq!(rows.rows.len(), 1);
@@ -560,7 +560,7 @@ both_engines!(
         let table = fx.people();
         let where_eq = "name = 'Ada'";
         let rows = fx
-            .table_rows(&table, Page::first(), where_eq)
+            .table_rows(&table, Page::first(), where_eq, &[])
             .await
             .expect("filtered rows");
         assert_eq!(rows.rows.len(), 1);
@@ -584,7 +584,7 @@ both_engines!(
         assert_eq!(affected, 1);
 
         let again = fx
-            .table_rows(&table, Page::first(), where_eq)
+            .table_rows(&table, Page::first(), where_eq, &[])
             .await
             .expect("reload");
         assert_eq!(
@@ -623,7 +623,7 @@ both_engines!(
         );
 
         let ada = fx
-            .table_rows(&table, Page::first(), "name = 'Ada'")
+            .table_rows(&table, Page::first(), "name = 'Ada'", &[])
             .await
             .expect("reload ada");
         let nickname = ada.rows[0].get(2).expect("nickname column");
@@ -648,6 +648,7 @@ both_engines!(
             .apply_changes(
                 &table,
                 &RowBatch {
+                    inserts: Vec::new(),
                     updates: vec![RowUpdate {
                         pk: vec![("id".into(), Value::Int(1))],
                         changes: vec![("nickname".into(), Value::Text("Lovelace".into()))],
@@ -672,7 +673,7 @@ both_engines!(
             "the seed has five rows and two were deleted"
         );
         let ada = fx
-            .table_rows(&table, Page::first(), "name = 'Ada'")
+            .table_rows(&table, Page::first(), "name = 'Ada'", &[])
             .await
             .expect("reload ada");
         assert_eq!(
@@ -718,6 +719,7 @@ both_engines!(
             .apply_changes(
                 &table,
                 &RowBatch {
+                    inserts: Vec::new(),
                     updates: vec![RowUpdate {
                         pk: vec![("id".into(), Value::Int(1))],
                         changes: vec![("nickname".into(), Value::Text("should-not-stick".into()))],
@@ -738,7 +740,7 @@ both_engines!(
             "nothing was deleted"
         );
         let ada = fx
-            .table_rows(&table, Page::first(), "name = 'Ada'")
+            .table_rows(&table, Page::first(), "name = 'Ada'", &[])
             .await
             .expect("reload ada");
         assert!(
@@ -758,6 +760,7 @@ both_engines!(deleting_a_missing_row_affects_nothing, |fx: Fixture| async move {
         .apply_changes(
             &table,
             &RowBatch {
+                inserts: Vec::new(),
                 updates: Vec::new(),
                 deletes: vec![RowDelete {
                     pk: vec![("id".into(), Value::Int(9_999))],
@@ -801,6 +804,143 @@ both_engines!(generated_truncate_and_drop_are_accepted, |fx: Fixture| async move
     fx.execute(&dbui_driver::drop_sql(fx.driver(), &view, TableKind::View))
         .await
         .expect("drop view");
+});
+
+// Paging without an order is not paging: `LIMIT`/`OFFSET` over an unordered
+// read can hand back the same row on two pages and never show another. This
+// walks a table one row at a time and checks it sees each exactly once.
+both_engines!(paging_in_key_order_sees_every_row_once, |fx: Fixture| async move {
+    use dbui_domain::order_for;
+
+    let table = fx.people();
+    let key = vec!["id".to_string()];
+
+    let mut seen = Vec::new();
+    for offset in 0..5u64 {
+        let page = Page { limit: 1, offset };
+        let rows = fx
+            .table_rows(&table, page, "", &order_for(None, &key))
+            .await
+            .expect("one row");
+        assert_eq!(rows.rows.len(), 1, "page {offset} should hold one row");
+        seen.push(rows.rows[0].get(0).expect("id").to_text());
+    }
+
+    assert_eq!(
+        seen,
+        vec!["1", "2", "3", "4", "5"],
+        "each row exactly once, in key order"
+    );
+});
+
+// A descending sort is applied by the server, not by the page the UI happens
+// to be holding.
+both_engines!(a_sort_is_applied_across_the_whole_table, |fx: Fixture| async move {
+    use dbui_domain::{order_for, SortKey};
+
+    let table = fx.people();
+    let key = vec!["id".to_string()];
+    let order = order_for(Some(&SortKey::desc("name")), &key);
+
+    let rows = fx
+        .table_rows(&table, Page::first(), "", &order)
+        .await
+        .expect("sorted rows");
+    let names: Vec<String> = rows
+        .rows
+        .iter()
+        .map(|row| row.get(1).expect("name").to_text())
+        .collect();
+
+    let mut expected = names.clone();
+    expected.sort();
+    expected.reverse();
+    assert_eq!(names, expected, "the server ordered them, not the client");
+
+    // The first page of a descending sort is the *last* rows alphabetically.
+    let first = fx
+        .table_rows(&table, Page { limit: 1, offset: 0 }, "", &order)
+        .await
+        .expect("first row");
+    assert_eq!(first.rows[0].get(1).map(|v| v.to_text()), Some("Grace".into()));
+});
+
+// A new row goes in the same transaction as everything else, and the columns
+// left out of it are the ones the server fills in.
+both_engines!(an_insert_commits_with_the_rest_of_the_batch, |fx: Fixture| async move {
+    use dbui_driver::{RowBatch, RowInsert, RowUpdate};
+
+    let table = fx.people();
+    let affected = fx
+        .apply_changes(
+            &table,
+            &RowBatch {
+                inserts: vec![RowInsert {
+                    values: vec![
+                        ("id".into(), Value::Int(6)),
+                        ("name".into(), Value::Text("Katherine".into())),
+                    ],
+                }],
+                updates: vec![RowUpdate {
+                    pk: vec![("id".into(), Value::Int(1))],
+                    changes: vec![("nickname".into(), Value::Text("Lovelace".into()))],
+                }],
+                deletes: Vec::new(),
+            },
+        )
+        .await
+        .expect("insert + update");
+    assert_eq!(affected, 2);
+
+    let rows = fx
+        .table_rows(&table, Page::first(), "id = 6", &[])
+        .await
+        .expect("the new row");
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0].get(1).map(|v| v.to_text()), Some("Katherine".into()));
+    assert!(
+        rows.rows[0].get(2).expect("nickname").is_null(),
+        "a column left out of the INSERT keeps the table's own default"
+    );
+});
+
+// An insert the server refuses takes the whole batch down with it.
+both_engines!(a_failing_insert_rolls_the_batch_back, |fx: Fixture| async move {
+    use dbui_driver::{RowBatch, RowInsert, RowUpdate};
+
+    let table = fx.people();
+    let err = fx
+        .apply_changes(
+            &table,
+            &RowBatch {
+                // id 1 already exists: the primary key rejects it.
+                inserts: vec![RowInsert {
+                    values: vec![
+                        ("id".into(), Value::Int(1)),
+                        ("name".into(), Value::Text("Clash".into())),
+                    ],
+                }],
+                updates: vec![RowUpdate {
+                    pk: vec![("id".into(), Value::Int(2))],
+                    changes: vec![("nickname".into(), Value::Text("should-not-stick".into()))],
+                }],
+                deletes: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("a duplicate key is refused");
+    assert!(!err.to_string().is_empty());
+
+    assert_eq!(fx.row_count(&table, "").await.expect("count"), 5);
+    let grace = fx
+        .table_rows(&table, Page::first(), "id = 2", &[])
+        .await
+        .expect("reload grace");
+    assert_eq!(
+        grace.rows[0].get(2).map(|v| v.to_text()),
+        Some("Amazing".into()),
+        "the update alongside it rolled back too"
+    );
 });
 
 both_engines!(closing_is_idempotent, |fx: Fixture| async move {

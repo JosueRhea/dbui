@@ -1636,6 +1636,195 @@ fn editing_rows_staged_for_deletion_writes_no_update(cx: &mut TestAppContext) {
     });
 }
 
+// -- sorting, inserting, copying ------------------------------------------
+
+/// Clicking a header cycles the sort and resets to the first page, because an
+/// offset into the old order means nothing in the new one.
+#[gpui::test]
+fn sorting_cycles_and_returns_to_the_first_page(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        if let Some(WorkspaceTab::Table { page, .. }) = view.tabs.active_mut() {
+            page.offset = 500;
+        }
+
+        view.toggle_sort("name", cx);
+        let sort = view.active_sort().expect("sorted");
+        assert_eq!(sort.column, "name");
+        assert!(sort.ascending);
+        let Some(WorkspaceTab::Table { page, .. }) = view.tabs.active() else {
+            panic!("table tab");
+        };
+        assert_eq!(page.offset, 0, "a new order restarts the paging");
+
+        view.toggle_sort("name", cx);
+        assert!(!view.active_sort().expect("still sorted").ascending);
+
+        view.toggle_sort("name", cx);
+        assert!(view.active_sort().is_none(), "a third click clears it");
+    });
+}
+
+/// A sort is part of where the user was, so it comes back with the session.
+#[gpui::test]
+fn a_sort_survives_a_relaunch(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+    let saved = view.update(cx, |view, cx| {
+        view.toggle_sort("name", cx);
+        view.tabs.to_saved().0
+    });
+
+    let sort = match &saved[0] {
+        dbui_app::SavedTab::Table { sort, .. } => sort.clone(),
+        _ => panic!("a table tab"),
+    };
+    assert_eq!(sort.as_ref().expect("saved").column, "name");
+
+    // And a tab rebuilt from that comes back sorted the same way.
+    let restored = crate::tabs::Tabs::from_saved(&saved, 0);
+    let Some(WorkspaceTab::Table { sort, .. }) = restored.active() else {
+        panic!("a table tab");
+    };
+    assert_eq!(sort.as_ref().expect("restored").column, "name");
+}
+
+#[gpui::test]
+fn add_row_stages_a_new_row_and_opens_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        let tab = view.tabs.active().expect("tab");
+        assert_eq!(tab.pending_inserts().len(), 1);
+        assert_eq!(tab.editing_insert(), Some(0));
+        assert!(view.detail_open, "and it opens for filling in");
+
+        // Every column starts as DEFAULT, so an untouched row writes nothing
+        // the server has an opinion about.
+        let row = &tab.pending_inserts()[0];
+        assert_eq!(row.fields.len(), 2);
+        assert!(row.to_values().expect("parses").is_empty());
+    });
+}
+
+/// A column left reading DEFAULT is left out of the statement entirely: that
+/// is what lets a sequence or a column default still fire.
+#[gpui::test]
+fn only_filled_in_columns_reach_the_insert(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        if let Some(WorkspaceTab::Table {
+            pending_inserts, ..
+        }) = view.tabs.active_mut()
+        {
+            pending_inserts[0].fields[1].1 =
+                crate::text_input::TextInput::with_text("Katherine", true);
+        }
+
+        let staged = view.collect_batch_inserts().expect("parses");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].values.len(), 1, "only the column that was typed");
+        assert_eq!(staged[0].values[0].0, "name");
+    });
+}
+
+/// A new row has no stored value to take a type from, so the column's declared
+/// type is used instead. Sending `6` as text is what made Postgres refuse the
+/// INSERT with "column is of type bigint but expression is of type text".
+#[gpui::test]
+fn a_new_rows_values_take_their_type_from_the_column(cx: &mut TestAppContext) {
+    use dbui_app::domain::Value;
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        if let Some(WorkspaceTab::Table {
+            pending_inserts, ..
+        }) = view.tabs.active_mut()
+        {
+            pending_inserts[0].fields[0].1 =
+                crate::text_input::TextInput::with_text("6", true);
+        }
+
+        let staged = view.collect_batch_inserts().expect("parses");
+        assert_eq!(
+            staged[0].values[0],
+            ("id".to_string(), Value::Int(6)),
+            "a bigint column takes an integer, not the string \"6\""
+        );
+    });
+}
+
+/// ⌘⌫ on a new row takes it back off the list -- there is nothing on the
+/// server to delete.
+#[gpui::test]
+fn deleting_a_staged_new_row_unstages_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        assert_eq!(view.staged_insert_count(), 1);
+        view.delete_selected_rows(cx);
+        assert_eq!(view.staged_insert_count(), 0);
+        assert!(
+            view.collect_batch_deletes().is_empty(),
+            "and no DELETE is staged for a row that never existed"
+        );
+    });
+}
+
+#[gpui::test]
+fn discard_clears_staged_new_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        view.add_row(cx);
+        assert_eq!(view.staged_insert_count(), 2);
+        view.discard_pending_edits(cx);
+        assert_eq!(view.staged_insert_count(), 0);
+    });
+}
+
+#[gpui::test]
+fn cmd_c_copies_the_selected_rows_as_tsv(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        view.grid_pointer_down(1, None, gpui::Modifiers::shift(), cx);
+    });
+    cx.simulate_keystrokes("cmd-c");
+
+    cx.update(|_, cx| {
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard");
+        assert_eq!(text, "id	name
+1	row 1
+2	row 2
+");
+    });
+}
+
+/// Copy with nothing selected takes the page rather than nothing: a shortcut
+/// that silently does nothing reads as broken.
+#[gpui::test]
+fn copying_with_no_selection_takes_the_whole_page(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.clear_row_selection(cx);
+        view.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx);
+        assert_eq!(describe(&view.status), "info: Copied 3 rows");
+    });
+}
+
 // -- searching the tree ---------------------------------------------------
 
 #[gpui::test]

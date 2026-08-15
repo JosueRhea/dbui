@@ -17,6 +17,8 @@ pub mod value;
 
 pub use catalog::{Catalog, Column, Schema, Table, TableKind, TableRef};
 pub use connection::{ConnectionConfig, ConnectionId, Driver, TlsMode};
-pub use query::{ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row};
+pub use query::{
+    order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, SortKey,
+};
 pub use sql_split::{split_statements, statement_at};
 pub use value::{Value, ValueKind};

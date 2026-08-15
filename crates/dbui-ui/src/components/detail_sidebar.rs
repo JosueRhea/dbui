@@ -57,7 +57,19 @@ impl DbUi {
                 result,
                 ..
             }) => {
-                if let Some(draft) = draft.as_ref() {
+                // A staged insert takes the sidebar over: it has no stored
+                // row behind it, so the ordinary draft path has nothing to
+                // reconcile against.
+                if let Some(insert) = self
+                    .tabs
+                    .active()
+                    .and_then(|tab| {
+                        tab.editing_insert()
+                            .and_then(|index| tab.pending_inserts().get(index))
+                    })
+                {
+                    render_insert_draft(insert, self.detail_input, theme, cx)
+                } else if let Some(draft) = draft.as_ref() {
                     // The lead row only decides which write tokens are on
                     // offer; the values on screen come from the draft, which
                     // already reconciled every selected row.
@@ -228,6 +240,87 @@ fn render_table_draft(
         ))
         .children(fields)
         .children(message)
+        .into_any_element()
+}
+
+/// The editors for a row that is not on the server yet.
+///
+/// Every field starts reading `DEFAULT`, which is not a value but an absence:
+/// a column left saying it is left out of the INSERT entirely, so the table's
+/// own default, sequence or generated value is what lands.
+fn render_insert_draft(
+    insert: &crate::tabs::PendingRowInsert,
+    detail_input: Option<DetailInput>,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
+    let fields: Vec<AnyElement> = insert
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, (name, input, _))| {
+            div()
+                .id(("insert-field", index))
+                .w_full()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .text_size(metrics::text_size_small())
+                        .child(SharedString::from(name.clone())),
+                )
+                .child(text_field(
+                    ("insert-field-input", index),
+                    input,
+                    InputTarget::InsertField(index),
+                    detail_input == Some(DetailInput::Field(index)),
+                    None,
+                    theme,
+                    cx,
+                ))
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .w_full()
+        .min_w(px(0.))
+        .child(
+            div()
+                .w_full()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .bg(theme.elevated)
+                .border_1()
+                .border_color(theme.success)
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(metrics::text_size_small())
+                        .text_color(theme.success)
+                        .child("New row"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_muted)
+                        .child(
+                            "Nothing is written until you commit. A field left \
+                             reading DEFAULT is left out, so the column's own \
+                             default fires.",
+                        ),
+                ),
+        )
+        .children(fields)
         .into_any_element()
 }
 

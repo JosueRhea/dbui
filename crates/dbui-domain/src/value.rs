@@ -35,6 +35,47 @@ pub enum Value {
 }
 
 impl Value {
+    /// An empty value of whatever variant a column of `declared_type` holds.
+    ///
+    /// Editing a stored row can read the type off the value already in the
+    /// cell. A *new* row has no such value, and sending everything as text is
+    /// what makes Postgres refuse `INSERT INTO t (id) VALUES ($1)` against a
+    /// bigint column. So the engine's own spelling of the type is matched
+    /// instead, coarsely -- the variant only has to be right about which of
+    /// this enum's arms the value belongs in.
+    pub fn prototype_for(declared_type: &str) -> Value {
+        let name = declared_type.to_ascii_lowercase();
+        let has = |needle: &str| name.contains(needle);
+
+        // Order matters: `timestamp` contains neither `int` nor `text`, but
+        // `bigint` contains `int` and `point` must not.
+        if has("bool") {
+            return Value::Bool(false);
+        }
+        if has("json") {
+            return Value::Json(String::new());
+        }
+        if has("uuid") {
+            return Value::Uuid(String::new());
+        }
+        if has("timestamp") || has("date") || has("time") || has("interval") {
+            return Value::Temporal(String::new());
+        }
+        if has("numeric") || has("decimal") || has("money") {
+            return Value::Decimal(String::new());
+        }
+        if has("double") || has("real") || has("float") {
+            return Value::Float(0.0);
+        }
+        if has("serial") || (has("int") && !has("point")) {
+            return Value::Int(0);
+        }
+        if has("bytea") || has("blob") || has("binary") {
+            return Value::Bytes(Vec::new());
+        }
+        Value::Text(String::new())
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -209,5 +250,66 @@ mod tests {
     fn bytes_show_a_preview_and_the_real_length() {
         assert_eq!(Value::Bytes(vec![0xde, 0xad]).to_text(), "0xdead (2 bytes)");
         assert!(Value::Bytes(vec![0; 40]).to_text().contains("(40 bytes)"));
+    }
+}
+
+#[cfg(test)]
+mod prototype_tests {
+    use super::*;
+
+    /// The bug this fixes: a new row had no stored value to take a type from,
+    /// so every column went over as text and Postgres refused the INSERT with
+    /// "column is of type bigint but expression is of type text".
+    #[test]
+    fn integer_columns_are_recognised_in_both_engines_spellings() {
+        for name in ["bigint", "integer", "int4", "INT", "smallint", "BIGINT UNSIGNED"] {
+            assert_eq!(
+                Value::prototype_for(name),
+                Value::Int(0),
+                "{name} should widen to an integer"
+            );
+        }
+    }
+
+    /// `point` contains "int" and is not a number.
+    #[test]
+    fn point_is_not_mistaken_for_an_integer() {
+        assert_eq!(Value::prototype_for("point"), Value::Text(String::new()));
+    }
+
+    #[test]
+    fn the_other_families_land_in_their_own_variants() {
+        assert_eq!(Value::prototype_for("boolean"), Value::Bool(false));
+        assert_eq!(Value::prototype_for("jsonb"), Value::Json(String::new()));
+        assert_eq!(Value::prototype_for("uuid"), Value::Uuid(String::new()));
+        assert_eq!(
+            Value::prototype_for("timestamp with time zone"),
+            Value::Temporal(String::new())
+        );
+        assert_eq!(
+            Value::prototype_for("numeric(10,2)"),
+            Value::Decimal(String::new())
+        );
+        assert_eq!(Value::prototype_for("double precision"), Value::Float(0.0));
+        assert_eq!(Value::prototype_for("bytea"), Value::Bytes(Vec::new()));
+    }
+
+    /// Anything unrecognised is text, which every engine will coerce from.
+    #[test]
+    fn an_unknown_type_falls_back_to_text() {
+        assert_eq!(
+            Value::prototype_for("some_custom_enum"),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            Value::prototype_for("character varying(255)"),
+            Value::Text(String::new())
+        );
+    }
+
+    /// A `serial` is an integer column with a sequence behind it.
+    #[test]
+    fn serial_is_an_integer() {
+        assert_eq!(Value::prototype_for("bigserial"), Value::Int(0));
     }
 }

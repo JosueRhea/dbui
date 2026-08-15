@@ -35,6 +35,8 @@ pub enum InputTarget {
     SidebarFilter,
     /// The name typed to arm a destructive statement.
     ConfirmName,
+    /// One column of the new row being staged.
+    InsertField(usize),
 }
 
 impl DbUi {
@@ -72,6 +74,16 @@ impl DbUi {
             InputTarget::PaletteQuery => self.palette.as_mut().map(|p| &mut p.query),
             InputTarget::SidebarFilter => Some(&mut self.sidebar_filter),
             InputTarget::ConfirmName => self.confirm.as_mut().map(|prompt| &mut prompt.input),
+            InputTarget::InsertField(index) => match self.tabs.active_mut() {
+                Some(crate::tabs::WorkspaceTab::Table {
+                    pending_inserts,
+                    editing_insert: Some(open),
+                    ..
+                }) => pending_inserts
+                    .get_mut(*open)
+                    .and_then(|row| row.fields.get_mut(index).map(|(_, input, _)| input)),
+                _ => None,
+            },
         }
     }
 
@@ -115,6 +127,12 @@ impl DbUi {
             // The prompt is modal: it already owns the keyboard, and moving
             // `focus` would leave the surface underneath looking active.
             InputTarget::ConfirmName => {}
+            InputTarget::InsertField(index) => {
+                self.detail_input = Some(DetailInput::Field(index));
+                self.focus = crate::root::Focus::Detail;
+                self.filter_focus = None;
+                self.page_size_focus = false;
+            }
         }
         cx.notify();
     }
@@ -144,6 +162,7 @@ pub(crate) fn text_field(
         InputTarget::PaletteQuery => "palette-query-scroll".into(),
         InputTarget::SidebarFilter => "sidebar-filter-scroll".into(),
         InputTarget::ConfirmName => "confirm-name-scroll".into(),
+        InputTarget::InsertField(index) => ("insert-field-scroll", index).into(),
         InputTarget::DetailField(index) => ("detail-field-scroll", index).into(),
     };
 

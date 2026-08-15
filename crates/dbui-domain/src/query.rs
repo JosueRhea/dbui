@@ -97,6 +97,65 @@ impl QueryResult {
     }
 }
 
+/// One column of an `ORDER BY`.
+///
+/// Paging is `LIMIT`/`OFFSET`, and neither engine defines a row order without
+/// an `ORDER BY` -- so a table read without one can hand back the same row on
+/// two pages and skip another entirely. Every table read therefore carries an
+/// order, defaulting to the primary key, and the user's chosen sort is put in
+/// front of it rather than replacing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortKey {
+    pub column: String,
+    pub ascending: bool,
+}
+
+impl SortKey {
+    pub fn asc(column: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            ascending: true,
+        }
+    }
+
+    pub fn desc(column: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            ascending: false,
+        }
+    }
+
+    /// Ascending, descending, then unsorted -- what a third click on the same
+    /// header should leave behind.
+    pub fn cycled(current: Option<&SortKey>, column: &str) -> Option<SortKey> {
+        match current {
+            Some(key) if key.column == column && key.ascending => Some(SortKey::desc(column)),
+            Some(key) if key.column == column => None,
+            _ => Some(SortKey::asc(column)),
+        }
+    }
+}
+
+/// The order a table page is read in: the user's sort, then the key.
+///
+/// The key columns stay on the end even when the user picked a sort, because a
+/// sort on a column full of duplicates is not by itself a total order -- and a
+/// page boundary landing inside a run of equal values is exactly where rows go
+/// missing.
+pub fn order_for(sort: Option<&SortKey>, key_columns: &[String]) -> Vec<SortKey> {
+    let mut order = Vec::new();
+    if let Some(sort) = sort {
+        order.push(sort.clone());
+    }
+    for column in key_columns {
+        if order.iter().any(|key| &key.column == column) {
+            continue;
+        }
+        order.push(SortKey::asc(column));
+    }
+    order
+}
+
 /// A window over a table's rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
@@ -228,5 +287,76 @@ mod tests {
             },
         };
         assert_eq!(result.summary(), "1 row affected in 12 ms");
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    /// Clicking the same header walks asc -> desc -> unsorted.
+    #[test]
+    fn a_header_cycles_through_three_states() {
+        let first = SortKey::cycled(None, "name").expect("first click sorts");
+        assert!(first.ascending);
+
+        let second = SortKey::cycled(Some(&first), "name").expect("second reverses");
+        assert!(!second.ascending);
+
+        assert!(
+            SortKey::cycled(Some(&second), "name").is_none(),
+            "a third click clears it"
+        );
+    }
+
+    /// A different header starts its own cycle rather than inheriting the
+    /// direction of the one before it.
+    #[test]
+    fn a_different_header_starts_ascending() {
+        let sorted = SortKey::desc("name");
+        let next = SortKey::cycled(Some(&sorted), "score").expect("sorts the new column");
+        assert_eq!(next.column, "score");
+        assert!(next.ascending);
+    }
+
+    /// The bug this exists to prevent: `LIMIT`/`OFFSET` with no total order
+    /// can repeat a row on one page and drop another. The key always trails
+    /// the sort, so equal values still have a defined order between them.
+    #[test]
+    fn the_key_always_breaks_ties_behind_the_sort() {
+        let key = vec!["id".to_string()];
+
+        let unsorted = order_for(None, &key);
+        assert_eq!(unsorted, vec![SortKey::asc("id")]);
+
+        let sorted = order_for(Some(&SortKey::desc("name")), &key);
+        assert_eq!(sorted, vec![SortKey::desc("name"), SortKey::asc("id")]);
+    }
+
+    /// Sorting *by* the key must not name it twice.
+    #[test]
+    fn sorting_by_the_key_does_not_repeat_it() {
+        let key = vec!["id".to_string()];
+        assert_eq!(
+            order_for(Some(&SortKey::desc("id")), &key),
+            vec![SortKey::desc("id")]
+        );
+    }
+
+    /// A composite key contributes every column, in declaration order.
+    #[test]
+    fn a_composite_key_contributes_all_of_itself() {
+        let key = vec!["tenant".to_string(), "id".to_string()];
+        assert_eq!(
+            order_for(None, &key),
+            vec![SortKey::asc("tenant"), SortKey::asc("id")]
+        );
+    }
+
+    /// Nothing to order by is left unordered rather than guessed at: ordering
+    /// a keyless view by an arbitrary column can be a sort of the whole table.
+    #[test]
+    fn no_key_and_no_sort_is_no_order_at_all() {
+        assert!(order_for(None, &[]).is_empty());
     }
 }

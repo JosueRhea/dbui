@@ -9,7 +9,8 @@ use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, Page, QueryOutcome,
-    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, Table, TableRef, TlsMode, Value,
+    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef,
+    TlsMode, Value,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
@@ -186,8 +187,9 @@ impl DatabaseDriver for PostgresDriver {
         table: &TableRef,
         page: Page,
         where_clause: &str,
+        order: &[SortKey],
     ) -> Result<ResultSet> {
-        let bound = sql_build::select_page_sql(Driver::Postgres, table, where_clause);
+        let bound = sql_build::select_page_sql(Driver::Postgres, table, where_clause, order);
         let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
         for value in &bound.binds {
             query = bind_value(query, value);
@@ -239,6 +241,12 @@ impl DatabaseDriver for PostgresDriver {
         }
 
         let mut statements = Vec::with_capacity(batch.len());
+        for row in &batch.inserts {
+            statements.push(
+                sql_build::insert_sql(Driver::Postgres, table, &row.values)
+                    .map_err(|message| DriverError::message("INSERT", message))?,
+            );
+        }
         for row in &batch.updates {
             statements.push(
                 sql_build::update_sql(Driver::Postgres, table, &row.changes, &row.pk)

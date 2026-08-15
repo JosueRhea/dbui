@@ -9,6 +9,7 @@
 use super::{button, caption};
 use crate::root::{DbUi, Focus, Status};
 use crate::text_input::TextInput;
+use crate::row_export::RowFormat;
 use crate::theme::metrics;
 use dbui_app::commands;
 use dbui_app::domain::{ConnectionId, TableKind, TableRef};
@@ -22,6 +23,8 @@ use gpui::{
 pub enum ContextTarget {
     Table { table: TableRef, kind: TableKind },
     Schema { connection: ConnectionId, name: String },
+    /// A row in the result grid.
+    Rows,
 }
 
 /// One thing a context menu can do.
@@ -38,6 +41,11 @@ pub enum MenuAction {
     ToggleSchema,
     Truncate,
     Drop,
+    CopyRowsTsv,
+    CopyRowsJson,
+    CopyRowsInsert,
+    DeleteRows,
+    AddRow,
 }
 
 impl MenuAction {
@@ -127,6 +135,29 @@ impl ConfirmPrompt {
 
 fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
     match target {
+        ContextTarget::Rows => vec![
+            MenuRow::Item {
+                action: MenuAction::CopyRowsTsv,
+                label: RowFormat::Tsv.label().into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::CopyRowsJson,
+                label: RowFormat::Json.label().into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::CopyRowsInsert,
+                label: RowFormat::Insert.label().into(),
+            },
+            MenuRow::Separator,
+            MenuRow::Item {
+                action: MenuAction::AddRow,
+                label: "New Row".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::DeleteRows,
+                label: "Delete Selected Rows".into(),
+            },
+        ],
         ContextTarget::Schema { .. } => vec![
             MenuRow::Item {
                 action: MenuAction::ToggleSchema,
@@ -310,6 +341,11 @@ impl DbUi {
                 self.copy_to_clipboard(name.clone(), "Schema name copied", cx);
             }
             (_, MenuAction::RefreshCatalog) => self.refresh_catalog(cx),
+            (_, MenuAction::CopyRowsTsv) => self.copy_selected_rows(RowFormat::Tsv, cx),
+            (_, MenuAction::CopyRowsJson) => self.copy_selected_rows(RowFormat::Json, cx),
+            (_, MenuAction::CopyRowsInsert) => self.copy_selected_rows(RowFormat::Insert, cx),
+            (_, MenuAction::AddRow) => self.add_row(cx),
+            (_, MenuAction::DeleteRows) => self.delete_selected_rows(cx),
 
             (ContextTarget::Table { table, .. }, MenuAction::OpenTable) => {
                 let table = table.clone();
@@ -843,6 +879,17 @@ mod tests {
         // ...but a running action cannot be fired twice.
         prompt.running = true;
         assert!(!prompt.armed());
+    }
+
+    /// The grid's menu acts on rows, not on the relation -- offering "Drop
+    /// Table" from a right-click on a row is how the wrong thing gets clicked.
+    #[test]
+    fn the_row_menu_offers_rows_and_nothing_destructive_to_the_table() {
+        let actions = actions_of(&ContextTarget::Rows);
+        assert!(actions.contains(&MenuAction::CopyRowsTsv));
+        assert!(actions.contains(&MenuAction::DeleteRows));
+        assert!(!actions.iter().any(|action| action.is_destructive()));
+        assert!(!actions.contains(&MenuAction::Drop));
     }
 
     #[test]

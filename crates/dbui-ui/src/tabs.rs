@@ -3,7 +3,7 @@
 use crate::json_format;
 use crate::root::ResultView;
 use crate::text_input::TextInput;
-use dbui_app::domain::{Column, ColumnInfo, Page, TableRef, Value};
+use dbui_app::domain::{Column, ColumnInfo, Page, SortKey, TableRef, Value};
 use dbui_app::SavedTab;
 use std::collections::HashSet;
 
@@ -109,6 +109,92 @@ pub fn pk_label(pk: &[(String, Value)]) -> String {
         .map(|(name, value)| format!("{name}={}", display_change_text(value)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A new row staged for insertion.
+///
+/// It keeps live editors rather than finished values because, unlike an edit,
+/// there is no stored row underneath to fall back on: the buffer *is* the row
+/// until it is committed. A field left untouched is written as [`Value::Default`]
+/// -- absent from the statement, so the column's own default or sequence fires.
+pub struct PendingRowInsert {
+    /// `(column name, editor, an empty value of the column's own type)`.
+    ///
+    /// The prototype is what a typed literal is parsed against. An edit can
+    /// read the type off the value already in the cell; a new row has no such
+    /// value, and sending everything as text is what makes Postgres refuse an
+    /// INSERT against a `bigint` column.
+    pub fields: Vec<(String, TextInput, Value)>,
+}
+
+impl PendingRowInsert {
+    /// A blank row shaped like the result set, every field reading `DEFAULT`.
+    pub fn blank(columns: &[ColumnInfo], structure: &[Column]) -> Self {
+        Self {
+            fields: columns
+                .iter()
+                .map(|column| {
+                    let declared = structure
+                        .iter()
+                        .find(|meta| meta.name == column.name)
+                        .map(|meta| meta.data_type.as_str())
+                        // A query result carries the wire type rather than the
+                        // declared one, which is close enough to widen by.
+                        .unwrap_or(column.type_name.as_str());
+                    (
+                        column.name.clone(),
+                        TextInput::with_text(DEFAULT_TOKEN, true),
+                        Value::prototype_for(declared),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The columns to actually write.
+    ///
+    /// Fields still reading `DEFAULT` are dropped rather than sent: naming a
+    /// column at all overrides its default, so an untouched `id` would insert
+    /// a literal DEFAULT where the sequence should have run.
+    pub fn to_values(&self) -> Result<Vec<(String, Value)>, String> {
+        let mut values = Vec::new();
+        for (name, input, prototype) in &self.fields {
+            let text = input.text().trim();
+            if text.eq_ignore_ascii_case(DEFAULT_TOKEN) {
+                continue;
+            }
+            let parsed = parse_draft_value(input.text(), prototype)?;
+            values.push((name.clone(), parsed));
+        }
+        Ok(values)
+    }
+
+    /// How the change bubble names it: the first few filled-in columns.
+    pub fn label(&self) -> String {
+        let filled: Vec<String> = self
+            .fields
+            .iter()
+            .filter(|(_, input, _)| !input.text().trim().eq_ignore_ascii_case(DEFAULT_TOKEN))
+            .take(3)
+            .map(|(name, input, _)| format!("{name}={}", one_line_value(input.text())))
+            .collect();
+        if filled.is_empty() {
+            "all defaults".to_string()
+        } else {
+            filled.join(", ")
+        }
+    }
+}
+
+pub const DEFAULT_TOKEN: &str = "DEFAULT";
+
+fn one_line_value(text: &str) -> String {
+    let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if flat.chars().count() > 24 {
+        format!("{}…", flat.chars().take(24).collect::<String>())
+    } else {
+        flat
+    }
 }
 
 /// Which result rows are selected, and where a range grows from.
@@ -515,6 +601,9 @@ pub enum WorkspaceTab {
         page: Page,
         /// Applied WHERE body (empty = no filter).
         where_clause: String,
+        /// The column the user sorted by, if any. The primary key trails it
+        /// so paging stays stable -- see `dbui_domain::order_for`.
+        sort: Option<SortKey>,
         /// Draft text while the filter strip is open.
         where_draft: TextInput,
         /// Editable page size shown in the bottom bar.
@@ -528,6 +617,10 @@ pub enum WorkspaceTab {
         draft: Option<RowDraft>,
         pending_edits: Vec<PendingRowEdit>,
         pending_deletes: Vec<PendingRowDelete>,
+        /// New rows staged for insertion, drawn under the real ones.
+        pending_inserts: Vec<PendingRowInsert>,
+        /// Which staged insert the detail sidebar is editing, if any.
+        editing_insert: Option<usize>,
         change_bubble_expanded: bool,
         /// True while a transactional save for this tab is in flight.
         saving: bool,
@@ -555,6 +648,7 @@ impl WorkspaceTab {
             table,
             page: Page::first(),
             where_clause: String::new(),
+            sort: None,
             where_draft: TextInput::new(false),
             page_size_draft: TextInput::with_text(Page::DEFAULT_LIMIT.to_string(), false),
             hidden_columns: HashSet::new(),
@@ -564,6 +658,8 @@ impl WorkspaceTab {
             draft: None,
             pending_edits: Vec::new(),
             pending_deletes: Vec::new(),
+            pending_inserts: Vec::new(),
+            editing_insert: None,
             change_bubble_expanded: false,
             saving: false,
             pane: TablePane::Data,
@@ -647,6 +743,26 @@ impl WorkspaceTab {
         }
     }
 
+    /// New rows staged for insertion.
+    pub fn pending_inserts(&self) -> &[PendingRowInsert] {
+        match self {
+            Self::Table {
+                pending_inserts, ..
+            } => pending_inserts,
+            Self::Sql { .. } => &[],
+        }
+    }
+
+    /// Which staged insert the sidebar is editing.
+    pub fn editing_insert(&self) -> Option<usize> {
+        match self {
+            Self::Table {
+                editing_insert, ..
+            } => *editing_insert,
+            Self::Sql { .. } => None,
+        }
+    }
+
     /// Rows staged for deletion. Only a table tab can have any: a query result
     /// has no table to delete from.
     pub fn pending_deletes(&self) -> &[PendingRowDelete] {
@@ -692,6 +808,7 @@ impl WorkspaceTab {
                 table,
                 where_clause,
                 hidden_columns,
+                sort,
                 ..
             } => {
                 // Sorted so an unordered set does not rewrite the file with
@@ -703,6 +820,7 @@ impl WorkspaceTab {
                     name: table.name.clone(),
                     where_clause: where_clause.clone(),
                     hidden_columns: hidden,
+                    sort: sort.clone(),
                 }
             }
             Self::Sql { editor, .. } => SavedTab::Sql {
@@ -718,16 +836,19 @@ impl WorkspaceTab {
                 name,
                 where_clause,
                 hidden_columns,
+                sort,
             } => {
                 let mut tab = Self::table(id, TableRef::new(schema, name));
                 if let Self::Table {
                     where_clause: clause,
                     where_draft,
                     hidden_columns: hidden,
+                    sort: tab_sort,
                     ..
                 } = &mut tab
                 {
                     clause.clone_from(where_clause);
+                    tab_sort.clone_from(sort);
                     // The strip opens showing the filter that is applied, not
                     // an empty box over filtered rows.
                     *where_draft = TextInput::with_text(where_clause.clone(), false);
@@ -1123,6 +1244,7 @@ mod tests {
                     name: "users".into(),
                     where_clause: String::new(),
                     hidden_columns: Vec::new(),
+                    sort: None,
                 },
             ],
             0,

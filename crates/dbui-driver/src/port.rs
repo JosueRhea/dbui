@@ -6,7 +6,9 @@
 
 use crate::error::Result;
 use async_trait::async_trait;
-use dbui_domain::{Catalog, Column, Driver, Page, QueryResult, ResultSet, TableRef, Value};
+use dbui_domain::{
+    Catalog, Column, Driver, Page, QueryResult, ResultSet, SortKey, TableRef, Value,
+};
 
 /// A live connection to one server.
 ///
@@ -32,12 +34,16 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// One page of a table's rows.
     ///
-    /// `where_clause` is freeform SQL after `WHERE` (empty means the whole table).
+    /// `where_clause` is freeform SQL after `WHERE` (empty means the whole
+    /// table). `order` is what makes the page meaningful: `LIMIT`/`OFFSET`
+    /// over an unordered read can return the same row twice and skip another,
+    /// so the caller passes the sort plus the key that breaks its ties.
     async fn table_rows(
         &self,
         table: &TableRef,
         page: Page,
         where_clause: &str,
+        order: &[SortKey],
     ) -> Result<ResultSet>;
 
     /// Total rows matching the same WHERE as [`table_rows`].
@@ -93,9 +99,22 @@ pub struct RowDelete {
     pub pk: Vec<(String, Value)>,
 }
 
+/// One new row for [`DatabaseDriver::apply_changes`].
+///
+/// Columns the user never filled in are left out of `values` entirely rather
+/// than sent as NULL: leaving them out is what lets a `DEFAULT`, a sequence or
+/// a generated column do its job.
+#[derive(Debug, Clone)]
+pub struct RowInsert {
+    pub values: Vec<(String, Value)>,
+}
+
 /// Everything one commit writes.
 #[derive(Debug, Clone, Default)]
 pub struct RowBatch {
+    /// Run first, so a row can be inserted and then referred to by the rest
+    /// of the same batch.
+    pub inserts: Vec<RowInsert>,
     pub updates: Vec<RowUpdate>,
     /// Run after the updates. Staging an edit and a delete on the same row is
     /// the user changing their mind, and in that order the UPDATE is not left
@@ -106,16 +125,17 @@ pub struct RowBatch {
 impl RowBatch {
     pub fn of_updates(updates: Vec<RowUpdate>) -> Self {
         Self {
+            inserts: Vec::new(),
             updates,
             deletes: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.updates.is_empty() && self.deletes.is_empty()
+        self.inserts.is_empty() && self.updates.is_empty() && self.deletes.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.updates.len() + self.deletes.len()
+        self.inserts.len() + self.updates.len() + self.deletes.len()
     }
 }
