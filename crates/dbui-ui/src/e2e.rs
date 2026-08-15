@@ -1850,6 +1850,31 @@ fn editing_a_cell_in_place_stages_the_change(cx: &mut TestAppContext) {
     });
 }
 
+/// A cell the user has edited shows what it will become, not what the server
+/// last said -- otherwise typing into a cell looks like it did nothing.
+#[gpui::test]
+fn a_staged_edit_is_what_the_grid_shows(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("renamed");
+        view.commit_cell_edit(cx);
+
+        let batch = view.collect_batch_edits();
+        let tab = view.tabs.active().expect("tab");
+        let staged = tab
+            .staged_edit_for_row(1, &batch)
+            .expect("row 1 has a staged edit");
+        assert_eq!(staged.changes[0].new_text, "renamed");
+
+        assert!(
+            tab.staged_edit_for_row(0, &batch).is_none(),
+            "and the rows around it are untouched"
+        );
+    });
+}
+
 /// Escape throws the cell edit away without staging anything.
 #[gpui::test]
 fn cancelling_a_cell_edit_stages_nothing(cx: &mut TestAppContext) {

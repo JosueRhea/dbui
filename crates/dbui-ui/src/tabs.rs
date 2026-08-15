@@ -778,6 +778,24 @@ impl WorkspaceTab {
         }
     }
 
+    /// The staged edit covering the row at `index`, if any.
+    ///
+    /// `batch` is the effective batch the caller already computed; matching is
+    /// by primary key, because a row's position can change under it.
+    pub fn staged_edit_for_row<'a>(
+        &self,
+        index: usize,
+        batch: &'a [PendingRowEdit],
+    ) -> Option<&'a PendingRowEdit> {
+        if batch.is_empty() {
+            return None;
+        }
+        let view = self.result()?;
+        let values = view.set.rows.get(index)?;
+        let pk = row_pk(&view.set.columns, &values.0, &view.structure).ok()?;
+        batch.iter().find(|edit| edit.matches_pk(&pk))
+    }
+
     /// Whether the row at `index` is struck through as staged for deletion.
     pub fn row_is_staged_for_delete(&self, index: usize) -> bool {
         let Self::Table {

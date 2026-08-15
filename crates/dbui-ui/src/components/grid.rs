@@ -114,6 +114,10 @@ impl DbUi {
                     })
                     .collect();
                 let lead_row = tab.selected_row();
+                // The whole staged batch, resolved once per repaint rather
+                // than per cell: a cell the user has edited should show what
+                // it will become, not what the server last said.
+                let staged = this.collect_batch_edits();
                 let theme = &this.theme;
                 let total_width: f32 = visible
                     .iter()
@@ -145,6 +149,7 @@ impl DbUi {
                         let row_selected = tab.selection().contains(index)
                             || lead_row == Some(index);
                         let staged_delete = tab.row_is_staged_for_delete(index);
+                        let staged_edit = tab.staged_edit_for_row(index, &staged);
 
                         let cells: Vec<AnyElement> = visible
                             .iter()
@@ -158,13 +163,24 @@ impl DbUi {
                                 let value = row.get(column);
                                 let kind = value.map(|v| v.kind()).unwrap_or(ValueKind::Null);
                                 let is_null = value.map(|v| v.is_null()).unwrap_or(true);
-                                let text: SharedString = if is_null {
-                                    "NULL".into()
-                                } else {
-                                    value
+                                // A staged change wins over the stored value:
+                                // after typing into a cell, seeing the old
+                                // value still there reads as the edit having
+                                // been dropped.
+                                let pending = staged_edit.and_then(|edit| {
+                                    view.set.columns.get(column).and_then(|info| {
+                                        edit.changes
+                                            .iter()
+                                            .find(|change| change.column == info.name)
+                                    })
+                                });
+                                let text: SharedString = match pending {
+                                    Some(change) => one_line_cell(&change.new_text).into(),
+                                    None if is_null => "NULL".into(),
+                                    None => value
                                         .map(|v| v.to_cell(CELL_CHARS))
                                         .unwrap_or_default()
-                                        .into()
+                                        .into(),
                                 };
                                 let is_selected = this.selected_cell == Some((index, column));
                                 let editing = this.editing_cell == Some((index, column));
@@ -207,7 +223,12 @@ impl DbUi {
                                     })
                                     .when(kind.right_aligned(), |cell| cell.justify_end())
                                     .text_color(theme.value_color(kind))
-                                    .when(is_null, |cell| cell.text_color(theme.value_null))
+                                    .when(is_null && pending.is_none(), |cell| {
+                                        cell.text_color(theme.value_null)
+                                    })
+                                    .when(pending.is_some(), |cell| {
+                                        cell.text_color(theme.success)
+                                    })
                                     // A row on its way out is drawn as one:
                                     // struck through, in the colour the change
                                     // bubble uses for a removal.
@@ -443,6 +464,19 @@ fn render_insert_row(
                 .child("+"),
         )
         .children(cells)
+}
+
+/// A staged value flattened to fit one grid row, the way a stored value is.
+fn one_line_cell(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if flat.chars().count() > CELL_CHARS {
+        flat.chars().take(CELL_CHARS).collect()
+    } else {
+        flat
+    }
 }
 
 fn empty_state(theme: &crate::theme::Theme, connected: bool) -> impl IntoElement {
