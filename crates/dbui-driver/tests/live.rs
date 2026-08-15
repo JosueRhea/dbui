@@ -635,9 +635,9 @@ both_engines!(
     }
 );
 
-/// One commit, both kinds of change. This is what ⌘S sends: if the two
-/// travelled in separate transactions, a failing delete would leave the edits
-/// written, which is the state the staged batch exists to prevent.
+// One commit, both kinds of change. This is what ⌘S sends: if the two
+// travelled in separate transactions, a failing delete would leave the edits
+// written, which is the state the staged batch exists to prevent.
 both_engines!(
     a_batch_commits_edits_and_deletions_together,
     |fx: Fixture| async move {
@@ -683,8 +683,8 @@ both_engines!(
     }
 );
 
-/// A delete that the server refuses takes the whole batch with it, including
-/// the edits that had already been applied inside the transaction.
+// A delete that the server refuses takes the whole batch with it, including
+// the edits that had already been applied inside the transaction.
 both_engines!(
     a_failing_delete_rolls_the_edits_back,
     |fx: Fixture| async move {
@@ -748,8 +748,8 @@ both_engines!(
     }
 );
 
-/// A row named by a key that matches nothing is not an error -- it is a row
-/// somebody else already deleted. The count is what says so.
+// A row named by a key that matches nothing is not an error -- it is a row
+// somebody else already deleted. The count is what says so.
 both_engines!(deleting_a_missing_row_affects_nothing, |fx: Fixture| async move {
     use dbui_driver::{RowBatch, RowDelete};
 
@@ -770,7 +770,7 @@ both_engines!(deleting_a_missing_row_affects_nothing, |fx: Fixture| async move {
     assert_eq!(fx.row_count(&table, "").await.expect("count"), 5);
 });
 
-/// The two statements the context menu offers have to be accepted as written.
+// The two statements the context menu offers have to be accepted as written.
 both_engines!(generated_truncate_and_drop_are_accepted, |fx: Fixture| async move {
     use dbui_domain::TableKind;
 
