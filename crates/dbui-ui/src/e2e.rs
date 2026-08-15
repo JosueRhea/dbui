@@ -1307,6 +1307,127 @@ fn deleting_with_no_selection_explains_itself(cx: &mut TestAppContext) {
     });
 }
 
+/// ⌘Z on the grid throws the staged batch away. There is no step-by-step undo
+/// of a batch, and the batch is what the user is looking at.
+#[gpui::test]
+fn cmd_z_discards_the_staged_batch(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-backspace");
+    view.update(cx, |view, _| {
+        assert_eq!(view.collect_batch_deletes().len(), 4);
+    });
+
+    cx.simulate_keystrokes("cmd-z");
+    view.update(cx, |view, _| {
+        assert!(view.collect_batch_deletes().is_empty());
+        assert!(view.collect_batch_edits().is_empty());
+        assert_eq!(describe(&view.status), "info: Discarded 4 changes");
+    });
+}
+
+/// It takes bulk edits with it, not just deletions.
+#[gpui::test]
+fn cmd_z_discards_a_bulk_edit(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, cx| {
+        type_into_draft(view, 1, "renamed");
+        view.clear_row_selection(cx);
+        assert_eq!(view.collect_batch_edits().len(), 3);
+    });
+
+    cx.simulate_keystrokes("cmd-z");
+    view.update(cx, |view, _| {
+        assert!(view.collect_batch_edits().is_empty());
+    });
+}
+
+/// ⌘Z belongs to whichever surface has the keyboard. In the SQL editor it is
+/// still undo, which is why it is not bound as a global action.
+#[gpui::test]
+fn cmd_z_in_the_editor_is_still_text_undo(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        view.focus = Focus::Editor;
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(&typing("select"));
+    view.update(cx, |view, _| assert_eq!(sql_editor_text(view), "select"));
+
+    cx.simulate_keystrokes("cmd-z");
+    view.update(cx, |view, _| {
+        assert_ne!(
+            sql_editor_text(view),
+            "select",
+            "the editor's own undo has to still run"
+        );
+    });
+}
+
+/// Nothing staged: ⌘Z must not claim to have undone something.
+#[gpui::test]
+fn cmd_z_with_nothing_staged_reports_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-z");
+    view.update(cx, |view, _| {
+        assert_eq!(describe(&view.status), "idle");
+    });
+}
+
+/// The batch belongs to the tab, not to the grid: Escape hands the keyboard
+/// back to the tree, and ⌘Z there still has to discard the changes the bubble
+/// is showing.
+#[gpui::test]
+fn cmd_z_discards_from_the_sidebar_too(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-backspace");
+    view.update(cx, |view, cx| {
+        view.focus = Focus::Sidebar;
+        cx.notify();
+    });
+
+    cx.simulate_keystrokes("cmd-z");
+    view.update(cx, |view, _| {
+        assert!(view.collect_batch_deletes().is_empty());
+    });
+}
+
+/// Every surface that owns an undo stack has to keep ⌘Z for it.
+#[gpui::test]
+fn text_surfaces_keep_cmd_z_for_their_own_undo(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, _| {
+        for focus in [
+            Focus::Editor,
+            Focus::Filter,
+            Focus::PageSize,
+            Focus::SidebarSearch,
+        ] {
+            view.focus = focus;
+            assert!(view.text_undo_has_focus(), "{focus:?} types text");
+        }
+
+        // The detail sidebar only owns it while a field is actually focused.
+        view.focus = Focus::Detail;
+        view.detail_input = Some(crate::components::DetailInput::Field(1));
+        assert!(view.text_undo_has_focus());
+        view.detail_input = None;
+        assert!(!view.text_undo_has_focus(), "row chrome is not a text field");
+
+        view.focus = Focus::Grid;
+        assert!(!view.text_undo_has_focus());
+    });
+}
+
 /// Discard is the way out of a staged batch, and it has to take the deletions
 /// with it -- otherwise ⌘S after a Discard still drops rows.
 #[gpui::test]

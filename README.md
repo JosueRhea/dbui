@@ -100,7 +100,8 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
   out, `⌘A` for all of them. `⌘⌫` stages the selection for deletion: the rows
   are struck through and listed in the change bubble beside any pending edits,
   and nothing reaches the server until `⌘S` commits the batch in one
-  transaction. Deleting needs a primary key, and says so when there is none.
+  transaction. `⌘Z` throws the whole batch away. Deleting needs a primary key,
+  and says so when there is none.
 - **Bulk editing** — with several rows selected, the detail sidebar describes
   the whole selection: a column they agree on shows that value, one they
   differ on shows `MIXED`. Type over a field and it is written to every
@@ -126,6 +127,7 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⇧↑` / `⇧↓` | Grow the row selection |
 | `⌘⌫` | Stage the selected rows for deletion |
 | `⌘S` | Commit the staged batch in one transaction |
+| `⌘Z` | Discard the staged batch (undo, inside an editor) |
 | `⌘⇧F` | Search the schema tree |
 | `⌘F` | Filter the rows of the open table |
 | `⌘N` | New connection |

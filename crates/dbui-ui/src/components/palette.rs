@@ -229,7 +229,7 @@ const ACTIONS: &[ActionDef] = &[
     ActionDef {
         id: ActionId::DiscardChanges,
         label: "Discard Changes",
-        shortcut: None,
+        shortcut: Some("⌘Z"),
         section: "Rows",
     },
     // View

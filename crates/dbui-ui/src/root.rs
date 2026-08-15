@@ -1584,6 +1584,21 @@ impl DbUi {
             || (self.focus == Focus::Detail && self.detail_input.is_none())
     }
 
+    /// Whether a text editor currently owns ⌘Z for its own undo stack.
+    ///
+    /// Everywhere else ⌘Z means "discard the staged batch". The batch belongs
+    /// to the tab rather than to any one surface, so it has to work from the
+    /// tree as well as the grid — the change bubble is on screen either way,
+    /// and a shortcut that does nothing while the thing it undoes is visible
+    /// reads as broken.
+    pub(crate) fn text_undo_has_focus(&self) -> bool {
+        match self.focus {
+            Focus::Editor | Focus::Filter | Focus::PageSize | Focus::SidebarSearch => true,
+            Focus::Detail => self.detail_input.is_some(),
+            Focus::Sidebar | Focus::Grid => false,
+        }
+    }
+
     fn result_row_count(&self) -> usize {
         self.tabs
             .active()
@@ -1846,6 +1861,12 @@ impl DbUi {
         batch
     }
 
+    /// Throw away everything staged on the active tab.
+    ///
+    /// This is what ⌘Z means once the grid has the keyboard: there is no
+    /// step-by-step undo of a staged batch, and the batch is the thing the
+    /// user is looking at. Inside a text field ⌘Z still undoes typing —
+    /// see [`grid_owns_keys`](DbUi::grid_owns_keys).
     pub(crate) fn discard_pending_edits(&mut self, cx: &mut Context<Self>) {
         if matches!(
             self.tabs.active(),
@@ -1853,6 +1874,16 @@ impl DbUi {
         ) {
             return;
         }
+
+        // Counted before anything is cleared, and including the open draft:
+        // what is being thrown away is everything ⌘S would have written.
+        let discarded = self.collect_batch_edits().len() + self.collect_batch_deletes().len();
+        if discarded == 0 {
+            // Saying "changes discarded" with nothing staged would be
+            // reporting an undo that never happened.
+            return;
+        }
+
         if let Some(WorkspaceTab::Table {
             draft,
             result,
@@ -1869,7 +1900,9 @@ impl DbUi {
                 draft.reset(view);
             }
         }
-        self.status = Status::info("Changes discarded");
+
+        let plural = if discarded == 1 { "change" } else { "changes" };
+        self.status = Status::info(format!("Discarded {discarded} {plural}"));
         cx.notify();
     }
 
@@ -2420,6 +2453,12 @@ impl DbUi {
                     self.delete_selected_rows(cx);
                     return;
                 }
+                // Unshifted only: ⌘⇧Z is redo, and a staged batch has nothing
+                // to redo — so it falls through rather than discarding twice.
+                "z" if !shift && !self.text_undo_has_focus() => {
+                    self.discard_pending_edits(cx);
+                    return;
+                }
                 "enter" if shift => {
                     self.run_all_queries(cx);
                     return;
@@ -2911,6 +2950,9 @@ impl Render for DbUi {
             }))
             .on_action(cx.listener(|this, _: &crate::DeleteRows, _window, cx| {
                 this.delete_selected_rows(cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::DiscardChanges, _window, cx| {
+                this.discard_pending_edits(cx)
             }))
             .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| this.open_sql_tab(cx)))
             .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| this.refresh_result(cx)))
