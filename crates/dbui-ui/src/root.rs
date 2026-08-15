@@ -3815,11 +3815,48 @@ impl DbUi {
             }
             _ => false,
         };
+        // Picking MIXED from the menu is the user saying "never mind, leave
+        // each row as it was" -- so it drops what was staged for that column
+        // as well as putting the token back. That is not the same as the
+        // MIXED a fresh draft *shows* because the rows disagree, which has no
+        // opinion and must preserve what is staged; the difference is that
+        // this one was asked for.
+        if applied && token == crate::tabs::MIXED {
+            self.unstage_column(index, cx);
+        }
+
         self.detail_value_menu = None;
         if applied {
             self.detail_input = Some(DetailInput::Field(index));
             self.focus = Focus::Detail;
         }
+        cx.notify();
+    }
+
+    /// Drop any staged change to one column across the drafted rows.
+    fn unstage_column(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Table {
+            draft: Some(draft),
+            result: Some(view),
+            pending_edits,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+        let Some((column, _, _)) = draft.fields.get(index) else {
+            return;
+        };
+        let column = column.clone();
+        let keys = draft.row_keys(view);
+
+        for edit in pending_edits.iter_mut() {
+            if keys.iter().any(|pk| edit.matches_pk(pk)) {
+                edit.changes.retain(|change| change.column != column);
+            }
+        }
+        // A row with nothing left to change is no longer a pending edit.
+        pending_edits.retain(|edit| !edit.changes.is_empty());
         cx.notify();
     }
 }

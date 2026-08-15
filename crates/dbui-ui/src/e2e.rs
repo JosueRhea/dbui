@@ -1988,6 +1988,175 @@ fn history_records_statements_and_loads_them_back(cx: &mut TestAppContext) {
     });
 }
 
+// -- gaps found by auditing which commands no test drove ------------------
+
+/// The palette's "Clear Sort" is a different path from clicking the header a
+/// third time, and had no test of its own.
+#[gpui::test]
+fn clearing_the_sort_returns_to_key_order(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.toggle_sort("name", cx);
+        assert!(view.active_sort().is_some());
+
+        if let Some(WorkspaceTab::Table { page, .. }) = view.tabs.active_mut() {
+            page.offset = 500;
+        }
+        view.clear_sort(cx);
+
+        assert!(view.active_sort().is_none());
+        let Some(WorkspaceTab::Table { page, .. }) = view.tabs.active() else {
+            panic!("table tab");
+        };
+        assert_eq!(page.offset, 0, "and the paging restarts");
+    });
+}
+
+/// Clicking a staged row in the grid reopens it for editing rather than
+/// selecting a stored row that is not there.
+#[gpui::test]
+fn clicking_a_staged_row_reopens_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        view.add_row(cx);
+        assert_eq!(view.tabs.active().unwrap().editing_insert(), Some(1));
+
+        view.edit_insert(0, cx);
+        assert_eq!(view.tabs.active().unwrap().editing_insert(), Some(0));
+        assert!(
+            view.tabs.active().unwrap().selection().is_empty(),
+            "a new row is not one of the stored ones"
+        );
+    });
+}
+
+/// Removing a staged row renumbers the one the sidebar is editing, or the
+/// sidebar ends up showing a different row than the one that was open.
+#[gpui::test]
+fn removing_a_staged_row_keeps_the_open_one_open(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.add_row(cx);
+        view.add_row(cx);
+        view.add_row(cx);
+        view.edit_insert(2, cx);
+
+        // Drop the first: the one being edited slides down to index 1.
+        view.remove_insert(0, cx);
+        assert_eq!(view.staged_insert_count(), 2);
+        assert_eq!(view.tabs.active().unwrap().editing_insert(), Some(1));
+
+        // Dropping the open one closes the sidebar on it.
+        view.remove_insert(1, cx);
+        assert_eq!(view.tabs.active().unwrap().editing_insert(), None);
+    });
+}
+
+/// ↓ from the filter box steps into the tree; ↵ opens the first match.
+#[gpui::test]
+fn the_filter_box_hands_off_to_the_tree(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    view.update(cx, |view, cx| {
+        // Nothing is connected, so the tree is empty and both are no-ops
+        // rather than panics -- which is the property worth pinning.
+        view.focus_sidebar_search(cx);
+        view.enter_filtered_tree(cx);
+        assert!(view.sidebar_cursor.is_none());
+
+        let before = view.tabs.items.len();
+        view.open_first_filtered_table(cx);
+        assert_eq!(view.tabs.items.len(), before);
+    });
+}
+
+/// The write tokens, including the MIXED one that only a bulk edit offers.
+#[gpui::test]
+fn the_value_menu_writes_its_token_into_the_field(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, cx| {
+        view.set_detail_special_value(1, "NULL", cx);
+        assert_eq!(draft_texts(view)[1], "NULL");
+
+        // Every selected row is set to NULL, not just the lead one.
+        view.clear_row_selection(cx);
+        let batch = view.collect_batch_edits();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].changes[0].new_value, dbui_app::domain::Value::Null);
+    });
+
+    // And MIXED puts it back to leaving each row alone.
+    cx.simulate_keystrokes("cmd-a");
+    view.update(cx, |view, cx| {
+        view.set_detail_special_value(1, crate::tabs::MIXED, cx);
+        assert_eq!(draft_texts(view)[1], crate::tabs::MIXED);
+        view.clear_row_selection(cx);
+        assert!(view.collect_batch_edits().is_empty());
+    });
+}
+
+/// The two MIXEDs mean different things, and the difference matters: the one
+/// a draft *shows* because rows disagree has no opinion and keeps what is
+/// staged; the one picked from the menu was asked for, and reverts.
+#[gpui::test]
+fn a_shown_mixed_keeps_staged_edits_but_a_chosen_one_reverts(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    // Stage a different name on two rows, so the column reads MIXED on its own.
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        type_into_draft(view, 1, "first");
+        view.grid_pointer_down(1, None, gpui::Modifiers::default(), cx);
+        type_into_draft(view, 1, "second");
+        view.clear_row_selection(cx);
+        assert_eq!(view.collect_batch_edits().len(), 2);
+    });
+
+    // Selecting both shows MIXED -- and that must not drop either edit.
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        view.grid_pointer_down(1, None, gpui::Modifiers::shift(), cx);
+        assert_eq!(draft_texts(view)[1], crate::tabs::MIXED);
+        view.clear_row_selection(cx);
+        assert_eq!(
+            view.collect_batch_edits().len(),
+            2,
+            "merely looking at them changes nothing"
+        );
+    });
+
+    // Choosing MIXED from the menu is the way back out.
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        view.grid_pointer_down(1, None, gpui::Modifiers::shift(), cx);
+        view.set_detail_special_value(1, crate::tabs::MIXED, cx);
+        view.clear_row_selection(cx);
+        assert!(
+            view.collect_batch_edits().is_empty(),
+            "picking it undoes what was staged"
+        );
+    });
+}
+
+/// A primary key is not editable through the value menu either.
+#[gpui::test]
+fn the_value_menu_refuses_a_key_column(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        let before = draft_texts(view)[0].clone();
+        view.set_detail_special_value(0, "NULL", cx);
+        assert_eq!(draft_texts(view)[0], before, "the key is untouched");
+    });
+}
+
 // -- duplicate, copy, paste -----------------------------------------------
 
 /// ⌘D stages a copy of each selected row. The key is left for the table to
