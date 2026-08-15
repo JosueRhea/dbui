@@ -29,11 +29,11 @@ tested.
 
 ### `dbui-driver` — the port and its adapters
 
-One trait, `DatabaseDriver`, and two implementations of it. Everything
+One trait, `DatabaseDriver`, and three implementations of it. Everything
 engine-specific lives here and nowhere else:
 
 - connection options and TLS modes
-- introspection SQL (`pg_catalog` vs `information_schema`)
+- introspection SQL (`pg_catalog` vs `information_schema` vs `sqlite_master`)
 - decoding wire values into `Value`
 - turning a `sqlx::Error` into a sentence worth showing someone
 
@@ -104,7 +104,16 @@ its type name — a result set with one odd column still shows the other forty.
 **Exact numerics stay strings.** `NUMERIC` and `DECIMAL` become
 `Value::Decimal(String)`, never `f64`. Those columns are usually money, and
 rounding them on the way to a screen is a display bug that looks like a data
-bug.
+bug. SQLite is the exception, and not by choice: it has no exact numeric type
+to preserve — see Known limits.
+
+**Every table read is ordered.** `LIMIT`/`OFFSET` over an unordered read is not
+pagination: neither engine promises a row order without an `ORDER BY`, so the
+same row can arrive on two pages while another never arrives at all. The app
+layer therefore reads the columns first and orders by the primary key, putting
+the user's chosen sort in front of it rather than replacing it — a sort on a
+column full of duplicates is not a total order either, and a page boundary
+inside a run of equal values is exactly where rows go missing.
 
 **Identifiers are quoted, never bound.** SQL parameters cannot be identifiers,
 so generated statements have to paste table names in. Every one goes through

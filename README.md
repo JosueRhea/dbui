@@ -1,6 +1,6 @@
 # dbui
 
-A database editor for PostgreSQL and MySQL — TablePlus-shaped, written in Rust,
+A database editor for PostgreSQL, MySQL and SQLite — TablePlus-shaped, written in Rust,
 drawn with [GPUI](https://www.gpui.rs).
 
 This is a **starter**: the architecture is complete and the whole path works
@@ -62,14 +62,19 @@ Then in the app (`⌘N`), add a connection:
 Ports are non-default so they never collide with a Postgres or MySQL already
 running on the machine.
 
+SQLite needs no server: pick it in the connection sheet and give it the path to
+a `.db` file. The file has to exist — a path that is not there is reported as
+the typo it usually is, rather than quietly becoming an empty database.
+
 **Tests**
 
 ```sh
 cargo test
 ```
 
-Unit and UI tests need nothing running. Live driver tests that talk to real
-servers are opt-in:
+Unit, UI and SQLite tests need nothing running — the SQLite engine is linked
+in, so `crates/dbui-driver/tests/sqlite.rs` exercises a real database file on
+every run. The Postgres and MySQL tests need actual servers and are opt-in:
 
 ```sh
 docker compose up -d
@@ -168,7 +173,7 @@ crates/
   dbui/          the binary; calls dbui_ui::run()
   dbui-ui/       GPUI: window, layout, input
   dbui-app/      use cases, workspace state, the tokio bridge
-  dbui-driver/   the DatabaseDriver port + Postgres and MySQL adapters
+  dbui-driver/   the DatabaseDriver port + Postgres, MySQL and SQLite adapters
   dbui-domain/   the model everything else speaks in
 ```
 
