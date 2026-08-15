@@ -231,6 +231,17 @@ pub struct DbUi {
     /// a drag is in progress; the value is what stops a pointer wandering
     /// inside one row from rebuilding the range on every mouse-move.
     pub(crate) row_drag: Option<usize>,
+    /// The cell being edited in place, and the editor holding it.
+    ///
+    /// A single-line buffer of its own rather than the detail sidebar's field:
+    /// that one is multiline so JSON stays editable, and a multiline box does
+    /// not fit in a grid row. Committing writes back into the draft, so the
+    /// change is staged by exactly the same path as a sidebar edit.
+    pub(crate) editing_cell: Option<(usize, usize)>,
+    pub(crate) cell_editor: crate::text_input::TextInput,
+    /// Live column resize: `(column index, pointer x, width)` as they were
+    /// when the header edge was grabbed.
+    pub(crate) column_drag: Option<(usize, Pixels, f32)>,
     /// Right-click menu, if one is open.
     pub(crate) context_menu: Option<ContextMenu>,
     /// A destructive action waiting on the user typing the table's name.
@@ -313,6 +324,9 @@ impl DbUi {
             column_cache: HashMap::new(),
             sidebar_filter: crate::text_input::TextInput::new(false),
             row_drag: None,
+            editing_cell: None,
+            cell_editor: crate::text_input::TextInput::new(false),
+            column_drag: None,
             context_menu: None,
             confirm: None,
         }
@@ -1004,6 +1018,7 @@ impl DbUi {
                                     contents.columns,
                                 ));
                             }
+                            this.apply_column_widths(tab_id);
                             if is_active {
                                 this.status = Status::Idle;
                                 this.focus = Focus::Grid;
@@ -1636,6 +1651,30 @@ impl DbUi {
             || (self.focus == Focus::Detail && self.detail_input.is_none())
     }
 
+    /// Whether the active connection refuses writes.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.workspace
+            .active()
+            .map(|entry| entry.config.read_only)
+            .unwrap_or(false)
+    }
+
+    /// Refuse a write and say why. Returns true when the caller should stop.
+    ///
+    /// Checked at each place that would actually write rather than only where
+    /// changes are staged: staging is harmless, and refusing it would make a
+    /// read-only connection feel broken rather than protected.
+    pub(crate) fn refuse_if_read_only(&mut self, what: &str, cx: &mut Context<Self>) -> bool {
+        if !self.is_read_only() {
+            return false;
+        }
+        self.status = Status::error(format!(
+            "{what} refused — this connection is marked read only"
+        ));
+        cx.notify();
+        true
+    }
+
     /// Whether a text editor currently owns ⌘Z for its own undo stack.
     ///
     /// Everywhere else ⌘Z means "discard the staged batch". The batch belongs
@@ -1868,6 +1907,202 @@ impl DbUi {
             *change_bubble_expanded = true;
         }
         Ok(staged)
+    }
+
+    // -- editing a cell in place --------------------------------------------
+
+    /// Start editing one cell in the grid.
+    ///
+    /// Refused for a primary key (the row's identity is not editable) and for
+    /// a value with newlines in it, which a one-line box would silently
+    /// flatten -- those go to the sidebar, which has room for them.
+    pub(crate) fn begin_cell_edit(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        if !matches!(self.tabs.active(), Some(WorkspaceTab::Table { .. })) {
+            self.status = Status::info("Only a table's rows can be edited");
+            cx.notify();
+            return;
+        }
+
+        // Selecting builds the draft this edit will be written into.
+        self.select_row(row, cx);
+
+        let field = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            }) => draft.fields.get(column).map(|(name, input, is_pk)| {
+                (name.clone(), input.text().to_string(), *is_pk)
+            }),
+            _ => None,
+        };
+        let Some((name, text, is_pk)) = field else {
+            return;
+        };
+
+        if is_pk {
+            self.status = Status::info(format!("{name} is part of the primary key"));
+            cx.notify();
+            return;
+        }
+        if text.contains('\n') {
+            self.detail_input = Some(DetailInput::Field(column));
+            self.focus = Focus::Detail;
+            self.status = Status::info(format!("{name} is multi-line — edit it in the sidebar"));
+            cx.notify();
+            return;
+        }
+
+        self.cell_editor = crate::text_input::TextInput::with_text(text, false);
+        self.cell_editor.select_all();
+        self.editing_cell = Some((row, column));
+        self.selected_cell = Some((row, column));
+        self.detail_input = None;
+        self.focus = Focus::Grid;
+        cx.notify();
+    }
+
+    /// Write what was typed back into the draft, which stages it.
+    pub(crate) fn commit_cell_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((_, column)) = self.editing_cell.take() else {
+            return;
+        };
+        let typed = self.cell_editor.text().to_string();
+        if let Some(WorkspaceTab::Table {
+            draft: Some(draft), ..
+        }) = self.tabs.active_mut()
+        {
+            if let Some((_, input, _)) = draft.fields.get_mut(column) {
+                let multiline = input.is_multiline();
+                *input = crate::text_input::TextInput::with_text(typed, multiline);
+            }
+        }
+        self.focus = Focus::Grid;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_cell_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing_cell.take().is_some() {
+            self.focus = Focus::Grid;
+            cx.notify();
+        }
+    }
+
+    /// Commit and step to the next editable column on the same row.
+    pub(crate) fn commit_cell_and_advance(&mut self, backward: bool, cx: &mut Context<Self>) {
+        let Some((row, column)) = self.editing_cell else {
+            return;
+        };
+        self.commit_cell_edit(cx);
+
+        let count = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            }) => draft.fields.len(),
+            _ => return,
+        };
+        if count == 0 {
+            return;
+        }
+        let mut next = column;
+        for _ in 0..count {
+            next = if backward {
+                (next + count - 1) % count
+            } else {
+                (next + 1) % count
+            };
+            let editable = match self.tabs.active() {
+                Some(WorkspaceTab::Table {
+                    draft: Some(draft), ..
+                }) => draft
+                    .fields
+                    .get(next)
+                    .is_some_and(|(_, input, is_pk)| !is_pk && !input.text().contains('\n')),
+                _ => false,
+            };
+            if editable {
+                self.begin_cell_edit(row, next, cx);
+                return;
+            }
+        }
+    }
+
+    // -- column widths ------------------------------------------------------
+
+    pub(crate) fn begin_column_drag(&mut self, column: usize, x: Pixels, cx: &mut Context<Self>) {
+        let width = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|view| view.widths.get(column).copied())
+            .unwrap_or(metrics::column_min_width());
+        self.column_drag = Some((column, x, width));
+        cx.notify();
+    }
+
+    pub(crate) fn drag_column(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some((column, start_x, start_width)) = self.column_drag else {
+            return;
+        };
+        let next = (start_width + f32::from(x - start_x))
+            .clamp(metrics::column_min_width(), metrics::column_max_width());
+
+        let Some(WorkspaceTab::Table {
+            result: Some(view),
+            column_widths,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            // A query result has no tab-level store, so its widths last only
+            // as long as the result does.
+            if let Some(view) = self.tabs.active_mut().and_then(|tab| match tab {
+                WorkspaceTab::Sql { result, .. } => result.as_mut(),
+                WorkspaceTab::Table { result, .. } => result.as_mut(),
+            }) {
+                if let Some(width) = view.widths.get_mut(column) {
+                    *width = next;
+                }
+            }
+            cx.notify();
+            return;
+        };
+
+        if let Some(width) = view.widths.get_mut(column) {
+            *width = next;
+        }
+        // Remembered by name so the next page keeps the width.
+        if let Some(info) = view.set.columns.get(column) {
+            column_widths.insert(info.name.clone(), next);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn end_column_drag(&mut self, cx: &mut Context<Self>) {
+        if self.column_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reapply_column_widths_for_test(&mut self, tab_id: crate::tabs::TabId) {
+        self.apply_column_widths(tab_id);
+    }
+
+    /// Put the dragged widths back onto a freshly loaded result.
+    fn apply_column_widths(&mut self, tab_id: crate::tabs::TabId) {
+        let Some(WorkspaceTab::Table {
+            result: Some(view),
+            column_widths,
+            ..
+        }) = self.tabs.get_mut(tab_id)
+        else {
+            return;
+        };
+        for (index, info) in view.set.columns.iter().enumerate() {
+            if let Some(width) = column_widths.get(&info.name) {
+                if let Some(slot) = view.widths.get_mut(index) {
+                    *slot = *width;
+                }
+            }
+        }
     }
 
     // -- staged inserts -----------------------------------------------------
@@ -2161,6 +2396,9 @@ impl DbUi {
     /// other rolls back, which is exactly the state a batch editor exists to
     /// prevent.
     pub(crate) fn save_pending_edits(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_if_read_only("Commit", cx) {
+            return;
+        }
         if matches!(
             self.tabs.active(),
             Some(WorkspaceTab::Table { saving: true, .. })
@@ -2788,6 +3026,32 @@ impl DbUi {
             }
         }
 
+        // A cell editor owns the keyboard while it is open: it is a text box
+        // sitting on top of the grid, and the grid's own shortcuts would fire
+        // through it otherwise.
+        if self.editing_cell.is_some() {
+            match key {
+                "escape" => {
+                    self.cancel_cell_edit(cx);
+                    return;
+                }
+                "enter" if !command => {
+                    self.commit_cell_edit(cx);
+                    return;
+                }
+                "tab" if !command => {
+                    self.commit_cell_and_advance(shift, cx);
+                    return;
+                }
+                _ => {
+                    if self.cell_editor.handle_key(keystroke, cx) {
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.focus == Focus::Detail {
             if key == "tab" && !command {
                 self.cycle_detail_focus(shift, cx);
@@ -3031,6 +3295,12 @@ impl DbUi {
         }
 
         if self.focus == Focus::Grid && !command {
+            if key == "enter" {
+                if let Some((row, column)) = self.selected_cell {
+                    self.begin_cell_edit(row, column, cx);
+                    return;
+                }
+            }
             match key {
                 // Shift grows the range from the anchor; a bare arrow moves
                 // the one selected row, which is also what collapses a range.
@@ -3186,7 +3456,8 @@ impl Render for DbUi {
             .when(
                 self.change_bubble_drag.is_some()
                     || self.editor_drag.is_some()
-                    || self.row_drag.is_some(),
+                    || self.row_drag.is_some()
+                    || self.column_drag.is_some(),
                 |root| {
                     root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         if this.change_bubble_drag.is_some() {
@@ -3195,6 +3466,9 @@ impl Render for DbUi {
                         if this.editor_drag.is_some() {
                             this.drag_editor(event.position.y, window, cx);
                         }
+                        if this.column_drag.is_some() {
+                            this.drag_column(event.position.x, cx);
+                        }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
@@ -3202,6 +3476,7 @@ impl Render for DbUi {
                             this.end_change_bubble_drag(cx);
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
+                            this.end_column_drag(cx);
                         }),
                     )
                     // Releasing outside the window has to end the drag too, or
@@ -3213,6 +3488,7 @@ impl Render for DbUi {
                             this.end_change_bubble_drag(cx);
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
+                            this.end_column_drag(cx);
                         }),
                     )
                 },

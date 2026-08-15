@@ -37,6 +37,8 @@ pub enum InputTarget {
     ConfirmName,
     /// One column of the new row being staged.
     InsertField(usize),
+    /// The one-line editor open over a grid cell.
+    CellEditor,
 }
 
 impl DbUi {
@@ -74,6 +76,7 @@ impl DbUi {
             InputTarget::PaletteQuery => self.palette.as_mut().map(|p| &mut p.query),
             InputTarget::SidebarFilter => Some(&mut self.sidebar_filter),
             InputTarget::ConfirmName => self.confirm.as_mut().map(|prompt| &mut prompt.input),
+            InputTarget::CellEditor => Some(&mut self.cell_editor),
             InputTarget::InsertField(index) => match self.tabs.active_mut() {
                 Some(crate::tabs::WorkspaceTab::Table {
                     pending_inserts,
@@ -127,6 +130,12 @@ impl DbUi {
             // The prompt is modal: it already owns the keyboard, and moving
             // `focus` would leave the surface underneath looking active.
             InputTarget::ConfirmName => {}
+            InputTarget::CellEditor => {
+                self.focus = crate::root::Focus::Grid;
+                self.detail_input = None;
+                self.filter_focus = None;
+                self.page_size_focus = false;
+            }
             InputTarget::InsertField(index) => {
                 self.detail_input = Some(DetailInput::Field(index));
                 self.focus = crate::root::Focus::Detail;
@@ -163,6 +172,7 @@ pub(crate) fn text_field(
         InputTarget::SidebarFilter => "sidebar-filter-scroll".into(),
         InputTarget::ConfirmName => "confirm-name-scroll".into(),
         InputTarget::InsertField(index) => ("insert-field-scroll", index).into(),
+        InputTarget::CellEditor => "cell-editor-scroll".into(),
         InputTarget::DetailField(index) => ("detail-field-scroll", index).into(),
     };
 

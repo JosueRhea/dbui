@@ -52,6 +52,21 @@ impl DbUi {
             .text_color(theme.text_muted)
             .text_size(metrics::text_size_small())
             .child(tabs)
+            // A read-only connection says so where the user is already
+            // looking to tell which server they are on.
+            .children(self.is_read_only().then(|| {
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(4.))
+                    .bg(theme.elevated)
+                    .border_1()
+                    .border_color(theme.warning)
+                    .text_color(theme.warning)
+                    .text_size(px(10.))
+                    .child("READ ONLY")
+            }))
             .child(
                 // The `+` is the only way to reach a connection that is not
                 // already a tab, so it stays put rather than scrolling away

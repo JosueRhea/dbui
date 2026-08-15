@@ -609,6 +609,9 @@ pub enum WorkspaceTab {
         /// Editable page size shown in the bottom bar.
         page_size_draft: TextInput,
         hidden_columns: HashSet<String>,
+        /// Widths the user dragged, by column name. Kept by name rather than
+        /// by index so they survive a reload that adds or drops a column.
+        column_widths: std::collections::HashMap<String, f32>,
         result: Option<ResultView>,
         selected_row: Option<usize>,
         /// Every selected row. `selected_row` is the one whose detail is open;
@@ -652,6 +655,7 @@ impl WorkspaceTab {
             where_draft: TextInput::new(false),
             page_size_draft: TextInput::with_text(Page::DEFAULT_LIMIT.to_string(), false),
             hidden_columns: HashSet::new(),
+            column_widths: std::collections::HashMap::new(),
             result: None,
             selected_row: None,
             selection: RowSelection::default(),

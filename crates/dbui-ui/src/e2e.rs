@@ -1825,6 +1825,126 @@ fn copying_with_no_selection_takes_the_whole_page(cx: &mut TestAppContext) {
     });
 }
 
+// -- editing in the grid, resizing, read-only -----------------------------
+
+/// Enter on a selected cell opens it in place, and what is typed there is
+/// staged by the same path a sidebar edit takes.
+#[gpui::test]
+fn editing_a_cell_in_place_stages_the_change(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, Some(1), gpui::Modifiers::default(), cx);
+        view.begin_cell_edit(1, 1, cx);
+        assert_eq!(view.editing_cell, Some((1, 1)));
+        assert_eq!(view.cell_editor.text(), "row 2", "seeded from the cell");
+
+        view.cell_editor.set_text("renamed");
+        view.commit_cell_edit(cx);
+        assert!(view.editing_cell.is_none());
+
+        let batch = view.collect_batch_edits();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].changes[0].column, "name");
+        assert_eq!(batch[0].changes[0].new_text, "renamed");
+    });
+}
+
+/// Escape throws the cell edit away without staging anything.
+#[gpui::test]
+fn cancelling_a_cell_edit_stages_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("discarded");
+        view.cancel_cell_edit(cx);
+        assert!(view.collect_batch_edits().is_empty());
+    });
+}
+
+/// The primary key is the row's identity; editing it in place would be
+/// rewriting which row is being talked about.
+#[gpui::test]
+fn a_key_cell_cannot_be_edited_in_place(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 0, cx);
+        assert!(view.editing_cell.is_none());
+        assert!(
+            describe(&view.status).contains("primary key"),
+            "got: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// Tab commits and steps to the next editable column, skipping the key.
+#[gpui::test]
+fn tab_moves_to_the_next_editable_cell(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("first");
+        view.commit_cell_and_advance(false, cx);
+
+        // `id` is the key and `name` is where we started, so it wraps back.
+        assert_eq!(view.editing_cell, Some((0, 1)));
+        assert_eq!(view.collect_batch_edits()[0].changes[0].new_text, "first");
+    });
+}
+
+/// A dragged width outlives the reload that paging or sorting causes.
+#[gpui::test]
+fn a_dragged_column_width_survives_a_reload(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.begin_column_drag(1, gpui::px(100.), cx);
+        view.drag_column(gpui::px(180.), cx);
+        view.end_column_drag(cx);
+
+        let widened = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|v| v.widths.get(1).copied())
+            .expect("a width");
+
+        // Rebuild the result the way a reload does, then re-apply.
+        let id = view.tabs.active_id().expect("tab id");
+        view.reapply_column_widths_for_test(id);
+        let after = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|v| v.widths.get(1).copied())
+            .expect("a width");
+        assert_eq!(after, widened, "the drag is remembered by column name");
+    });
+}
+
+/// A read-only connection refuses to commit, and says why.
+#[gpui::test]
+fn a_read_only_connection_refuses_to_commit(cx: &mut TestAppContext) {
+    let mut config = ConnectionConfig::new(Driver::Postgres);
+    config.name = "Prod".into();
+    config.read_only = true;
+    let (view, cx) = open_with(cx, Workspace::from_configs(vec![config]));
+
+    view.update(cx, |view, cx| {
+        assert!(view.is_read_only());
+        view.save_pending_edits(cx);
+        assert!(
+            describe(&view.status).contains("read only"),
+            "got: {}",
+            describe(&view.status)
+        );
+    });
+}
+
 // -- searching the tree ---------------------------------------------------
 
 #[gpui::test]

@@ -325,6 +325,9 @@ impl DbUi {
 
         // A destructive pick opens the confirmation instead of running.
         if action.is_destructive() {
+            if self.refuse_if_read_only("That", cx) {
+                return;
+            }
             if let ContextTarget::Table { table, kind } = target {
                 self.confirm = Some(ConfirmPrompt::new(action, table, kind));
                 cx.notify();
@@ -488,6 +491,12 @@ impl DbUi {
     }
 
     pub(crate) fn run_confirmed_action(&mut self, cx: &mut Context<Self>) {
+        // Re-checked here as well as at the menu: the flag can be turned on
+        // while a confirmation is open.
+        if self.refuse_if_read_only("That", cx) {
+            self.confirm = None;
+            return;
+        }
         let Some(prompt) = self.confirm.as_ref() else {
             return;
         };

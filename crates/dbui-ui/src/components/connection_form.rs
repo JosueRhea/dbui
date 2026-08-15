@@ -154,6 +154,7 @@ impl ConnectionForm {
         config.username = self.text(Field::Username).trim().to_string();
         config.password = self.text(Field::Password).to_string();
         config.database = self.text(Field::Database).trim().to_string();
+        config.read_only = self.config.read_only;
         config
     }
 
@@ -163,6 +164,14 @@ impl ConnectionForm {
 
     pub fn tls(&self) -> TlsMode {
         self.config.tls
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.config.read_only
+    }
+
+    pub fn toggle_read_only(&mut self) {
+        self.config.read_only = !self.config.read_only;
     }
 
     pub fn is_editing(&self) -> bool {
@@ -484,6 +493,58 @@ impl DbUi {
                     })),
             );
 
+        let read_only = form.read_only();
+        let read_only_choice = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(72.))
+                    .flex_shrink_0()
+                    .text_color(theme.text_muted)
+                    .child("Access"),
+            )
+            .child(
+                div()
+                    .id("read-only-toggle")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .h(px(26.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if read_only { theme.elevated } else { theme.background })
+                    .border_1()
+                    .border_color(if read_only { theme.warning } else { theme.border })
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        if let Some(form) = this.modal.as_mut() {
+                            form.toggle_read_only();
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .h(px(12.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(if read_only {
+                                theme.warning
+                            } else {
+                                gpui::rgba(0x00000000)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(if read_only { theme.text } else { theme.text_faint })
+                            .child("Read only — refuse every write"),
+                    ),
+            );
+
         let message = form.message.as_ref().map(|(ok, text)| {
             div()
                 .text_size(px(11.))
@@ -529,6 +590,7 @@ impl DbUi {
                     .child(driver_choice)
                     .children(rows)
                     .child(tls_choice)
+                    .child(read_only_choice)
                     .child(caption(
                         "Passwords are kept for this session only and are never written to disk.",
                         theme,

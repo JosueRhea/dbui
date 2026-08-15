@@ -167,6 +167,29 @@ impl DbUi {
                                         .into()
                                 };
                                 let is_selected = this.selected_cell == Some((index, column));
+                                let editing = this.editing_cell == Some((index, column));
+
+                                if editing {
+                                    return div()
+                                        .id(("cell", index * 1_000 + column))
+                                        .w(px(width))
+                                        .flex_shrink_0()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .border_r_1()
+                                        .border_color(theme.accent)
+                                        .child(super::text_field::text_field(
+                                            "cell-editor",
+                                            &this.cell_editor,
+                                            super::text_field::InputTarget::CellEditor,
+                                            true,
+                                            None,
+                                            theme,
+                                            cx,
+                                        ))
+                                        .into_any_element();
+                                }
 
                                 div()
                                     .id(("cell", index * 1_000 + column))
@@ -196,6 +219,12 @@ impl DbUi {
                                         MouseButton::Left,
                                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                             cx.stop_propagation();
+                                            // A second click on the same cell
+                                            // opens it, the way a grid does.
+                                            if event.click_count >= 2 {
+                                                this.begin_cell_edit(index, column, cx);
+                                                return;
+                                            }
                                             this.grid_pointer_down(
                                                 index,
                                                 Some(column),
@@ -460,6 +489,7 @@ fn render_header(
 
             div()
                 .id(("header", *index))
+                .relative()
                 .w(px(width))
                 .flex_shrink_0()
                 .h_full()
@@ -497,6 +527,32 @@ fn render_header(
                         .text_color(theme.accent)
                         .child(if key.ascending { "↑" } else { "↓" })
                 }))
+                // The grab strip for resizing, on the column's right edge.
+                // `absolute` so it sits over the border rather than taking
+                // width from the header it belongs to.
+                .child(
+                    div()
+                        .id(("column-resize", *index))
+                        .absolute()
+                        .top_0()
+                        .right(px(-2.))
+                        .w(px(5.))
+                        .h_full()
+                        .cursor_col_resize()
+                        .hover(|strip| strip.bg(theme.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let column = *index;
+                                move |this, event: &MouseDownEvent, _, cx| {
+                                    // Or the press would sort the column the
+                                    // user is trying to widen.
+                                    cx.stop_propagation();
+                                    this.begin_column_drag(column, event.position.x, cx);
+                                }
+                            }),
+                        ),
+                )
                 .into_any_element()
         })
         .collect();

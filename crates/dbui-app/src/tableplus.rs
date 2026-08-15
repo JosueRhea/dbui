@@ -185,6 +185,10 @@ pub fn import_from_plist(
             password,
             database,
             tls,
+            // An import brings whole servers over at once, production ones
+            // among them. They arrive writable, the same as a hand-typed
+            // connection -- the flag is the user's to set, not ours to guess.
+            read_only: false,
         });
     }
 

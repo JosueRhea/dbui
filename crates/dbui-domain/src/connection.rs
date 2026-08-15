@@ -146,6 +146,14 @@ pub struct ConnectionConfig {
     pub database: String,
     #[serde(default)]
     pub tls: TlsMode,
+    /// Refuse every write through this connection.
+    ///
+    /// The app can `DROP`, `TRUNCATE` and commit batch deletes, and the
+    /// TablePlus import brings connections over wholesale -- production ones
+    /// included. This is the switch that makes a server safe to browse.
+    /// `default` so a connections file written before it existed still loads.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl ConnectionConfig {
@@ -164,6 +172,7 @@ impl ConnectionConfig {
             password: String::new(),
             database: driver.default_database().into(),
             tls: TlsMode::default(),
+            read_only: false,
         }
     }
 
