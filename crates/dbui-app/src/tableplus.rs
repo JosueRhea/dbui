@@ -207,8 +207,11 @@ fn map_tls(mode: Option<i64>) -> TlsMode {
     // TablePlus: 0 prefer/auto, 1 require-ish in practice varies by build.
     // Prefer matches our default and works for PlanetScale-style hosts that
     // still list tlsMode 0 in the plist.
+    // TablePlus' strictest mode still accepts the certificate it is handed, so
+    // an import maps it to `Encrypt` rather than `Require`: claiming a verified
+    // connection the other app never made would be the wrong kind of upgrade.
     match mode.unwrap_or(0) {
-        2 => TlsMode::Require,
+        2 => TlsMode::Encrypt,
         1 => TlsMode::Prefer,
         _ => TlsMode::Prefer,
     }
@@ -379,7 +382,7 @@ mod tests {
         assert_eq!(mysql.name, "shop");
         assert_eq!(mysql.driver, Driver::MySql);
         assert_eq!(mysql.port, 3307);
-        assert_eq!(mysql.tls, TlsMode::Require);
+        assert_eq!(mysql.tls, TlsMode::Encrypt);
 
         let _ = std::fs::remove_dir_all(dir);
     }

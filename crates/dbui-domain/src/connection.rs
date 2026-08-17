@@ -83,24 +83,49 @@ impl fmt::Display for Driver {
 }
 
 /// How hard to insist on TLS.
+///
+/// Encryption and identity are two separate questions, and only
+/// [`Require`](TlsMode::Require) answers both: it checks the certificate chain
+/// and that the name on it is the host that was dialed. The modes below it
+/// encrypt at best, which stops a passive listener but not a machine in the
+/// middle presenting a certificate of its own -- so a password sent over one
+/// of them can still be collected by whatever answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsMode {
     Disable,
     #[default]
     Prefer,
+    /// Insist on TLS, but accept whatever certificate the server offers.
+    ///
+    /// What a self-signed or private-CA server needs until its CA is trusted
+    /// by the machine. Encrypted, not authenticated.
+    Encrypt,
+    /// Insist on TLS and verify the certificate chain and the hostname.
     Require,
 }
 
 impl TlsMode {
-    pub const ALL: [TlsMode; 3] = [TlsMode::Disable, TlsMode::Prefer, TlsMode::Require];
+    pub const ALL: [TlsMode; 4] = [
+        TlsMode::Disable,
+        TlsMode::Prefer,
+        TlsMode::Encrypt,
+        TlsMode::Require,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             TlsMode::Disable => "Disabled",
             TlsMode::Prefer => "Preferred",
-            TlsMode::Require => "Required",
+            TlsMode::Encrypt => "Encrypted",
+            TlsMode::Require => "Verified",
         }
+    }
+
+    /// Whether this mode authenticates the server rather than only encrypting
+    /// the wire.
+    pub fn verifies_certificate(self) -> bool {
+        matches!(self, TlsMode::Require)
     }
 }
 
@@ -278,6 +303,16 @@ mod tests {
     fn observing_a_loaded_id_keeps_next_above_it() {
         ConnectionId::observe(ConnectionId(1_000));
         assert!(ConnectionId::next().0 > 1_000);
+    }
+
+    /// Only one mode authenticates the server. The others encrypt at best,
+    /// and a mode that claimed otherwise would be the dangerous kind of label.
+    #[test]
+    fn only_the_verified_mode_checks_the_certificate() {
+        assert!(TlsMode::Require.verifies_certificate());
+        for mode in [TlsMode::Disable, TlsMode::Prefer, TlsMode::Encrypt] {
+            assert!(!mode.verifies_certificate(), "{mode:?}");
+        }
     }
 
     #[test]
