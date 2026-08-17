@@ -300,6 +300,146 @@ mod tests {
         assert_eq!(load_password(id).unwrap(), "");
     }
 
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("dbui-store-test-{}-{name}", std::process::id()));
+        path
+    }
+
+    /// The point of the atomic write: a reader sees one whole version or the
+    /// other. The rename also has to leave no temp file behind, or the config
+    /// directory fills up with them.
+    #[test]
+    fn an_atomic_write_replaces_a_file_whole_and_leaves_no_temp_behind() {
+        let dir = temp_dir("atomic").join("nested");
+        let path = dir.join("session.json");
+
+        write_atomic(&path, "{\"first\":true}").expect("the parent is created");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"first\":true}");
+
+        write_atomic(&path, "{}").expect("an existing file is replaced");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "found {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(temp_dir("atomic"));
+    }
+
+    /// A path that cannot be written is reported with the path in it -- the
+    /// message reaches a status bar, where "permission denied" alone says
+    /// nothing.
+    #[test]
+    fn a_write_that_cannot_happen_names_the_path() {
+        let dir = temp_dir("write-clash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let occupied = dir.join("session.json");
+        std::fs::create_dir(&occupied).unwrap();
+
+        let error = write_atomic(&occupied, "{}").expect_err("a directory is in the way");
+        assert!(matches!(error, StoreError::Write { .. }));
+        assert!(error.to_string().contains("session.json"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The override is what keeps a second profile -- and the UI tests, which
+    /// persist a session as they click around -- out of the real configuration
+    /// directory.
+    #[test]
+    fn the_environment_can_move_the_configuration_directory() {
+        let original = std::env::var_os(CONFIG_DIR_VAR);
+
+        std::env::set_var(CONFIG_DIR_VAR, "/tmp/dbui-elsewhere");
+        assert_eq!(config_dir().unwrap(), PathBuf::from("/tmp/dbui-elsewhere"));
+        assert_eq!(
+            connections_path().unwrap(),
+            PathBuf::from("/tmp/dbui-elsewhere/connections.json")
+        );
+        assert_eq!(
+            prefs_path().unwrap(),
+            PathBuf::from("/tmp/dbui-elsewhere/prefs.json")
+        );
+
+        // An empty override is ignored rather than treated as the root: it is
+        // what an unset variable looks like to a shell that exported it anyway.
+        std::env::set_var(CONFIG_DIR_VAR, "");
+        assert!(config_dir().unwrap().ends_with("dbui"));
+
+        match original {
+            Some(value) => std::env::set_var(CONFIG_DIR_VAR, value),
+            None => std::env::remove_var(CONFIG_DIR_VAR),
+        }
+    }
+
+    /// A first launch has no prefs file, and every version of the file since
+    /// has had fewer keys than the current one -- both have to come back as
+    /// defaults rather than as an error or a zeroed theme.
+    #[test]
+    fn missing_and_partial_prefs_fall_back_to_the_defaults() {
+        let dir = temp_dir("prefs");
+        let path = dir.join("prefs.json");
+        let defaults = Prefs::default();
+
+        let missing = load_prefs(&path).expect("no file is not a failure");
+        assert_eq!(missing.theme, defaults.theme);
+        assert_eq!(missing.zoom_pct, defaults.zoom_pct);
+        assert_eq!(missing.sql_editor_height_px, defaults.sql_editor_height_px);
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{\"theme\":\"gruvbox-dark\"}").unwrap();
+        let partial = load_prefs(&path).expect("an older file still loads");
+        assert_eq!(partial.theme, "gruvbox-dark");
+        assert_eq!(partial.zoom_pct, defaults.zoom_pct, "the rest defaults");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefs_survive_a_round_trip_and_malformed_prefs_are_reported() {
+        let dir = temp_dir("prefs-roundtrip");
+        let path = dir.join("prefs.json");
+        let prefs = Prefs {
+            theme: "light".into(),
+            zoom_pct: 125,
+            sql_editor_height_px: 320,
+        };
+
+        save_prefs(&path, &prefs).expect("the parent is created");
+        let loaded = load_prefs(&path).unwrap();
+        assert_eq!(loaded.theme, "light");
+        assert_eq!(loaded.zoom_pct, 125);
+        assert_eq!(loaded.sql_editor_height_px, 320);
+
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(matches!(load_prefs(&path), Err(StoreError::Parse { .. })));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that exists but cannot be read is a different case from one that
+    /// does not exist, and only the second is silently fine.
+    #[test]
+    fn an_unreadable_path_is_not_mistaken_for_a_missing_file() {
+        let dir = temp_dir("unreadable");
+        std::fs::create_dir_all(dir.join("connections.json")).unwrap();
+
+        assert!(matches!(
+            load(&dir.join("connections.json")),
+            Err(StoreError::Read { .. })
+        ));
+        assert!(matches!(
+            load_prefs(&dir.join("connections.json")),
+            Err(StoreError::Read { .. })
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn malformed_json_is_reported_not_swallowed() {
         let path = temp_path("malformed");

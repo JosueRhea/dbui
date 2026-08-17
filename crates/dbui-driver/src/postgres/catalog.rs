@@ -113,3 +113,25 @@ pub fn table_kind(relkind: &str) -> dbui_domain::TableKind {
         _ => TableKind::Table,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use dbui_domain::TableKind;
+
+    /// `relkind` has more values than the domain models, and the ones left over
+    /// -- partitioned (`p`), foreign (`f`), plain (`r`) -- are all read the same
+    /// way, so they are all tables.
+    #[test]
+    fn relkinds_the_domain_does_not_model_are_tables() {
+        assert_eq!(super::table_kind("v"), TableKind::View);
+        assert_eq!(super::table_kind("m"), TableKind::MaterializedView);
+        assert_eq!(super::table_kind("r"), TableKind::Table);
+        assert_eq!(super::table_kind("p"), TableKind::Table);
+        assert_eq!(super::table_kind("f"), TableKind::Table);
+        assert_eq!(
+            super::table_kind("V"),
+            TableKind::Table,
+            "relkind is lowercase"
+        );
+    }
+}
