@@ -980,44 +980,37 @@ impl TextInput {
         index
     }
 
+    /// Where `⌥→` lands: the **end** of the word ahead.
+    ///
+    /// This is the asymmetry macOS has and Windows does not -- going right the
+    /// caret stops after a word, going left it stops before one -- so a gap is
+    /// crossed on the way rather than stopped in. The code here used to do the
+    /// Windows thing (stop at the start of the next word) under a comment
+    /// claiming it was the macOS one.
     fn next_word_boundary(&self, from: usize) -> usize {
-        if from >= self.value.len() {
-            return self.value.len();
-        }
         let mut index = from;
+
+        // Cross any gap first: ⌥→ from inside whitespace goes on to the end of
+        // the word after it, never stopping in the space.
+        while index < self.value.len() {
+            let Some(c) = self.value[index..].chars().next() else {
+                break;
+            };
+            if !c.is_whitespace() {
+                break;
+            }
+            index = self.next_boundary(index);
+        }
+
         let Some(ch) = self.value[index..].chars().next() else {
             return self.value.len();
         };
-
-        if ch.is_whitespace() {
-            while index < self.value.len() {
-                let Some(c) = self.value[index..].chars().next() else {
-                    break;
-                };
-                if !c.is_whitespace() {
-                    break;
-                }
-                index = self.next_boundary(index);
-            }
-            return index;
-        }
-
         let word = Self::is_word_char(ch);
         while index < self.value.len() {
             let Some(c) = self.value[index..].chars().next() else {
                 break;
             };
             if Self::is_word_char(c) != word || c.is_whitespace() {
-                break;
-            }
-            index = self.next_boundary(index);
-        }
-        // Also consume following whitespace, matching macOS word motion.
-        while index < self.value.len() {
-            let Some(c) = self.value[index..].chars().next() else {
-                break;
-            };
-            if !c.is_whitespace() {
                 break;
             }
             index = self.next_boundary(index);
@@ -1360,6 +1353,47 @@ mod tests {
         let mut field = input("one\ntwo\nthree");
         field.click_at(5, false, 3);
         assert_eq!(&field.text()[field.selection()], "two\n");
+    }
+
+    /// Going right the caret stops *after* a word, going left *before* one.
+    /// That asymmetry is the macOS convention, and it used to stop at the
+    /// start of the next word in both directions.
+    #[test]
+    fn option_arrows_walk_words_the_way_macos_does() {
+        let mut field = input("alpha beta gamma");
+        field.move_to(0);
+
+        field.move_word_right();
+        assert_eq!(field.cursor(), 5, "after alpha, not before beta");
+        field.move_word_right();
+        assert_eq!(field.cursor(), 10, "after beta");
+        field.move_word_right();
+        assert_eq!(field.cursor(), 16, "after gamma");
+        field.move_word_right();
+        assert_eq!(field.cursor(), 16, "and stays at the end");
+
+        field.move_word_left();
+        assert_eq!(field.cursor(), 11, "before gamma");
+        field.move_word_left();
+        assert_eq!(field.cursor(), 6, "before beta");
+    }
+
+    /// From inside a gap it crosses the gap rather than stopping in it.
+    #[test]
+    fn option_right_from_whitespace_crosses_it() {
+        let mut field = input("alpha   beta");
+        field.move_to(6); // inside the run of spaces
+        field.move_word_right();
+        assert_eq!(field.cursor(), 12, "the end of beta");
+    }
+
+    /// ⌥⌦ takes the word, and leaves the space that followed it.
+    #[test]
+    fn option_delete_forward_takes_the_word_not_the_gap() {
+        let mut field = input("alpha beta");
+        field.move_to(0);
+        field.delete_word_forward();
+        assert_eq!(field.text(), " beta");
     }
 
     #[test]

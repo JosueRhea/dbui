@@ -4471,3 +4471,201 @@ fn right_clicking_inside_the_open_cell_editor_opens_no_row_menu(cx: &mut TestApp
         assert_eq!(view.editing_cell, Some((1, 1)), "and it stayed open");
     });
 }
+
+// -- the inline editor is a text box, and holds the text keys ---------------
+//
+// While it is open the grid's own ⌘ shortcuts have to stand down: the box is
+// on top, and every one of these means something different inside a field.
+// ⌘Z was the loud one -- it threw away the whole staged batch instead of
+// undoing a keystroke -- but the same guard covers all of them.
+
+/// An open cell editor with `count` rows behind it, holding `text`.
+fn open_cell_editor<'a>(
+    cx: &'a mut TestAppContext,
+    count: usize,
+    text: &str,
+) -> (Entity<DbUi>, &'a mut VisualTestContext) {
+    let (view, cx) = open_table_with_rows(cx, count);
+    let typed = text.to_string();
+    view.update(cx, move |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text(&typed);
+    });
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// The report: ⌘Z did not undo, it discarded the staged batch.
+#[gpui::test]
+fn cmd_z_in_the_cell_editor_undoes_the_typing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    // A staged edit on another row, so a discard would be visible.
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("first");
+        view.commit_cell_edit(cx);
+        view.begin_cell_edit(1, 1, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes(&typing("abc"));
+    cx.simulate_keystrokes("cmd-z");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.editing_cell, Some((1, 1)), "still open");
+        assert_ne!(view.cell_editor.text(), "abc", "the typing was undone");
+        assert_eq!(
+            view.collect_batch_edits().len(),
+            1,
+            "and the staged batch was left alone"
+        );
+    });
+}
+
+/// ⌘⇧Z redoes it again, which is the half that already worked -- pinned so
+/// the pair stays a pair.
+#[gpui::test]
+fn cmd_shift_z_in_the_cell_editor_redoes(cx: &mut TestAppContext) {
+    let (view, cx) = open_cell_editor(cx, 4, "");
+
+    cx.simulate_keystrokes(&typing("abc"));
+    cx.simulate_keystrokes("cmd-z");
+    cx.simulate_keystrokes("cmd-shift-z");
+
+    view.update(cx, |view, _| assert_eq!(view.cell_editor.text(), "abc"));
+}
+
+/// ⌘A selects the value, not every row in the table.
+#[gpui::test]
+fn cmd_a_in_the_cell_editor_selects_its_text(cx: &mut TestAppContext) {
+    let (view, cx) = open_cell_editor(cx, 4, "abcdef");
+
+    cx.simulate_keystrokes("cmd-a");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.cell_editor.selection(), 0..6, "the value is selected");
+        assert_ne!(selected_rows(view).len(), 4, "not every row in the table");
+    });
+}
+
+/// ⌘C copies what is selected in the box, not the rows behind it.
+#[gpui::test]
+fn cmd_c_in_the_cell_editor_copies_its_text(cx: &mut TestAppContext) {
+    let (_view, cx) = open_cell_editor(cx, 4, "copy me");
+
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_keystrokes("cmd-c");
+
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("copy me".to_string())
+    );
+}
+
+/// ⌘V pastes text into the box rather than staging rows from the clipboard.
+#[gpui::test]
+fn cmd_v_in_the_cell_editor_pastes_text(cx: &mut TestAppContext) {
+    let (view, cx) = open_cell_editor(cx, 4, "");
+
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasted".into()));
+    cx.simulate_keystrokes("cmd-v");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.cell_editor.text(), "pasted");
+        assert_eq!(
+            view.tabs.active().unwrap().pending_inserts().len(),
+            0,
+            "and staged no rows"
+        );
+    });
+}
+
+/// ⌘⌫ deletes to the start of the line. Over the grid it stages the selected
+/// rows for deletion, which is not what a person typing into a box wants.
+#[gpui::test]
+fn cmd_backspace_in_the_cell_editor_deletes_text(cx: &mut TestAppContext) {
+    let (view, cx) = open_cell_editor(cx, 4, "abcdef");
+
+    cx.simulate_keystrokes("cmd-backspace");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.editing_cell, Some((1, 1)), "still open");
+        // Nothing was staged for deletion.
+        assert!(view.collect_batch_deletes().is_empty());
+    });
+}
+
+/// ⌘D duplicates rows over the grid. While a box is open it must not fire.
+#[gpui::test]
+fn cmd_d_in_the_cell_editor_stages_no_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open_cell_editor(cx, 4, "abcdef");
+
+    cx.simulate_keystrokes("cmd-d");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.active().unwrap().pending_inserts().len(), 0);
+    });
+}
+
+/// ⌘S commits the batch -- so it has to fold in the box that is still open,
+/// or it saves everything except the value the user just typed.
+#[gpui::test]
+fn cmd_s_folds_in_the_open_cell_editor(cx: &mut TestAppContext) {
+    let (view, cx) = open_cell_editor(cx, 4, "typed just now");
+
+    view.update(cx, |view, cx| view.save_pending_edits(cx));
+
+    view.update(cx, |view, _| {
+        assert!(view.editing_cell.is_none(), "the box closed");
+        let staged = view.collect_batch_edits();
+        assert!(
+            staged.iter().any(|edit| edit
+                .changes
+                .iter()
+                .any(|change| change.new_text == "typed just now")),
+            "the typed value went into the batch"
+        );
+    });
+}
+
+/// The rest of what a text box answers to, in one sweep.
+///
+/// None of these were ever intercepted -- ⌘X, the word and line jumps and the
+/// shifted arrows are absent from the grid's shortcut list, so they always
+/// reached the field. They are pinned here anyway: the bug was a *global*
+/// shortcut quietly claiming a key the box needed, and the way that stays
+/// fixed is for the whole contract to be written down.
+#[gpui::test]
+fn the_cell_editor_answers_the_rest_of_the_text_keys(cx: &mut TestAppContext) {
+    let (view, cx) = open_cell_editor(cx, 4, "alpha beta gamma");
+
+    // ⌘→ / ⌘← are the ends of the line.
+    cx.simulate_keystrokes("cmd-right");
+    view.update(cx, |view, _| assert_eq!(view.cell_editor.cursor(), 16));
+    cx.simulate_keystrokes("cmd-left");
+    view.update(cx, |view, _| assert_eq!(view.cell_editor.cursor(), 0));
+
+    // ⌥→ walks a word at a time, landing after each one.
+    cx.simulate_keystrokes("alt-right alt-right");
+    view.update(cx, |view, _| assert_eq!(view.cell_editor.cursor(), 10));
+
+    // ⇧← grows a selection back over "ta".
+    cx.simulate_keystrokes("shift-left shift-left");
+    let cut = view.update(cx, |view, _| view.cell_editor.selection());
+    assert_eq!(cut, 8..10);
+
+    // ⌘X takes it away, and ⌘V puts it back.
+    cx.simulate_keystrokes("cmd-x");
+    view.update(cx, |view, _| {
+        assert_eq!(view.cell_editor.text(), "alpha be gamma");
+    });
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("ta".to_string())
+    );
+    cx.simulate_keystrokes("cmd-v");
+    view.update(cx, |view, _| {
+        assert_eq!(view.cell_editor.text(), "alpha beta gamma");
+        assert_eq!(view.editing_cell, Some((1, 1)), "and it never closed");
+    });
+}

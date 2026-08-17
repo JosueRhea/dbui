@@ -1805,7 +1805,13 @@ impl DbUi {
     /// are typeable, and ⌘A there still means "the rows I clicked" until an
     /// actual field takes focus — otherwise selecting rows and pressing ⌘A
     /// would do nothing, which reads as the shortcut being broken.
+    ///
+    /// An open cell editor takes them all back: it is a text box sitting on
+    /// the grid, and `focus` stays [`Focus::Grid`] while it is up.
     pub(crate) fn grid_owns_keys(&self) -> bool {
+        if self.editing_cell.is_some() {
+            return false;
+        }
         self.focus == Focus::Grid
             || (self.focus == Focus::Detail && self.detail_input.is_none())
     }
@@ -1834,14 +1840,22 @@ impl DbUi {
         true
     }
 
-    /// Whether a text editor currently owns ⌘Z for its own undo stack.
+    /// Whether a text editor currently owns the text keys — ⌘Z for its own
+    /// undo stack, and ⌘C / ⌘V / ⌘D for the characters rather than the rows.
     ///
     /// Everywhere else ⌘Z means "discard the staged batch". The batch belongs
     /// to the tab rather than to any one surface, so it has to work from the
     /// tree as well as the grid — the change bubble is on screen either way,
     /// and a shortcut that does nothing while the thing it undoes is visible
     /// reads as broken.
+    ///
+    /// The inline cell editor is the exception inside [`Focus::Grid`]: it is a
+    /// real text box, so while it is open ⌘Z has a keystroke to undo and the
+    /// batch is emphatically not what the user is asking to throw away.
     pub(crate) fn text_undo_has_focus(&self) -> bool {
+        if self.editing_cell.is_some() {
+            return true;
+        }
         match self.focus {
             Focus::Editor | Focus::Filter | Focus::PageSize | Focus::SidebarSearch => true,
             Focus::Detail => self.detail_input.is_some(),
@@ -2893,7 +2907,11 @@ impl DbUi {
             return;
         }
 
-        // Fold the open draft in first so Save catches in-progress edits.
+        // Fold the open editors in first so Save catches in-progress edits --
+        // the sidebar draft, and the box still open over a cell. Committing a
+        // batch that leaves out the value the user typed a moment ago is how
+        // an edit silently goes missing.
+        self.finish_cell_edit(cx);
         self.stash_current_draft(cx);
 
         // The staged inserts are turned into values here rather than later:
