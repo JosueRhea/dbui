@@ -130,22 +130,30 @@ impl Value {
     /// value paint over its neighbours; and a 2 MB JSON blob costs real time to
     /// lay out for the ~60 characters that end up visible.
     pub fn to_cell(&self, max_chars: usize) -> String {
-        let text = self.to_text();
-        let mut out = String::with_capacity(text.len().min(max_chars) + 1);
-        for ch in text.chars() {
-            if out.chars().count() >= max_chars {
-                out.push('…');
-                return out;
-            }
-            match ch {
-                '\n' => out.push('⏎'),
-                '\t' => out.push(' '),
-                '\r' => {}
-                c => out.push(c),
-            }
-        }
-        out
+        one_line(&self.to_text(), max_chars)
     }
+}
+
+/// Flatten text onto one line and cap its length, marking the cut with `…`.
+///
+/// A newline becomes a visible `⏎` rather than a space, because "there is more
+/// value below" is worth seeing where only one line is drawn; a carriage return
+/// is dropped so that a CRLF does not read as two breaks.
+pub fn one_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_chars) + 1);
+    for ch in text.chars() {
+        if out.chars().count() >= max_chars {
+            out.push('…');
+            return out;
+        }
+        match ch {
+            '\n' => out.push('⏎'),
+            '\t' => out.push(' '),
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl fmt::Display for Value {

@@ -4,6 +4,8 @@
 //! strip is appended as typed (same trust model as the SQL editor). UPDATE
 //! values are bound, never interpolated.
 
+use crate::error::{DriverError, Result as DriverResult};
+use crate::port::RowBatch;
 use dbui_domain::{Driver, SortKey, TableKind, TableRef, Value};
 
 /// A SQL fragment plus the values to bind, in order.
@@ -128,28 +130,47 @@ pub fn update_sql(
         }
     }
 
-    let mut wheres = Vec::new();
-    for (name, value) in pk {
-        let col = driver.quote_identifier(name);
-        if value.is_null() {
-            wheres.push(format!("{col} IS NULL"));
-        } else {
-            let ph = typed_placeholder(driver, param, value);
-            param += 1;
-            wheres.push(format!("{col} = {ph}"));
-            binds.push(value_to_bind(value));
-        }
-    }
+    let wheres = key_predicate(driver, pk, &mut param, &mut binds);
 
     Ok(BoundSql {
         sql: format!(
             "UPDATE {} SET {} WHERE {}",
             table.quoted(driver),
             sets.join(", "),
-            wheres.join(" AND ")
+            wheres
         ),
         binds,
     })
+}
+
+/// `"id" = $1 AND "tenant" IS NULL` — the predicate that names one row.
+///
+/// Appends the bound values to `binds` and advances `param` past the
+/// placeholders it used, so a caller can build this after a `SET` list on the
+/// same numbering. A NULL key part is compared with `IS NULL` because `= NULL`
+/// is never true, and a row whose key holds a NULL is still a row the grid
+/// showed and the user selected.
+fn key_predicate(
+    driver: Driver,
+    pk: &[(String, Value)],
+    param: &mut usize,
+    binds: &mut Vec<Value>,
+) -> String {
+    let mut parts = Vec::with_capacity(pk.len());
+    for (name, value) in pk {
+        let col = driver.quote_identifier(name);
+        if value.is_null() {
+            parts.push(format!("{col} IS NULL"));
+        } else {
+            parts.push(format!(
+                "{col} = {}",
+                typed_placeholder(driver, *param, value)
+            ));
+            *param += 1;
+            binds.push(value_to_bind(value));
+        }
+    }
+    parts.join(" AND ")
 }
 
 /// `DELETE FROM table WHERE pk…` — one row, identified by its primary key.
@@ -169,27 +190,46 @@ pub fn delete_sql(
 
     let mut binds = Vec::new();
     let mut param = 1usize;
-    let mut wheres = Vec::new();
-    for (name, value) in pk {
-        let col = driver.quote_identifier(name);
-        if value.is_null() {
-            wheres.push(format!("{col} IS NULL"));
-        } else {
-            let ph = typed_placeholder(driver, param, value);
-            param += 1;
-            wheres.push(format!("{col} = {ph}"));
-            binds.push(value_to_bind(value));
-        }
-    }
+    let wheres = key_predicate(driver, pk, &mut param, &mut binds);
 
     Ok(BoundSql {
-        sql: format!(
-            "DELETE FROM {} WHERE {}",
-            table.quoted(driver),
-            wheres.join(" AND ")
-        ),
+        sql: format!("DELETE FROM {} WHERE {}", table.quoted(driver), wheres),
         binds,
     })
+}
+
+/// Every statement a staged batch turns into, in the order it must run.
+///
+/// Inserts first, then updates, then deletes: a batch that adds a row and
+/// deletes another must not have the delete take the new row's place in a
+/// unique index. The whole batch is built before any of it runs, so a batch
+/// containing one impossible statement -- an update on a table with no primary
+/// key -- fails before the transaction opens rather than half-way through it.
+pub fn batch_sql(
+    driver: Driver,
+    table: &TableRef,
+    batch: &RowBatch,
+) -> DriverResult<Vec<BoundSql>> {
+    let mut statements = Vec::with_capacity(batch.len());
+    for row in &batch.inserts {
+        statements.push(
+            insert_sql(driver, table, &row.values)
+                .map_err(|message| DriverError::message("INSERT", message))?,
+        );
+    }
+    for row in &batch.updates {
+        statements.push(
+            update_sql(driver, table, &row.changes, &row.pk)
+                .map_err(|message| DriverError::message("UPDATE", message))?,
+        );
+    }
+    for row in &batch.deletes {
+        statements.push(
+            delete_sql(driver, table, &row.pk)
+                .map_err(|message| DriverError::message("DELETE", message))?,
+        );
+    }
+    Ok(statements)
 }
 
 /// `INSERT INTO table (…) VALUES (…)` for one new row.

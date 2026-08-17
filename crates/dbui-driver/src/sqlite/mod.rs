@@ -7,18 +7,17 @@
 mod catalog;
 mod decode;
 
+use crate::adapter;
 use crate::error::{DriverError, Result};
 use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
-use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Page, QueryOutcome,
-    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef, Value,
+    Catalog, Column, ConnectionConfig, Driver, ForeignKey, Page, QueryResult, ResultSet, Schema,
+    SortKey, Table, TableRef, Value,
 };
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
-use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::Row as _;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
 
 pub struct SqliteDriver {
     pool: SqlitePool,
@@ -46,7 +45,7 @@ impl SqliteDriver {
             // SQLite serialises writers anyway, and a single connection keeps
             // a transaction and the statements around it on the same one.
             .max_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
+            .acquire_timeout(adapter::ACQUIRE_TIMEOUT)
             .connect_with(options)
             .await
             .map_err(|error| DriverError::connect(path, &error))?;
@@ -70,19 +69,11 @@ impl SqliteDriver {
             .await
             .map_err(|error| DriverError::catalog(&error))?;
 
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                Some(ForeignKey {
-                    column: row.try_get::<String, _>("column_name").ok()?,
-                    references: TableRef::new(
-                        catalog::SCHEMA_NAME,
-                        row.try_get::<String, _>("ref_table").ok()?,
-                    ),
-                    references_column: row.try_get::<String, _>("ref_column").ok()?,
-                })
-            })
-            .collect())
+        // SQLite has one schema, so its query has no `ref_schema` to read.
+        Ok(adapter::foreign_keys::<sqlx::Sqlite>(
+            &rows,
+            Some(catalog::SCHEMA_NAME),
+        ))
     }
 }
 
@@ -97,11 +88,7 @@ impl DatabaseDriver for SqliteDriver {
     }
 
     async fn ping(&self) -> Result<()> {
-        sqlx::query("SELECT 1")
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(|error| DriverError::query("SELECT 1", &error))
+        adapter::ping(&self.pool).await
     }
 
     async fn catalog(&self) -> Result<Catalog> {
@@ -167,30 +154,20 @@ impl DatabaseDriver for SqliteDriver {
         where_clause: &str,
         order: &[SortKey],
     ) -> Result<ResultSet> {
-        let bound = sql_build::select_page_sql(Driver::Sqlite, table, where_clause, order);
-        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
-        for value in &bound.binds {
-            query = bind_value(query, value);
-        }
-        query = query.bind(page.probe_limit()).bind(page.offset as i64);
-
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| DriverError::query(&bound.sql, &error))?;
-
-        let mut set = build_result_set(rows, page.limit as usize);
-        self.backfill_columns(&mut set, &bound.sql).await;
-        Ok(set)
+        adapter::table_page(
+            &self.pool,
+            Driver::Sqlite,
+            table,
+            page,
+            where_clause,
+            order,
+            decode::decode_row,
+        )
+        .await
     }
 
     async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64> {
-        let bound = sql_build::count_sql(Driver::Sqlite, table, where_clause);
-        debug_assert!(bound.binds.is_empty(), "count_sql binds nothing");
-        sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()))
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|error| DriverError::query(&bound.sql, &error))
+        adapter::row_count(&self.pool, Driver::Sqlite, table, where_clause).await
     }
 
     async fn update_row(
@@ -210,153 +187,14 @@ impl DatabaseDriver for SqliteDriver {
     }
 
     async fn apply_changes(&self, table: &TableRef, batch: &RowBatch) -> Result<u64> {
-        if batch.is_empty() {
-            return Ok(0);
-        }
-
-        let mut statements = Vec::with_capacity(batch.len());
-        for row in &batch.inserts {
-            statements.push(
-                sql_build::insert_sql(Driver::Sqlite, table, &row.values)
-                    .map_err(|message| DriverError::message("INSERT", message))?,
-            );
-        }
-        for row in &batch.updates {
-            statements.push(
-                sql_build::update_sql(Driver::Sqlite, table, &row.changes, &row.pk)
-                    .map_err(|message| DriverError::message("UPDATE", message))?,
-            );
-        }
-        for row in &batch.deletes {
-            statements.push(
-                sql_build::delete_sql(Driver::Sqlite, table, &row.pk)
-                    .map_err(|message| DriverError::message("DELETE", message))?,
-            );
-        }
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| DriverError::query("BEGIN", &error))?;
-
-        let mut total = 0u64;
-        for bound in &statements {
-            let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
-            for value in &bound.binds {
-                query = bind_value(query, value);
-            }
-            let done = query
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| DriverError::query(&bound.sql, &error))?;
-            total += done.rows_affected();
-        }
-
-        tx.commit()
-            .await
-            .map_err(|error| DriverError::query("COMMIT", &error))?;
-        Ok(total)
+        adapter::apply_changes(&self.pool, Driver::Sqlite, table, batch).await
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        let started = Instant::now();
-
-        let outcome = if query::returns_rows(sql) {
-            let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|error| DriverError::query(sql, &error))?;
-            let mut set = build_result_set(rows, usize::MAX);
-            self.backfill_columns(&mut set, sql).await;
-            QueryOutcome::Rows(set)
-        } else {
-            let done = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .execute(&self.pool)
-                .await
-                .map_err(|error| DriverError::query(sql, &error))?;
-            QueryOutcome::Affected(done.rows_affected())
-        };
-
-        Ok(QueryResult {
-            statement: sql.to_string(),
-            outcome,
-            stats: QueryStats {
-                elapsed: started.elapsed(),
-            },
-        })
+        adapter::execute(&self.pool, sql, decode::decode_row).await
     }
 
     async fn close(&self) {
         self.pool.close().await;
-    }
-}
-
-impl SqliteDriver {
-    /// See the Postgres adapter's copy: a query that matched nothing carries
-    /// no column metadata, and a grid with no headers looks broken.
-    async fn backfill_columns(&self, set: &mut ResultSet, sql: &str) {
-        use sqlx::{Executor, Statement};
-
-        if !set.columns.is_empty() || !set.rows.is_empty() {
-            return;
-        }
-        let prepared = Executor::prepare(&self.pool, AssertSqlSafe(sql.to_string()).into_sql_str());
-        if let Ok(statement) = prepared.await {
-            set.columns = statement
-                .columns()
-                .iter()
-                .map(|column| ColumnInfo {
-                    name: column.name().to_string(),
-                    type_name: column.type_info().name().to_string(),
-                })
-                .collect();
-        }
-    }
-}
-
-fn build_result_set(rows: Vec<SqliteRow>, keep: usize) -> ResultSet {
-    let columns = rows
-        .first()
-        .map(|row| {
-            row.columns()
-                .iter()
-                .map(|column| ColumnInfo {
-                    name: column.name().to_string(),
-                    type_name: column.type_info().name().to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let truncated = rows.len() > keep;
-    let decoded = rows
-        .iter()
-        .take(keep)
-        .map(|row| DomainRow(decode::decode_row(row)))
-        .collect();
-
-    ResultSet {
-        columns,
-        rows: decoded,
-        truncated,
-    }
-}
-
-/// Bind one domain value with its own type.
-///
-/// SQLite's affinity rules coerce most things, but binding the real type keeps
-/// an integer key comparing as an integer rather than as text.
-fn bind_value<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
-    value: &Value,
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
-    match value {
-        Value::Null | Value::Default => query.bind(Option::<String>::None),
-        Value::Bool(flag) => query.bind(*flag),
-        Value::Int(number) => query.bind(*number),
-        Value::Float(number) => query.bind(*number),
-        Value::Bytes(bytes) => query.bind(bytes.clone()),
-        other => query.bind(other.to_text()),
     }
 }

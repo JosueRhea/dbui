@@ -21,4 +21,4 @@ pub use query::{
     order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, SortKey,
 };
 pub use sql_split::{split_statements, statement_at};
-pub use value::{Value, ValueKind};
+pub use value::{one_line, Value, ValueKind};

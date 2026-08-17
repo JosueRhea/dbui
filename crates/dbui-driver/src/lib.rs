@@ -5,6 +5,8 @@
 //! `Arc<dyn DatabaseDriver>` and cannot tell Postgres from MySQL except by
 //! asking.
 
+mod adapter;
+mod decode;
 mod error;
 mod mysql;
 mod port;

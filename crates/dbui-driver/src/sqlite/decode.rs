@@ -18,21 +18,13 @@
 //!   still shows what the table declared, because that comes from
 //!   `pragma_table_info` rather than from the wire.
 
+use crate::adapter;
 use dbui_domain::Value;
-use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use sqlx::sqlite::SqliteRow;
+use sqlx::{Row as _, TypeInfo as _, ValueRef as _};
 
 pub fn decode_row(row: &SqliteRow) -> Vec<Value> {
-    (0..row.len())
-        .map(|index| {
-            let declared = row
-                .columns()
-                .get(index)
-                .map(|column| column.type_info().name().to_string())
-                .unwrap_or_default();
-            decode_cell(row, index, &declared)
-        })
-        .collect()
+    adapter::decode_row::<sqlx::Sqlite>(row, decode_cell)
 }
 
 fn decode_cell(row: &SqliteRow, index: usize, declared: &str) -> Value {
