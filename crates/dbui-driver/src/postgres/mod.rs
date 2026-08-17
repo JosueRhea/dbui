@@ -213,27 +213,29 @@ impl DatabaseDriver for PostgresDriver {
             .await
             .map_err(|error| DriverError::catalog(&error))?;
 
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                Some(Column {
-                    name: row.try_get::<String, _>("column_name").ok()?,
-                    data_type: row.try_get::<String, _>("data_type").ok()?,
-                    nullable: row.try_get::<bool, _>("is_nullable").unwrap_or(true),
-                    default: row.try_get::<Option<String>, _>("column_default").ok().flatten(),
-                    is_primary_key: row.try_get::<bool, _>("is_primary_key").unwrap_or(false),
-                    ordinal: i32::from(row.try_get::<i16, _>("ordinal").unwrap_or(0)),
-                    references: None,
+        // A row that will not decode fails the whole read. A silently dropped
+        // row is a column missing from the structure pane, and a defaulted
+        // `is_primary_key` is a page the grid pages unordered and refuses to
+        // edit, with nothing on screen either way.
+        rows.iter()
+            .map(|row| {
+                let catalog = |error: sqlx::Error| DriverError::catalog(&error);
+                let name = row.try_get::<String, _>("column_name").map_err(catalog)?;
+                Ok(Column {
+                    references: keys.iter().find(|key| key.column == name).cloned(),
+                    name,
+                    data_type: row.try_get::<String, _>("data_type").map_err(catalog)?,
+                    nullable: row.try_get::<bool, _>("is_nullable").map_err(catalog)?,
+                    // Only cosmetic, so still best effort.
+                    default: row
+                        .try_get::<Option<String>, _>("column_default")
+                        .ok()
+                        .flatten(),
+                    is_primary_key: row.try_get::<bool, _>("is_primary_key").map_err(catalog)?,
+                    ordinal: i32::from(row.try_get::<i16, _>("ordinal").map_err(catalog)?),
                 })
             })
-            .map(|mut column: Column| {
-                column.references = keys
-                    .iter()
-                    .find(|key| key.column == column.name)
-                    .cloned();
-                column
-            })
-            .collect())
+            .collect()
     }
 
     async fn table_rows(
