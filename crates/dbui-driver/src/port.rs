@@ -139,3 +139,140 @@ impl RowBatch {
         self.inserts.len() + self.updates.len() + self.deletes.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::DriverError;
+    use dbui_domain::TableRef;
+    use std::sync::Mutex;
+
+    /// A driver with nothing but the batch primitive implemented, so what the
+    /// provided methods do with it is visible.
+    #[derive(Default)]
+    struct Recorder {
+        batches: Mutex<Vec<RowBatch>>,
+    }
+
+    #[async_trait]
+    impl DatabaseDriver for Recorder {
+        fn driver(&self) -> Driver {
+            Driver::Sqlite
+        }
+
+        fn server_version(&self) -> &str {
+            "0"
+        }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn catalog(&self) -> Result<Catalog> {
+            Ok(Catalog::default())
+        }
+
+        async fn columns(&self, _table: &TableRef) -> Result<Vec<Column>> {
+            Ok(Vec::new())
+        }
+
+        async fn table_rows(
+            &self,
+            _table: &TableRef,
+            _page: Page,
+            _where_clause: &str,
+            _order: &[SortKey],
+        ) -> Result<ResultSet> {
+            Ok(ResultSet::default())
+        }
+
+        async fn row_count(&self, _table: &TableRef, _where_clause: &str) -> Result<i64> {
+            Ok(0)
+        }
+
+        async fn apply_changes(&self, _table: &TableRef, batch: &RowBatch) -> Result<u64> {
+            self.batches.lock().unwrap().push(batch.clone());
+            Ok(batch.len() as u64)
+        }
+
+        async fn execute(&self, sql: &str) -> Result<QueryResult> {
+            Err(DriverError::message(sql, "not implemented"))
+        }
+
+        async fn close(&self) {}
+    }
+
+    fn update(id: i64) -> RowUpdate {
+        RowUpdate {
+            pk: vec![("id".to_string(), Value::Int(id))],
+            changes: vec![("name".to_string(), Value::Text("ada".into()))],
+        }
+    }
+
+    /// Both single-row helpers exist for convenience only: an adapter that
+    /// implements the batch primitive gets them for free, and they must arrive
+    /// as *one* batch so the transaction still covers the lot.
+    #[tokio::test]
+    async fn the_single_row_helpers_are_one_batch_each() {
+        let driver = Recorder::default();
+        let table = TableRef::new("main", "users");
+        let row = update(1);
+
+        let touched = driver
+            .update_row(&table, &row.pk, &row.changes)
+            .await
+            .expect("update");
+        assert_eq!(touched, 1);
+
+        let touched = driver
+            .update_rows(&table, &[update(1), update(2), update(3)])
+            .await
+            .expect("update");
+        assert_eq!(touched, 3);
+
+        let batches = driver.batches.lock().unwrap();
+        assert_eq!(batches.len(), 2, "one call to the primitive each");
+        assert_eq!(batches[0].updates.len(), 1);
+        assert_eq!(batches[0].updates[0].pk, row.pk);
+        assert_eq!(batches[0].updates[0].changes, row.changes);
+        assert_eq!(batches[1].updates.len(), 3);
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.inserts.is_empty() && b.deletes.is_empty()),
+            "an update batch touches nothing else"
+        );
+    }
+
+    /// `is_empty` is what stops a commit with nothing staged from opening a
+    /// transaction, so it has to account for all three lists.
+    #[test]
+    fn a_batch_is_empty_only_when_all_three_lists_are() {
+        assert!(RowBatch::default().is_empty());
+        assert_eq!(RowBatch::default().len(), 0);
+
+        let batch = RowBatch {
+            inserts: vec![RowInsert {
+                values: vec![("name".to_string(), Value::Default)],
+            }],
+            updates: vec![update(1), update(2)],
+            deletes: vec![RowDelete {
+                pk: vec![("id".to_string(), Value::Int(9))],
+            }],
+        };
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 4, "every list counts");
+
+        let deletes_only = RowBatch {
+            deletes: vec![RowDelete {
+                pk: vec![("id".to_string(), Value::Int(9))],
+            }],
+            ..RowBatch::default()
+        };
+        assert!(!deletes_only.is_empty(), "deletions alone are still work");
+
+        let updates = RowBatch::of_updates(vec![update(1)]);
+        assert_eq!(updates.len(), 1);
+        assert!(updates.inserts.is_empty() && updates.deletes.is_empty());
+    }
+}

@@ -92,3 +92,20 @@ pub fn table_kind(table_type: &str) -> dbui_domain::TableKind {
         TableKind::Table
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use dbui_domain::TableKind;
+
+    /// `TABLE_TYPE` is `BASE TABLE`, `VIEW` or a temporary/system variant, and
+    /// MySQL does not promise a case for it -- everything that is not a view is
+    /// something the grid can read from.
+    #[test]
+    fn only_a_view_is_a_view() {
+        assert_eq!(super::table_kind("VIEW"), TableKind::View);
+        assert_eq!(super::table_kind("view"), TableKind::View);
+        assert_eq!(super::table_kind("BASE TABLE"), TableKind::Table);
+        assert_eq!(super::table_kind("SYSTEM VIEW"), TableKind::Table);
+        assert_eq!(super::table_kind(""), TableKind::Table);
+    }
+}
