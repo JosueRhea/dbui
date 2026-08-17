@@ -4669,3 +4669,332 @@ fn the_cell_editor_answers_the_rest_of_the_text_keys(cx: &mut TestAppContext) {
         assert_eq!(view.editing_cell, Some((1, 1)), "and it never closed");
     });
 }
+
+// -- every text box, one battery ------------------------------------------
+//
+// Three bugs in a row here had the same shape: something upstream of the
+// field ate a key or a press, and only the one surface somebody happened to
+// try showed it. Caps lock was every box at once; ⌘Z was the box over a grid
+// cell; a press inside that box went on to the row behind it. Each was found
+// by hand, one at a time.
+//
+// So the contract is asserted for all of them together. Adding a text box to
+// the app means adding a row here, and the battery says whether the box is a
+// real one.
+
+use crate::components::text_field::{DetailInput, InputTarget};
+use crate::text_input::TextInput;
+
+/// One editable box, and how to put the keyboard into it.
+struct Box2 {
+    name: &'static str,
+    /// Reach the state the box lives in. Called on a fresh window.
+    open: fn(&Entity<DbUi>, &mut VisualTestContext),
+    /// The buffer behind it, for seeding and reading back.
+    text: fn(&mut DbUi) -> Option<&mut TextInput>,
+    /// Whether the box still has the keyboard.
+    ///
+    /// `text` cannot answer this: the buffer behind a closed box is still
+    /// readable, so a press that shut the box would otherwise look like a
+    /// pass. That is exactly how the cell editor closing under the pointer
+    /// went unnoticed.
+    holds_keys: fn(&DbUi) -> bool,
+}
+
+fn by_target(target: InputTarget) -> impl Fn(&mut DbUi) -> Option<&mut TextInput> {
+    move |view: &mut DbUi| view.input_mut(target)
+}
+
+/// Every box the app draws.
+fn every_box() -> Vec<Box2> {
+    fn detail(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+        view.update(cx, |view, cx| {
+            view.select_row(0, cx);
+            view.focus_input(InputTarget::DetailSearch, cx);
+        });
+    }
+    vec![
+        Box2 {
+            name: "SQL editor",
+            open: |_, cx| cx.simulate_keystrokes("cmd-e"),
+            text: |view| match view.tabs.active_mut() {
+                Some(WorkspaceTab::Sql { editor, .. }) => Some(editor),
+                _ => None,
+            },
+            holds_keys: |view| view.focus == Focus::Editor,
+        },
+        Box2 {
+            name: "connection sheet",
+            open: |_, cx| cx.simulate_keystrokes("cmd-n"),
+            text: |view| view.modal.as_mut().and_then(|form| form.field_mut(0)),
+            holds_keys: |view| view.modal.is_some(),
+        },
+        Box2 {
+            name: "row filter (⌘F)",
+            open: |_, cx| cx.simulate_keystrokes("cmd-f"),
+            text: |view| view.input_mut(InputTarget::WhereDraft),
+            holds_keys: |view| view.focus == Focus::Filter,
+        },
+        Box2 {
+            name: "page size",
+            open: |view, cx| {
+                view.update(cx, |view, cx| view.focus_input(InputTarget::PageSize, cx));
+            },
+            text: |view| view.input_mut(InputTarget::PageSize),
+            holds_keys: |view| view.focus == Focus::PageSize,
+        },
+        Box2 {
+            name: "detail search",
+            open: detail,
+            text: |view| view.input_mut(InputTarget::DetailSearch),
+            holds_keys: |view| view.detail_input == Some(DetailInput::Search),
+        },
+        Box2 {
+            name: "detail field",
+            open: |view, cx| {
+                view.update(cx, |view, cx| {
+                    view.select_row(0, cx);
+                    // Field 0 is the primary key, which is deliberately not
+                    // editable in the sidebar -- so this asks for field 1.
+                    view.focus_input(InputTarget::DetailField(1), cx);
+                });
+            },
+            text: |view| view.input_mut(InputTarget::DetailField(1)),
+            holds_keys: |view| view.detail_input == Some(DetailInput::Field(1)),
+        },
+        Box2 {
+            name: "staged insert field",
+            open: |view, cx| {
+                view.update(cx, |view, cx| {
+                    view.add_row(cx);
+                    view.edit_insert(0, cx);
+                    view.focus_input(InputTarget::InsertField(1), cx);
+                });
+            },
+            text: |view| view.input_mut(InputTarget::InsertField(1)),
+            holds_keys: |view| view.detail_input == Some(DetailInput::Field(1)),
+        },
+        Box2 {
+            name: "cell editor",
+            open: |view, cx| {
+                view.update(cx, |view, cx| {
+                    view.begin_cell_edit(1, 1, cx);
+                    view.focus_input(InputTarget::CellEditor, cx);
+                });
+            },
+            text: |view| view.input_mut(InputTarget::CellEditor),
+            holds_keys: |view| view.editing_cell.is_some(),
+        },
+        Box2 {
+            name: "palette query",
+            open: |_, cx| cx.simulate_keystrokes("cmd-p"),
+            text: |view| view.input_mut(InputTarget::PaletteQuery),
+            holds_keys: |view| view.palette.is_some(),
+        },
+        Box2 {
+            name: "drop confirmation",
+            open: |view, cx| {
+                use crate::components::context_menu::{ContextTarget, MenuAction};
+                view.update(cx, |view, cx| {
+                    view.open_context_menu(
+                        ContextTarget::Table {
+                            table: TableRef::new("public", "users"),
+                            kind: dbui_app::domain::TableKind::Table,
+                        },
+                        gpui::point(gpui::px(0.), gpui::px(0.)),
+                        cx,
+                    );
+                    view.run_context_action(MenuAction::Drop, cx);
+                });
+            },
+            text: |view| view.input_mut(InputTarget::ConfirmName),
+            holds_keys: |view| view.confirm.is_some(),
+        },
+    ]
+}
+
+/// Seed the box with a known value and hand back a reader.
+fn seed(view: &Entity<DbUi>, cx: &mut VisualTestContext, boxed: &Box2) {
+    (boxed.open)(view, cx);
+    cx.run_until_parked();
+    let found = view.update(cx, |view, _| {
+        (boxed.text)(view).map(|input| {
+            input.set_text("alpha beta");
+            input.move_to(10);
+        })
+    });
+    assert!(found.is_some(), "{}: never reached the box", boxed.name);
+    cx.run_until_parked();
+}
+
+fn read(view: &Entity<DbUi>, cx: &mut VisualTestContext, boxed: &Box2) -> String {
+    view.update(cx, |view, _| {
+        (boxed.text)(view)
+            .map(|input| input.text().to_string())
+            .unwrap_or_default()
+    })
+}
+
+/// Caps lock reaches every box, not only the one it was found in.
+#[gpui::test]
+fn every_input_types_capitals_with_caps_lock(cx: &mut TestAppContext) {
+    for boxed in every_box() {
+        let (view, cx) = open_table_with_rows(cx, 4);
+        seed(&view, cx, &boxed);
+
+        cx.simulate_capslock_change(true);
+        cx.simulate_keystrokes("x");
+        cx.simulate_capslock_change(false);
+
+        assert_eq!(
+            read(&view, cx, &boxed),
+            "alpha betaX",
+            "{}: caps lock",
+            boxed.name
+        );
+    }
+}
+
+/// ⌘Z undoes a keystroke in every box. This is the one that discarded a whole
+/// staged batch instead, over a grid cell.
+#[gpui::test]
+fn every_input_undoes_with_cmd_z(cx: &mut TestAppContext) {
+    for boxed in every_box() {
+        let (view, cx) = open_table_with_rows(cx, 4);
+        seed(&view, cx, &boxed);
+
+        cx.simulate_keystrokes(&typing("XY"));
+        assert_eq!(read(&view, cx, &boxed), "alpha betaXY", "{}", boxed.name);
+        cx.simulate_keystrokes("cmd-z");
+
+        assert_eq!(
+            read(&view, cx, &boxed),
+            "alpha betaX",
+            "{}: ⌘Z undoes one keystroke",
+            boxed.name
+        );
+    }
+}
+
+/// ⌘A selects the value, ⌘C copies it, ⌘X takes it, ⌘V puts it back.
+#[gpui::test]
+fn every_input_does_select_all_copy_cut_and_paste(cx: &mut TestAppContext) {
+    for boxed in every_box() {
+        let (view, cx) = open_table_with_rows(cx, 4);
+        seed(&view, cx, &boxed);
+
+        cx.simulate_keystrokes("cmd-a");
+        let selected = view.update(cx, |view, _| (boxed.text)(view).map(|i| i.selection()));
+        assert_eq!(selected, Some(0..10), "{}: ⌘A", boxed.name);
+
+        // A sentinel on the board, so a copy that never happened is caught
+        // rather than read as a pass.
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL".into()));
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alpha beta".to_string()),
+            "{}: ⌘C",
+            boxed.name
+        );
+
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes("cmd-x");
+        assert!(read(&view, cx, &boxed).is_empty(), "{}: ⌘X", boxed.name);
+
+        cx.simulate_keystrokes("cmd-v");
+        assert_eq!(read(&view, cx, &boxed), "alpha beta", "{}: ⌘V", boxed.name);
+    }
+}
+
+/// ⌘⌫ clears to the start of the line rather than staging rows for deletion.
+#[gpui::test]
+fn every_input_deletes_to_the_line_start(cx: &mut TestAppContext) {
+    for boxed in every_box() {
+        let (view, cx) = open_table_with_rows(cx, 4);
+        seed(&view, cx, &boxed);
+
+        cx.simulate_keystrokes("cmd-backspace");
+
+        assert!(read(&view, cx, &boxed).is_empty(), "{}: ⌘⌫", boxed.name);
+        assert!(
+            view.update(cx, |view, _| view.collect_batch_deletes().is_empty()),
+            "{}: ⌘⌫ staged rows for deletion",
+            boxed.name
+        );
+    }
+}
+
+/// A press inside a box places the caret there and leaves the value alone --
+/// the failure that closed the cell editor out from under the pointer.
+///
+/// Every box in the list has to be on screen for this: a box that stopped
+/// drawing would otherwise quietly drop out of the audit, which is the exact
+/// shape of the bug the audit exists to catch. The tree filter is the one
+/// box not in the list, because it needs a live connection to draw at all --
+/// it has [`the_tree_filter_takes_a_press`] to itself.
+#[gpui::test]
+fn a_press_inside_any_input_places_the_caret(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    for boxed in every_box() {
+        let (view, cx) = open_table_with_rows(cx, 4);
+        seed(&view, cx, &boxed);
+
+        let bounds = view
+            .update(cx, |view, _| {
+                (boxed.text)(view).and_then(|input| input.hit_bounds_slot().get())
+            })
+            .unwrap_or_else(|| panic!("{}: never drew, so no press could reach it", boxed.name));
+
+        cx.simulate_click(
+            gpui::point(bounds.left() + gpui::px(1.), bounds.center().y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            read(&view, cx, &boxed),
+            "alpha beta",
+            "{}: a press ate the value",
+            boxed.name
+        );
+        assert_eq!(
+            view.update(cx, |view, _| (boxed.text)(view).map(|i| i.cursor())),
+            Some(0),
+            "{}: the caret did not follow the press",
+            boxed.name
+        );
+        assert!(
+            view.update(cx, |view, _| (boxed.holds_keys)(view)),
+            "{}: the press closed the box it landed in",
+            boxed.name
+        );
+    }
+}
+
+/// The tree filter, which is hidden until there is a catalog to filter -- so
+/// it needs a real connection rather than the fixture the battery uses.
+#[gpui::test]
+fn the_tree_filter_takes_a_press(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "input-audit");
+
+    cx.simulate_keystrokes("cmd-shift-f");
+    view.update(cx, |view, _| view.sidebar_filter.set_text("alpha beta"));
+    cx.run_until_parked();
+
+    let bounds = view
+        .update(cx, |view, _| view.sidebar_filter.hit_bounds_slot().get())
+        .expect("the tree filter draws once there is a catalog");
+    cx.simulate_click(
+        gpui::point(bounds.left() + gpui::px(1.), bounds.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.sidebar_filter.text(), "alpha beta");
+        assert_eq!(view.sidebar_filter.cursor(), 0);
+        assert_eq!(view.focus, Focus::SidebarSearch, "and kept the keyboard");
+    });
+}
