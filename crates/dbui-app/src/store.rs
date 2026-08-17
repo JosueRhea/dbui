@@ -53,14 +53,40 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), StoreError> {
     // The pid keeps two processes from renaming each other's half-written file
     // into place.
     let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temp, text).map_err(|error| write_error(&temp, error))?;
-    // Tightened before the rename, so the file is never readable by anyone
-    // else even for the moment between creation and the swap.
+    write_owner_only(&temp, text).map_err(|error| write_error(&temp, error))?;
+    // A temp file left behind by an earlier crash keeps the mode it was
+    // created with, so narrow it rather than trusting the create above.
     restrict_to_owner(&temp);
     std::fs::rename(&temp, path).map_err(|error| {
         let _ = std::fs::remove_file(&temp);
         write_error(path, error)
     })
+}
+
+/// Write `text` to `path`, creating it owner-only.
+///
+/// The mode goes in at `open` rather than after the write, so the contents are
+/// never readable by another account -- not even for the moment between
+/// creation and the rename that puts the file in place.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(text.as_bytes())
+}
+
+/// Windows and the rest have no mode to ask for; the file inherits what the
+/// directory grants.
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(path, text)
 }
 
 /// Take away group and world access from a file dbui wrote.
