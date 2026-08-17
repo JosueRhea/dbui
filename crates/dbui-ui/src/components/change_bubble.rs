@@ -5,6 +5,7 @@ use crate::root::DbUi;
 use crate::tabs::{FieldChange, PendingRowDelete, PendingRowEdit, WorkspaceTab};
 use crate::text_diff::{line_diff, DiffLine};
 use crate::theme::{metrics, Theme};
+use dbui_app::domain::one_line;
 use gpui::{div, prelude::*, px, AnyElement, Context, MouseButton, MouseDownEvent, SharedString};
 
 /// A one-line before/after has to fit beside its column name, and a diff line
@@ -217,7 +218,7 @@ fn render_insert_row(label: &str, theme: &Theme) -> AnyElement {
                 .min_w(px(0.))
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(SharedString::from(one_line(label))),
+                .child(SharedString::from(capped(label))),
         )
         .child(div().flex_shrink_0().child("NEW ROW"))
         .into_any_element()
@@ -242,7 +243,7 @@ fn render_delete_row(row: &PendingRowDelete, theme: &Theme) -> AnyElement {
                 .overflow_hidden()
                 .text_ellipsis()
                 .line_through()
-                .child(SharedString::from(one_line(&row.label))),
+                .child(SharedString::from(capped(&row.label))),
         )
         .child(div().flex_shrink_0().child("DELETE ROW"))
         .into_any_element()
@@ -282,13 +283,13 @@ fn render_change(change: &FieldChange, theme: &Theme) -> AnyElement {
             .child(
                 div()
                     .text_color(theme.danger)
-                    .child(SharedString::from(one_line(&change.old_text))),
+                    .child(SharedString::from(capped(&change.old_text))),
             )
             .child(div().text_color(theme.text_faint).child("→"))
             .child(
                 div()
                     .text_color(theme.success)
-                    .child(SharedString::from(one_line(&change.new_text))),
+                    .child(SharedString::from(capped(&change.new_text))),
             )
             .into_any_element(),
     }
@@ -332,7 +333,7 @@ fn render_diff_lines(lines: &[DiffLine], theme: &Theme) -> AnyElement {
                         .min_w(px(0.))
                         .overflow_hidden()
                         .text_ellipsis()
-                        .child(SharedString::from(one_line(text))),
+                        .child(SharedString::from(capped(text))),
                 )
         }));
 
@@ -349,19 +350,6 @@ fn render_diff_lines(lines: &[DiffLine], theme: &Theme) -> AnyElement {
 
 /// Collapse a value onto one line and cap it, the way the grid renders a cell:
 /// a newline here would paint over the row below it.
-fn one_line(text: &str) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        if out.chars().count() >= MAX_LINE_CHARS {
-            out.push('…');
-            return out;
-        }
-        match ch {
-            '\n' => out.push('⏎'),
-            '\t' => out.push(' '),
-            '\r' => {}
-            c => out.push(c),
-        }
-    }
-    out
+fn capped(text: &str) -> String {
+    one_line(text, MAX_LINE_CHARS)
 }

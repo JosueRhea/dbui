@@ -9,37 +9,23 @@
 //! same place. Neither aborts the query: a result set with one odd column
 //! should still show the other forty.
 
+use crate::adapter;
+use crate::decode::attempt;
 use dbui_domain::Value;
 use sqlx::postgres::types::Oid;
 use sqlx::postgres::PgRow;
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{BigDecimal, Decimal as RustDecimal, JsonValue, Uuid};
-use sqlx::{Column, Row, TypeInfo};
+use sqlx::Row;
 
 /// Decode every column of one row.
 pub fn decode_row(row: &PgRow) -> Vec<Value> {
-    (0..row.columns().len())
-        .map(|index| {
-            let type_name = row.column(index).type_info().name().to_ascii_uppercase();
-            decode_cell(row, index, &type_name)
-        })
-        .collect()
+    adapter::decode_row::<sqlx::Postgres>(row, decode_cell)
 }
 
-/// Try `Option<T>` at `index`, and hand the caller a `Value` only if sqlx
-/// agreed to decode it. `Ok(None)` is a real SQL NULL.
-macro_rules! attempt {
-    ($row:expr, $index:expr, $ty:ty, $wrap:expr) => {
-        match $row.try_get::<Option<$ty>, _>($index) {
-            Ok(Some(value)) => return $wrap(value),
-            Ok(None) => return Value::Null,
-            Err(_) => {}
-        }
-    };
-}
-
-fn decode_cell(row: &PgRow, index: usize, type_name: &str) -> Value {
-    match type_name {
+fn decode_cell(row: &PgRow, index: usize, reported_type: &str) -> Value {
+    let type_name = reported_type.to_ascii_uppercase();
+    match type_name.as_str() {
         "BOOL" => attempt!(row, index, bool, Value::Bool),
         "INT2" => attempt!(row, index, i16, |v| Value::Int(i64::from(v))),
         "INT4" => attempt!(row, index, i32, |v| Value::Int(i64::from(v))),

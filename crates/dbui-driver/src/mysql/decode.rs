@@ -3,33 +3,21 @@
 //! Same contract as the Postgres decoder: dispatch on the reported type name,
 //! degrade to [`Value::Unsupported`] rather than failing the query.
 
+use crate::adapter;
+use crate::decode::attempt;
 use dbui_domain::Value;
 use sqlx::mysql::MySqlRow;
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{BigDecimal, JsonValue};
-use sqlx::{Column, Row, TypeInfo};
+use sqlx::Row;
 
 pub fn decode_row(row: &MySqlRow) -> Vec<Value> {
-    (0..row.columns().len())
-        .map(|index| {
-            let type_name = row.column(index).type_info().name().to_ascii_uppercase();
-            decode_cell(row, index, &type_name)
-        })
-        .collect()
+    adapter::decode_row::<sqlx::MySql>(row, decode_cell)
 }
 
-macro_rules! attempt {
-    ($row:expr, $index:expr, $ty:ty, $wrap:expr) => {
-        match $row.try_get::<Option<$ty>, _>($index) {
-            Ok(Some(value)) => return $wrap(value),
-            Ok(None) => return Value::Null,
-            Err(_) => {}
-        }
-    };
-}
-
-fn decode_cell(row: &MySqlRow, index: usize, type_name: &str) -> Value {
-    match type_name {
+fn decode_cell(row: &MySqlRow, index: usize, reported_type: &str) -> Value {
+    let type_name = reported_type.to_ascii_uppercase();
+    match type_name.as_str() {
         // MySQL has no real boolean: `BOOLEAN` is an alias for `TINYINT(1)`,
         // and sqlx reports exactly that column as `BOOLEAN` -- there is no way
         // to tell "I meant true/false" from "I meant a one-digit integer".
