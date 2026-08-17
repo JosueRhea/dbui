@@ -3222,7 +3222,9 @@ impl DbUi {
         }
         let was_active = self.workspace.active_id() == Some(id);
         self.workspace.remove(id);
-        store::delete_password(id);
+        // Reported after the writes below: a password the keychain will not
+        // drop outlives the connection that owned it, which is worth a word.
+        let orphaned_password = store::delete_password(id).err();
         self.stashed_tabs.remove(&id);
 
         // Deleting the connection that was in front leaves its tabs pointing
@@ -3240,6 +3242,13 @@ impl DbUi {
 
         self.persist_connections();
         self.persist_session();
+        if let Some(error) = orphaned_password {
+            if !matches!(self.status, Status::Error(_)) {
+                self.status = Status::error(format!(
+                    "Connection removed, but its saved password is still in the keychain: {error}"
+                ));
+            }
+        }
         cx.notify();
         if was_active {
             self.load_active_table_if_empty(cx);

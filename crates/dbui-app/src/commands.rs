@@ -40,7 +40,11 @@ pub fn refresh_catalog(
 /// The columns are read *first*, because their primary key is what the page is
 /// ordered by. An unordered `LIMIT`/`OFFSET` is not pagination: the engine may
 /// return rows in any order it likes, so the same row can appear on two pages
-/// while another never appears at all.
+/// while another never appears at all. A column read that fails therefore
+/// takes the whole open with it rather than being defaulted away: rows read
+/// without a key look like an ordinary page while paging past them silently
+/// repeats and skips them, and the grid would offer edits it has no key to
+/// write.
 pub fn open_table(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
@@ -50,10 +54,14 @@ pub fn open_table(
     sort: Option<SortKey>,
 ) -> Task<Outcome<TableContents>> {
     runtime.spawn(async move {
-        let columns = driver.columns(&table).await.unwrap_or_default();
+        let columns = driver.columns(&table).await?;
         let order = dbui_domain::order_for(sort.as_ref(), &key_columns(&columns));
 
         let rows = driver.table_rows(&table, page, &where_clause, &order).await?;
+        // The count is the one part of the read allowed to fail on its own: on
+        // a large table it is the slowest of the three statements, and rows the
+        // user can already see are worth more than the total above them. `None`
+        // renders as an unknown count rather than as zero.
         let total_rows = driver.row_count(&table, &where_clause).await.ok();
 
         Ok(TableContents {
@@ -257,4 +265,146 @@ pub fn test_connection(runtime: &DbRuntime, config: ConnectionConfig) -> Task<Ou
 /// Close a pool without blocking the UI on it.
 pub fn disconnect(runtime: &DbRuntime, driver: Arc<dyn DatabaseDriver>) -> Task<()> {
     runtime.spawn(async move { driver.close().await })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use dbui_domain::{Driver, QueryStats};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    /// A driver whose catalog answers are whatever the test says they are.
+    struct StubDriver {
+        columns: Outcome<Vec<Column>>,
+        row_count: Outcome<i64>,
+    }
+
+    impl StubDriver {
+        /// A table with one primary-key column and seven rows.
+        fn healthy() -> Self {
+            Self {
+                columns: Ok(vec![Column {
+                    name: "id".into(),
+                    data_type: "integer".into(),
+                    nullable: false,
+                    default: None,
+                    is_primary_key: true,
+                    ordinal: 1,
+                    references: None,
+                }]),
+                row_count: Ok(7),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DatabaseDriver for StubDriver {
+        fn driver(&self) -> Driver {
+            Driver::Sqlite
+        }
+
+        fn server_version(&self) -> &str {
+            "stub"
+        }
+
+        async fn ping(&self) -> Outcome<()> {
+            Ok(())
+        }
+
+        async fn catalog(&self) -> Outcome<Catalog> {
+            Ok(Catalog::default())
+        }
+
+        async fn columns(&self, _table: &TableRef) -> Outcome<Vec<Column>> {
+            self.columns.clone()
+        }
+
+        async fn table_rows(
+            &self,
+            _table: &TableRef,
+            _page: Page,
+            _where_clause: &str,
+            _order: &[SortKey],
+        ) -> Outcome<ResultSet> {
+            Ok(ResultSet::default())
+        }
+
+        async fn row_count(&self, _table: &TableRef, _where_clause: &str) -> Outcome<i64> {
+            self.row_count.clone()
+        }
+
+        async fn apply_changes(&self, _table: &TableRef, _batch: &RowBatch) -> Outcome<u64> {
+            Ok(0)
+        }
+
+        async fn execute(&self, sql: &str) -> Outcome<QueryResult> {
+            Ok(QueryResult {
+                statement: sql.to_string(),
+                outcome: QueryOutcome::Affected(0),
+                stats: QueryStats {
+                    elapsed: std::time::Duration::ZERO,
+                },
+            })
+        }
+
+        async fn close(&self) {}
+    }
+
+    fn open(driver: StubDriver) -> Outcome<TableContents> {
+        let runtime = DbRuntime::new().expect("runtime");
+        let task = open_table(
+            &runtime,
+            Arc::new(driver),
+            TableRef::new("main", "widgets"),
+            Page::first(),
+            String::new(),
+            None,
+        );
+        wait_for(task).expect("the task was dropped")
+    }
+
+    /// Wait for a [`Task`] on the test thread: the work itself already runs on
+    /// the runtime's own threads, so this only has to watch for the answer.
+    fn wait_for<T>(mut task: Task<T>) -> Option<T> {
+        loop {
+            let mut cx = Context::from_waker(Waker::noop());
+            match Pin::new(&mut task).poll(&mut cx) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_whose_columns_will_not_read_fails_rather_than_opening_keyless() {
+        let error = DriverError::Catalog("permission denied for schema main".into());
+        let opened = open(StubDriver {
+            columns: Err(error.clone()),
+            ..StubDriver::healthy()
+        });
+        // Defaulting the columns away would open the table unordered and
+        // uneditable, with nothing on screen to say why.
+        assert_eq!(opened.err(), Some(error));
+    }
+
+    #[test]
+    fn a_count_that_will_not_read_still_opens_the_page_it_counts() {
+        let opened = open(StubDriver {
+            row_count: Err(DriverError::Catalog("count timed out".into())),
+            ..StubDriver::healthy()
+        })
+        .expect("the page itself read");
+        assert_eq!(opened.total_rows, None);
+        assert!(opened.is_ordered(), "the key read, so the page is ordered");
+    }
+
+    #[test]
+    fn a_healthy_read_carries_the_count_and_the_columns() {
+        let opened = open(StubDriver::healthy()).expect("read");
+        assert_eq!(opened.total_rows, Some(7));
+        assert_eq!(opened.columns.len(), 1);
+    }
 }

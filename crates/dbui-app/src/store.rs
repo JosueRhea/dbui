@@ -21,6 +21,14 @@ pub enum StoreError {
     Write { path: PathBuf, message: String },
     #[error("{path} is not valid connection JSON: {message}")]
     Parse { path: PathBuf, message: String },
+    #[error("The keychain refused the password: {message}")]
+    Keychain { message: String },
+}
+
+fn keychain_error(error: keyring::Error) -> StoreError {
+    StoreError::Keychain {
+        message: error.to_string(),
+    }
 }
 
 /// Environment variable pointing dbui at a different configuration directory.
@@ -151,14 +159,27 @@ pub fn save_prefs(path: &Path, prefs: &Prefs) -> Result<(), StoreError> {
     })
 }
 
+/// Saved connections, and the reason any of their passwords are missing.
+///
+/// A keychain that will not answer is worth saying out loud -- the connection
+/// will fail to authenticate later, and "wrong password" is a poor explanation
+/// for a password that was never read -- but it is no reason to hide hosts and
+/// usernames that read perfectly well.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Loaded {
+    pub configs: Vec<ConnectionConfig>,
+    /// Set when at least one password could not be read from the keychain.
+    pub password_error: Option<String>,
+}
+
 /// Read saved connections, treating "no file yet" as "no connections yet".
 ///
 /// Passwords are pulled from the OS keychain when present. A first launch has
 /// no file, and that is not a failure worth showing anyone.
-pub fn load(path: &Path) -> Result<Vec<ConnectionConfig>, StoreError> {
+pub fn load(path: &Path) -> Result<Loaded, StoreError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::default()),
         Err(error) => {
             return Err(StoreError::Read {
                 path: path.to_path_buf(),
@@ -173,18 +194,30 @@ pub fn load(path: &Path) -> Result<Vec<ConnectionConfig>, StoreError> {
             message: error.to_string(),
         })?;
 
+    let mut password_error = None;
     for config in &mut configs {
         ConnectionId::observe(config.id);
-        config.password = load_password(config.id).unwrap_or_default();
+        match load_password(config.id) {
+            Ok(password) => config.password = password,
+            Err(error) => {
+                config.password.clear();
+                password_error.get_or_insert_with(|| error.to_string());
+            }
+        }
     }
 
-    Ok(configs)
+    Ok(Loaded {
+        configs,
+        password_error,
+    })
 }
 
 /// Write saved connections, creating the directory if it is missing.
 ///
 /// Each config's password is synced to the keychain; empty passwords remove
-/// any existing secret for that id.
+/// any existing secret for that id. A keychain that refuses is an error even
+/// though the JSON landed: the connections are saved, but a password the user
+/// just typed is not, and they will be asked for it again.
 pub fn save(path: &Path, configs: &[ConnectionConfig]) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| StoreError::Write {
@@ -203,19 +236,29 @@ pub fn save(path: &Path, configs: &[ConnectionConfig]) -> Result<(), StoreError>
         message: error.to_string(),
     })?;
 
+    // Every password is attempted before the first failure is reported: the
+    // JSON is already on disk, so stopping early would leave the keychain
+    // agreeing with neither the old file nor the new one.
+    let mut refused = None;
     for config in configs {
-        let _ = store_password(config.id, &config.password);
+        if let Err(error) = store_password(config.id, &config.password) {
+            refused.get_or_insert(error);
+        }
     }
 
-    Ok(())
+    match refused {
+        Some(error) => Err(keychain_error(error)),
+        None => Ok(()),
+    }
 }
 
 /// Drop the keychain secret for a connection that is being deleted.
-pub fn delete_password(id: ConnectionId) {
-    let Ok(entry) = password_entry(id) else {
-        return;
-    };
-    let _ = entry.delete_credential();
+pub fn delete_password(id: ConnectionId) -> Result<(), StoreError> {
+    let entry = password_entry(id).map_err(keychain_error)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(keychain_error(error)),
+    }
 }
 
 fn password_entry(id: ConnectionId) -> keyring::Result<Entry> {
@@ -257,7 +300,7 @@ mod tests {
     #[test]
     fn a_missing_file_reads_as_no_connections() {
         let path = temp_path("missing");
-        assert_eq!(load(&path).unwrap(), Vec::new());
+        assert_eq!(load(&path).unwrap(), Loaded::default());
     }
 
     #[test]
@@ -271,21 +314,23 @@ mod tests {
 
         // Keychain may be unavailable in some CI sandboxes; still verify JSON.
         let keychain_ok = store_password(id, &config.password).is_ok();
-        save(&path, std::slice::from_ref(&config)).unwrap();
+        let saved = save(&path, std::slice::from_ref(&config));
+        assert_eq!(saved.is_ok(), keychain_ok, "the keychain is reported");
 
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("hunter2"), "passwords must not reach disk");
 
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name, "Staging");
-        assert_eq!(loaded[0].host, "db.internal");
-        assert_eq!(loaded[0].id, id);
+        assert_eq!(loaded.configs.len(), 1);
+        assert_eq!(loaded.configs[0].name, "Staging");
+        assert_eq!(loaded.configs[0].host, "db.internal");
+        assert_eq!(loaded.configs[0].id, id);
         if keychain_ok {
-            assert_eq!(loaded[0].password, "hunter2");
+            assert_eq!(loaded.configs[0].password, "hunter2");
+            assert_eq!(loaded.password_error, None);
+            delete_password(id).unwrap();
         }
 
-        delete_password(id);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -296,8 +341,29 @@ mod tests {
             return;
         }
         assert_eq!(load_password(id).unwrap(), "secret");
-        delete_password(id);
+        delete_password(id).unwrap();
         assert_eq!(load_password(id).unwrap(), "");
+    }
+
+    #[test]
+    fn a_connection_still_loads_when_its_password_does_not() {
+        let path = temp_path("keychainless");
+        let mut config = ConnectionConfig::new(Driver::Postgres);
+        config.name = "Staging".into();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&[&config]).unwrap()).unwrap();
+
+        // No secret was ever stored for this id, so a working keychain answers
+        // "no entry" -- an empty password and nothing to report. A keychain
+        // that is not there at all fails instead, and *that* is reported: the
+        // connection is still listed, but the password behind it is not.
+        let readable = load_password(config.id).is_ok();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.configs.len(), 1, "the connection is still listed");
+        assert_eq!(loaded.configs[0].password, "");
+        assert_eq!(loaded.password_error.is_none(), readable);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
