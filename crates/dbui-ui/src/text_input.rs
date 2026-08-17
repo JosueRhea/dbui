@@ -13,6 +13,51 @@ use gpui::{div, point, px, App, Bounds, ClipboardItem, Keystroke, Pixels, Point,
 
 const UNDO_LIMIT: usize = 100;
 
+/// Put caps lock back into a keystroke's typed character.
+///
+/// GPUI asks the keyboard layout what a key produces while passing it only
+/// shift and option -- never the alpha-lock bit -- so with caps lock on macOS
+/// hands us `a` for a key the rest of the system reads as `A`. Every field
+/// here types `keystroke.key_char`, so every field types lowercase until this
+/// runs. `keystroke.key` is left alone on purpose: it is what shortcuts match
+/// on, and ⌘S has to keep working with caps lock down.
+///
+/// Uppercase is the whole rule. Asking the layout itself -- `UCKeyTranslate`
+/// over every key of `com.apple.keylayout.ABC` -- says caps lock changes
+/// exactly the 26 letters and nothing else: a digit stays a digit, `⇧1` stays
+/// `!`, and `⇧`+caps stays *upper*case rather than inverting the way it does
+/// on Windows. So shift needs no special case here; GPUI has already applied
+/// it, and uppercasing an `A` again changes nothing.
+///
+/// Returns `None` when nothing needed changing, so the common keystroke does
+/// not clone.
+pub(crate) fn with_capslock(keystroke: &Keystroke, capslock: bool) -> Option<Keystroke> {
+    if !capslock {
+        return None;
+    }
+    let typed = keystroke.key_char.as_deref()?;
+    let raised: String = typed.chars().map(upper).collect();
+    if raised == typed {
+        return None;
+    }
+    let mut fixed = keystroke.clone();
+    fixed.key_char = Some(raised);
+    Some(fixed)
+}
+
+/// One character in, one character out.
+///
+/// A key press is one character, so a mapping that grows -- German `ß`
+/// uppercasing to `SS` -- is not something a keyboard does, and the layout is
+/// the authority on those anyway. Leave those alone rather than invent them.
+fn upper(c: char) -> char {
+    let mut mapped = c.to_uppercase();
+    match (mapped.next(), mapped.next()) {
+        (Some(only), None) => only,
+        _ => c,
+    }
+}
+
 #[derive(Clone)]
 struct Snapshot {
     value: String,
@@ -1323,5 +1368,52 @@ mod tests {
         assert_eq!(selection_on_line(&(0..10), &line), Some(0..3));
         assert_eq!(selection_on_line(&(5..6), &line), Some(1..2));
         assert_eq!(selection_on_line(&(0..4), &line), None);
+    }
+
+    fn typed(keystroke: &Keystroke, capslock: bool) -> Option<String> {
+        with_capslock(keystroke, capslock).and_then(|fixed| fixed.key_char)
+    }
+
+    #[test]
+    fn capslock_uppercases_only_when_it_is_on() {
+        assert_eq!(typed(&key_char('a'), false), None);
+        assert_eq!(typed(&key_char('a'), true).as_deref(), Some("A"));
+    }
+
+    /// Shift does *not* invert caps lock on macOS -- both down is still
+    /// uppercase, which is where this differs from Windows. Checked against
+    /// `UCKeyTranslate`, not from memory.
+    #[test]
+    fn shift_and_capslock_are_still_uppercase() {
+        let mut shifted = key_char('A');
+        shifted.modifiers.shift = true;
+        // Already uppercase, so there is nothing to change.
+        assert_eq!(typed(&shifted, true), None);
+    }
+
+    /// `None` means "nothing changed", which is what keeps the common
+    /// keystroke from cloning.
+    #[test]
+    fn capslock_leaves_caseless_keys_untouched() {
+        assert_eq!(typed(&key_char('7'), true), None);
+        assert_eq!(typed(&key_char('-'), true), None);
+        assert_eq!(typed(&key("backspace"), true), None, "no key_char at all");
+    }
+
+    /// `ß` uppercases to two characters, which no key press does. The layout
+    /// decides what that key types; we do not get to invent `SS`.
+    #[test]
+    fn capslock_does_not_grow_a_character() {
+        assert_eq!(typed(&key_char('ß'), true), None);
+        assert_eq!(typed(&key_char('ö'), true).as_deref(), Some("Ö"));
+    }
+
+    /// Only the typed character moves. `key` is what a binding matches on, and
+    /// rewriting it would break ⌘S with caps lock down.
+    #[test]
+    fn capslock_leaves_the_binding_key_alone() {
+        let fixed = with_capslock(&key_char('s'), true).expect("the character changed");
+        assert_eq!(fixed.key, "s");
+        assert_eq!(fixed.key_char.as_deref(), Some("S"));
     }
 }

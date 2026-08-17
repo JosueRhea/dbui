@@ -4180,3 +4180,127 @@ fn restoring_an_empty_session_changes_nothing(cx: &mut TestAppContext) {
         assert_eq!(view.workspace.open_count(), 1);
     });
 }
+
+// -- caps lock ------------------------------------------------------------
+//
+// macOS never sets the alpha-lock bit on the character it hands GPUI, so
+// every field in the app typed lowercase with caps lock on. The fix lives in
+// one place -- `on_key`, which every keystroke passes through -- and these
+// pin it there and at the surfaces a person would notice it on.
+
+/// The connection sheet: the field that holds focus when it opens.
+#[gpui::test]
+fn caps_lock_types_capitals_into_a_form_field(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    cx.simulate_keystrokes("cmd-n");
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes("p r o d");
+
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().expect("sheet open").to_config();
+        assert_eq!(config.name, "PROD");
+    });
+}
+
+/// Shift does not invert caps lock on macOS the way it does on Windows: both
+/// down is still uppercase. The keyboard layout is the authority on that, and
+/// it was asked directly rather than guessed at.
+#[gpui::test]
+fn shift_and_caps_lock_are_still_uppercase(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    cx.simulate_keystrokes("cmd-n");
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes("shift-p shift-r shift-o shift-d");
+
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().expect("sheet open").to_config();
+        assert_eq!(config.name, "PROD");
+    });
+}
+
+/// The SQL editor.
+#[gpui::test]
+fn caps_lock_types_capitals_into_the_sql_editor(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    cx.simulate_keystrokes("cmd-e");
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes("s e l space 1");
+
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "SEL 1");
+    });
+}
+
+/// The cell editor, which writes straight into a row.
+#[gpui::test]
+fn caps_lock_types_capitals_into_a_cell(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| view.begin_cell_edit(0, 1, cx));
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes("a b c");
+
+    view.update(cx, |view, _| assert_eq!(view.cell_editor.text(), "ABC"));
+}
+
+/// The schema filter, which is the one box a person is most likely to be
+/// typing in with caps lock already down.
+#[gpui::test]
+fn caps_lock_types_capitals_into_the_tree_filter(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    cx.simulate_keystrokes("cmd-shift-f");
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes("u s r");
+
+    view.update(cx, |view, _| assert_eq!(view.sidebar_filter.text(), "USR"));
+}
+
+/// Caps lock must not reach the shortcuts: `key` is what a binding matches on,
+/// and ⌘N has to open the sheet with caps lock down like it does without.
+#[gpui::test]
+fn caps_lock_leaves_shortcuts_alone(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes("cmd-n");
+
+    view.update(cx, |view, _| assert!(view.modal.is_some()));
+}
+
+/// And it must not reach anything without a case. A digit is a digit.
+#[gpui::test]
+fn caps_lock_leaves_digits_and_punctuation_alone(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    cx.simulate_keystrokes("cmd-e");
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes(&typing("1-2.3_4"));
+
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "1-2.3_4");
+    });
+}
+
+/// Releasing caps lock puts it back: the state is read per keystroke, not
+/// latched at the time a field opened.
+#[gpui::test]
+fn releasing_caps_lock_types_lowercase_again(cx: &mut TestAppContext) {
+    let (view, cx) = open_with(cx, saved_connections(1));
+
+    cx.simulate_keystrokes("cmd-e");
+    cx.simulate_capslock_change(true);
+    cx.simulate_keystrokes("o n");
+    cx.simulate_capslock_change(false);
+    cx.simulate_keystrokes("o f f");
+
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "ONoff");
+    });
+}

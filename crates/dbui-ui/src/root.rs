@@ -3327,10 +3327,14 @@ impl DbUi {
     pub(crate) fn on_key(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let keystroke = &event.keystroke;
+        // Every keystroke in the app arrives here, which makes this the one
+        // place caps lock has to be put back into the typed character. See
+        // [`crate::text_input::with_capslock`] for why it is missing.
+        let capslocked = crate::text_input::with_capslock(&event.keystroke, window.capslock().on);
+        let keystroke = capslocked.as_ref().unwrap_or(&event.keystroke);
         let key = keystroke.key.as_str();
         let command = keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
