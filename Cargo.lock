@@ -1470,14 +1470,14 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "dbui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dbui-ui",
 ]
 
 [[package]]
 name = "dbui-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dbui-domain",
  "dbui-driver",
@@ -1494,14 +1494,14 @@ dependencies = [
 
 [[package]]
 name = "dbui-domain"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "dbui-driver"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "dbui-domain",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "dbui-ui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cocoa 0.26.0",
  "dbui-app",
