@@ -504,6 +504,14 @@ fn hit_canvas(
         |_bounds, _, _, _| {},
     )
     .absolute()
+    // Pinned, not left to the static position. A single-line field is a
+    // *block* container -- `div()` is `Display::Block` until something calls
+    // `.flex()`, and only the multiline one does -- so an absolute child with
+    // `auto` insets lands under the sibling it follows, measuring the field a
+    // whole line lower than it is. Only `x` is read back for a single-line
+    // field, which is why nothing looked wrong.
+    .top_0()
+    .left_0()
     .size_full()
 }
 

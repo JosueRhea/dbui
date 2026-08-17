@@ -215,6 +215,30 @@ impl DbUi {
                                                 this.finish_cell_edit(cx);
                                             },
                                         ))
+                                        // A press *inside* is the field's own:
+                                        // placing a caret, double-clicking a
+                                        // word, starting a drag-selection. The
+                                        // field has already handled it by the
+                                        // time this runs -- children go first
+                                        // -- and stopping here is what keeps it
+                                        // from also reaching the row, which
+                                        // reads a press carrying no column as
+                                        // "the user moved on" and commits.
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        // Same for the right button, which
+                                        // would otherwise open the row menu --
+                                        // and that closes the editor too.
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                            }),
+                                        )
                                         .into_any_element();
                                 }
 

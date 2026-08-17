@@ -4304,3 +4304,170 @@ fn releasing_caps_lock_types_lowercase_again(cx: &mut TestAppContext) {
         assert_eq!(sql_editor_text(view), "ONoff");
     });
 }
+
+/// Clicking *inside* the open editor is not clicking away from it.
+///
+/// The press has to reach the field -- that is how a caret is placed, a word
+/// double-clicked, a range dragged -- without also reaching the row under it,
+/// which reads a press with no column as "the user moved on" and commits.
+#[gpui::test]
+fn clicking_inside_the_open_cell_editor_keeps_it_open(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("abcdef");
+    });
+    cx.run_until_parked();
+
+    // The field records where it was painted, so this is a press on the real
+    // editor rather than a guess at where the grid put it.
+    let inside = view
+        .update(cx, |view, _| view.cell_editor.hit_bounds_slot().get())
+        .expect("the editor was painted")
+        .center();
+    cx.simulate_click(inside, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.editing_cell,
+            Some((1, 1)),
+            "the editor stayed open under the pointer"
+        );
+        assert_eq!(view.cell_editor.text(), "abcdef", "and kept what was typed");
+    });
+}
+
+/// The editor's own painted bounds, for tests that press inside it.
+fn cell_editor_bounds(
+    view: &Entity<DbUi>,
+    cx: &mut VisualTestContext,
+) -> gpui::Bounds<gpui::Pixels> {
+    view.update(cx, |view, _| view.cell_editor.hit_bounds_slot().get())
+        .expect("the editor was painted")
+}
+
+/// And the press has to actually land in the text: clicking near the start of
+/// the value puts the caret there, rather than leaving it wherever it was.
+#[gpui::test]
+fn clicking_in_the_open_cell_editor_moves_the_caret(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("abcdef");
+        view.cell_editor.move_to(6);
+    });
+    cx.run_until_parked();
+
+    let bounds = cell_editor_bounds(&view, cx);
+    cx.simulate_click(
+        gpui::point(bounds.left() + gpui::px(1.), bounds.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.editing_cell, Some((1, 1)), "still open");
+        // The caret went where it was put.
+        assert_eq!(view.cell_editor.cursor(), 0);
+    });
+}
+
+/// Double-clicking a word selects it. The grid reads a second click on a cell
+/// as "open the editor"; the cell already being open is what makes this the
+/// field's press rather than the grid's.
+#[gpui::test]
+fn double_clicking_in_the_open_cell_editor_selects_a_word(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("alpha beta");
+    });
+    cx.run_until_parked();
+
+    let bounds = cell_editor_bounds(&view, cx);
+    let inside = gpui::point(bounds.left() + gpui::px(2.), bounds.center().y);
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: inside,
+        modifiers: gpui::Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.editing_cell, Some((1, 1)), "still open");
+        // The word under the pointer, not the whole value.
+        assert_eq!(view.cell_editor.selection(), 0..5);
+    });
+}
+
+/// Dragging out a selection inside the field is a text drag, not a row drag.
+/// The rows underneath must not follow the pointer.
+#[gpui::test]
+fn dragging_inside_the_open_cell_editor_leaves_the_rows_alone(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("abcdef");
+    });
+    cx.run_until_parked();
+    let before = view.update(cx, |view, _| selected_rows(view));
+
+    let bounds = cell_editor_bounds(&view, cx);
+    cx.simulate_mouse_down(
+        gpui::point(bounds.left() + gpui::px(1.), bounds.center().y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    // Down the grid, across the rows under the field.
+    let below = bounds.bottom() + gpui::px(60.);
+    let away = gpui::point(bounds.right() - gpui::px(1.), below);
+    cx.simulate_mouse_move(away, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_up(away, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.editing_cell, Some((1, 1)), "still open");
+        // The row selection did not follow the pointer.
+        assert_eq!(selected_rows(view), before);
+    });
+}
+
+/// Right-clicking inside it is the field's too: the row menu would close the
+/// editor out from under a person reaching for Copy.
+#[gpui::test]
+fn right_clicking_inside_the_open_cell_editor_opens_no_row_menu(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("abcdef");
+    });
+    cx.run_until_parked();
+
+    let bounds = cell_editor_bounds(&view, cx);
+    cx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Right,
+        position: bounds.center(),
+        modifiers: gpui::Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert!(view.context_menu.is_none(), "no row menu over the editor");
+        assert_eq!(view.editing_cell, Some((1, 1)), "and it stayed open");
+    });
+}
