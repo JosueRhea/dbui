@@ -30,10 +30,15 @@ impl MySqlDriver {
             .host(&config.host)
             .port(config.port)
             .username(&config.username)
+            // `Required` only insists on encryption; it accepts any
+            // certificate, which a man in the middle is happy to supply.
+            // `VerifyIdentity` is the one that checks the chain and the
+            // hostname, and is what the UI's "Verified" has to mean.
             .ssl_mode(match config.tls {
                 TlsMode::Disable => MySqlSslMode::Disabled,
                 TlsMode::Prefer => MySqlSslMode::Preferred,
-                TlsMode::Require => MySqlSslMode::Required,
+                TlsMode::Encrypt => MySqlSslMode::Required,
+                TlsMode::Require => MySqlSslMode::VerifyIdentity,
             });
 
         if !config.password.is_empty() {

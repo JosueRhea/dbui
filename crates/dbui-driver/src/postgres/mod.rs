@@ -30,10 +30,15 @@ impl PostgresDriver {
             .host(&config.host)
             .port(config.port)
             .username(&config.username)
+            // `Require` is Postgres' "encrypt, but believe any certificate":
+            // it stops a listener and not a man in the middle. The mode called
+            // "Verified" in the UI therefore has to be `VerifyFull`, which is
+            // the only one that checks the chain and the hostname.
             .ssl_mode(match config.tls {
                 TlsMode::Disable => PgSslMode::Disable,
                 TlsMode::Prefer => PgSslMode::Prefer,
-                TlsMode::Require => PgSslMode::Require,
+                TlsMode::Encrypt => PgSslMode::Require,
+                TlsMode::Require => PgSslMode::VerifyFull,
             });
 
         if !config.password.is_empty() {
