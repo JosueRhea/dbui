@@ -270,6 +270,74 @@ pub struct StatementResult {
     pub summary: String,
 }
 
+/// A run that stopped on an error, kept on the tab that ran it.
+///
+/// The status bar is one line, and the next thing to happen overwrites it --
+/// sorting a column, clicking a cell, a background tab finishing its load. An
+/// engine's complaint is usually the longest and least disposable thing the
+/// app has to say, so it is kept here instead: it survives the footer moving
+/// on, and it survives switching to another tab and back.
+#[derive(Clone)]
+pub struct StatementError {
+    /// The statement as sent, so the message has something to point at.
+    pub sql: String,
+    pub message: String,
+    /// The engine's SQLSTATE, when it gave one.
+    pub code: Option<String>,
+    /// Statements of the same run that succeeded before this one.
+    pub succeeded: usize,
+    /// Statements the run never reached, because this one stopped it.
+    pub skipped: usize,
+}
+
+impl StatementError {
+    /// The one-line version, for the status bar.
+    pub fn headline(&self) -> String {
+        match &self.code {
+            Some(code) => format!("{code}: {}", self.message),
+            None => self.message.clone(),
+        }
+    }
+
+    /// What the run got through, when it was more than one statement.
+    pub fn progress(&self) -> Option<String> {
+        if self.succeeded == 0 && self.skipped == 0 {
+            return None;
+        }
+        let ran = match self.succeeded {
+            0 => None,
+            1 => Some("1 statement ran before this one".to_string()),
+            n => Some(format!("{n} statements ran before this one")),
+        };
+        let left = match self.skipped {
+            0 => None,
+            1 => Some("1 was not attempted".to_string()),
+            n => Some(format!("{n} were not attempted")),
+        };
+        match (ran, left) {
+            (Some(ran), Some(left)) => Some(format!("{ran} · {left}")),
+            (Some(ran), None) => Some(ran),
+            (None, Some(left)) => Some(format!("It was the first to run · {left}")),
+            (None, None) => None,
+        }
+    }
+
+    /// Everything worth putting on the clipboard.
+    pub fn to_clipboard(&self) -> String {
+        let mut text = String::new();
+        if let Some(code) = &self.code {
+            text.push_str(code);
+            text.push_str(": ");
+        }
+        text.push_str(&self.message);
+        if !self.sql.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(self.sql.trim());
+        }
+        text
+    }
+}
+
 impl StatementResult {
     /// A short label for the strip: `1 SELECT`, `2 UPDATE`, …
     pub fn label(&self, index: usize) -> String {
@@ -718,6 +786,8 @@ pub enum WorkspaceTab {
         pane: TablePane,
         filters_open: bool,
         columns_open: bool,
+        /// Why the last load failed, if it did.
+        error: Option<StatementError>,
     },
     Sql {
         id: TabId,
@@ -735,6 +805,10 @@ pub enum WorkspaceTab {
         selection: RowSelection,
         /// Editable detail editors for the selected result row.
         draft: Option<RowDraft>,
+        /// Why the last run failed, if it did. Cleared when the next one
+        /// starts, and not before: an error the user has not read yet is not
+        /// an error that has been dealt with.
+        error: Option<StatementError>,
     },
 }
 
@@ -764,6 +838,7 @@ impl WorkspaceTab {
             pane: TablePane::Data,
             filters_open: false,
             columns_open: false,
+            error: None,
         }
     }
 
@@ -778,6 +853,7 @@ impl WorkspaceTab {
             selected_row: None,
             selection: RowSelection::default(),
             draft: None,
+            error: None,
         }
     }
 
@@ -823,6 +899,19 @@ impl WorkspaceTab {
     pub fn result(&self) -> Option<&ResultView> {
         match self {
             Self::Table { result, .. } | Self::Sql { result, .. } => result.as_ref(),
+        }
+    }
+
+    /// Why the last run or load on this tab failed, if it did.
+    pub fn error(&self) -> Option<&StatementError> {
+        match self {
+            Self::Table { error, .. } | Self::Sql { error, .. } => error.as_ref(),
+        }
+    }
+
+    pub(crate) fn set_error(&mut self, failure: Option<StatementError>) {
+        match self {
+            Self::Table { error, .. } | Self::Sql { error, .. } => *error = failure,
         }
     }
 
@@ -1130,6 +1219,7 @@ impl Tabs {
                     selected_row,
                     selection,
                     draft,
+                    error,
                     ..
                 }
                 | WorkspaceTab::Sql {
@@ -1137,12 +1227,14 @@ impl Tabs {
                     selected_row,
                     selection,
                     draft,
+                    error,
                     ..
                 } => {
                     *result = None;
                     *selected_row = None;
                     selection.clear();
                     *draft = None;
+                    *error = None;
                 }
             }
         }

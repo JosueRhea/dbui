@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod connection;
 pub mod query;
 pub mod sql_split;
+pub mod statement;
 pub mod value;
 
 pub use catalog::{Catalog, Column, ForeignKey, Schema, Table, TableKind, TableRef};
@@ -21,4 +22,5 @@ pub use query::{
     order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, SortKey,
 };
 pub use sql_split::{split_statements, statement_at};
+pub use statement::StatementInfo;
 pub use value::{Value, ValueKind};

@@ -55,6 +55,25 @@ impl DriverError {
             code: None,
         }
     }
+
+    /// The statement this is about, when it is about one.
+    ///
+    /// A batch that fails halfway needs to be able to say *which* statement
+    /// failed, and the engine is the only thing that knows for certain.
+    pub fn statement(&self) -> Option<&str> {
+        match self {
+            DriverError::Query { statement, .. } => Some(statement),
+            _ => None,
+        }
+    }
+
+    /// The engine's SQLSTATE, when it gave one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            DriverError::Query { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Unwrap a `sqlx::Error` down to the sentence worth showing.

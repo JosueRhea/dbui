@@ -80,20 +80,43 @@ impl QueryResult {
         }
     }
 
-    /// The one-line verdict for the status bar.
-    pub fn summary(&self) -> String {
-        let ms = self.stats.elapsed.as_secs_f64() * 1000.0;
+    /// What the statement did, with no timing attached.
+    ///
+    /// `CREATE TABLE` and friends get their own verdict rather than the row
+    /// count the engine reports for them, which is always zero: a DDL
+    /// statement that says "0 rows affected" reads as a statement that did
+    /// nothing, and that is the whole of the feedback it used to give.
+    pub fn verdict(&self) -> String {
         match &self.outcome {
             QueryOutcome::Rows(set) => {
                 let plural = if set.rows.len() == 1 { "row" } else { "rows" };
                 let truncated = if set.truncated { "+" } else { "" };
-                format!("{}{} {} in {:.0} ms", set.rows.len(), truncated, plural, ms)
+                format!("{}{truncated} {plural}", set.rows.len())
             }
             QueryOutcome::Affected(n) => {
-                let plural = if *n == 1 { "row" } else { "rows" };
-                format!("{n} {plural} affected in {ms:.0} ms")
+                let info = crate::statement::describe(&self.statement);
+                // A count the engine put a number on is a fact about the data.
+                // Zero from a statement that never writes rows is not a small
+                // number -- it is the absence of one, and reading it as
+                // "0 rows affected" is what made `CREATE TABLE` look like a
+                // statement that had done nothing.
+                if *n > 0 || info.affects_rows || info.verb.is_empty() {
+                    let plural = if *n == 1 { "row" } else { "rows" };
+                    format!("{n} {plural} affected")
+                } else {
+                    match &info.object {
+                        Some(object) => format!("{} {object} · OK", info.verb),
+                        None => format!("{} · OK", info.verb),
+                    }
+                }
             }
         }
+    }
+
+    /// The one-line verdict for the status bar.
+    pub fn summary(&self) -> String {
+        let ms = self.stats.elapsed.as_secs_f64() * 1000.0;
+        format!("{} in {ms:.0} ms", self.verdict())
     }
 }
 
@@ -287,6 +310,54 @@ mod tests {
             },
         };
         assert_eq!(result.summary(), "1 row affected in 12 ms");
+    }
+
+    fn affected(statement: &str, rows: u64) -> String {
+        QueryResult {
+            statement: statement.into(),
+            outcome: QueryOutcome::Affected(rows),
+            stats: QueryStats {
+                elapsed: Duration::from_millis(3),
+            },
+        }
+        .verdict()
+    }
+
+    /// The bug this fixes: every engine reports `CREATE TABLE` as zero rows
+    /// affected, and "0 rows affected" is what a statement that did nothing
+    /// says.
+    #[test]
+    fn ddl_gets_a_verdict_rather_than_a_row_count() {
+        assert_eq!(
+            affected("CREATE TABLE notes (id int)", 0),
+            "CREATE TABLE notes · OK"
+        );
+        assert_eq!(affected("DROP VIEW IF EXISTS v", 0), "DROP VIEW v · OK");
+        assert_eq!(
+            affected("ALTER TABLE public.orders ADD COLUMN paid bool", 0),
+            "ALTER TABLE public.orders · OK"
+        );
+        assert_eq!(affected("TRUNCATE TABLE t", 0), "TRUNCATE TABLE t · OK");
+    }
+
+    /// A write's row count still is the verdict, zero included: a `DELETE`
+    /// that matched nothing is exactly what the user needs to be told.
+    #[test]
+    fn a_write_still_reports_its_row_count() {
+        assert_eq!(affected("DELETE FROM t WHERE a = 1", 0), "0 rows affected");
+        assert_eq!(affected("UPDATE t SET a = 1", 1), "1 row affected");
+        assert_eq!(
+            affected("INSERT INTO t VALUES (1), (2)", 2),
+            "2 rows affected"
+        );
+    }
+
+    /// And a number the engine went to the trouble of reporting is kept,
+    /// whatever this crate thinks the statement was.
+    #[test]
+    fn a_reported_count_is_never_thrown_away() {
+        assert_eq!(affected("CALL rebuild()", 7), "7 rows affected");
+        assert_eq!(affected("", 0), "0 rows affected");
     }
 }
 

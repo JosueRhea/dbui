@@ -125,6 +125,7 @@ impl DbUi {
                 .flex_col()
                 .overflow_hidden()
                 .child(self.render_editor(cx))
+                .child(self.render_error_panel(cx))
                 .child(self.render_statement_strip(cx))
                 .child(self.render_grid(window, cx))
                 .into_any_element(),
@@ -137,10 +138,120 @@ impl DbUi {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
+                    .child(self.render_error_panel(cx))
                     .child(self.render_grid(window, cx))
                     .into_any_element(),
             },
         }
+    }
+
+    /// What the last run failed on, kept in front of the user.
+    ///
+    /// The status bar is one line and the next message owns it, so an engine's
+    /// complaint used to survive exactly until the next thing happened -- and
+    /// a Postgres error is rarely one line, and never one the user is done
+    /// with after one glance. This sits between the editor and the results,
+    /// stays until the next run or an explicit dismissal, and keeps the
+    /// statement it is about beside it.
+    fn render_error_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(error) = self.tabs.active().and_then(|tab| tab.error()).cloned() else {
+            return div().into_any_element();
+        };
+        let theme = &self.theme;
+
+        let dismiss = div()
+            .id("error-dismiss")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(metrics::scaled(20.))
+            .h(metrics::scaled(20.))
+            .flex_shrink_0()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .hover(|button| button.bg(theme.hover))
+            .on_click(cx.listener(|this, _, _window, cx| this.clear_tab_error(cx)))
+            .child("✕");
+
+        let copy = div()
+            .id("error-copy")
+            .flex()
+            .items_center()
+            .px_2()
+            .h(metrics::scaled(20.))
+            .flex_shrink_0()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .hover(|button| button.bg(theme.hover))
+            .on_click(cx.listener(|this, _, _window, cx| this.copy_tab_error(cx)))
+            .child("Copy");
+
+        let code = error.code.clone().map(|code| {
+            div()
+                .px_1p5()
+                .flex_shrink_0()
+                .rounded_md()
+                .bg(theme.elevated)
+                .border_1()
+                .border_color(theme.danger)
+                .font_family(metrics::MONO_FONT)
+                .text_size(metrics::text_size_small())
+                .text_color(theme.danger)
+                .child(SharedString::from(code))
+        });
+
+        // The statement is shown as sent, on one line: it is here to say
+        // *which* statement, not to be read again -- the editor above still
+        // has it in full.
+        let statement = one_line(&error.sql).map(|sql| {
+            div()
+                .w_full()
+                .overflow_hidden()
+                .font_family(metrics::MONO_FONT)
+                .text_size(metrics::text_size_small())
+                .text_color(theme.text_muted)
+                .child(SharedString::from(sql))
+        });
+
+        div()
+            .id("error-panel")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .flex_shrink_0()
+            .max_h(metrics::scaled(150.))
+            .overflow_y_scroll()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.danger)
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(div().flex_shrink_0().text_color(theme.danger).child("⚠"))
+                    .children(code)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_color(theme.danger)
+                            .child(SharedString::from(error.message.clone())),
+                    )
+                    .child(copy)
+                    .child(dismiss),
+            )
+            .children(statement)
+            .children(
+                error
+                    .progress()
+                    .map(|note| caption(note, theme).flex_shrink_0()),
+            )
+            .into_any_element()
     }
 
     /// One chip per statement of the last run.
@@ -609,4 +720,19 @@ fn render_completion_popup(
         .text_size(metrics::text_size_small())
         .children(rows)
         .into_any_element()
+}
+
+/// A statement squeezed onto one line, or `None` when there is nothing to
+/// show. Whitespace inside a multi-line statement collapses so the panel
+/// stays the same height whatever was run.
+fn one_line(sql: &str) -> Option<String> {
+    let flattened = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 200;
+    if flattened.chars().count() <= LIMIT {
+        return Some(flattened);
+    }
+    Some(flattened.chars().take(LIMIT).collect::<String>() + "…")
 }

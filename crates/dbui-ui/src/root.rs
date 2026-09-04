@@ -1137,6 +1137,21 @@ impl DbUi {
     }
 
     pub(crate) fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        self.reload_catalog(true, cx);
+    }
+
+    /// Re-read the catalog because a statement changed it, without saying so.
+    ///
+    /// The DDL's own verdict -- "CREATE TABLE users · OK" -- is what the user
+    /// is reading, and "Catalog refreshed" landing on top of it a moment later
+    /// is how that feedback went missing. A refresh nobody asked for keeps
+    /// quiet, failure included: the tree simply stays as it was, and ⌘R is
+    /// still there to be told about it.
+    pub(crate) fn refresh_catalog_quietly(&mut self, cx: &mut Context<Self>) {
+        self.reload_catalog(false, cx);
+    }
+
+    fn reload_catalog(&mut self, narrate: bool, cx: &mut Context<Self>) {
         let Some(driver) = self.workspace.active_driver() else {
             return;
         };
@@ -1144,7 +1159,9 @@ impl DbUi {
             return;
         };
 
-        self.status = Status::busy("Refreshing…");
+        if narrate {
+            self.status = Status::busy("Refreshing…");
+        }
         let task = commands::refresh_catalog(&self.runtime, driver);
         cx.spawn(async move |this, cx| {
             let landed = task.await;
@@ -1154,10 +1171,12 @@ impl DbUi {
                         if let Some(entry) = this.workspace.get_mut(id) {
                             entry.catalog = Some(catalog);
                         }
-                        this.status = Status::info("Catalog refreshed");
+                        if narrate {
+                            this.status = Status::info("Catalog refreshed");
+                        }
                     }
-                    Some(Err(error)) => this.status = Status::error(error.to_string()),
-                    None => {}
+                    Some(Err(error)) if narrate => this.status = Status::error(error.to_string()),
+                    _ => {}
                 }
                 cx.notify();
             })
@@ -1212,6 +1231,9 @@ impl DbUi {
         self.loads_in_flight = self.loads_in_flight.saturating_add(1);
         if self.tabs.active_id() == Some(tab_id) {
             self.status = Status::busy(format!("Loading {}…", table.qualified()));
+        }
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.set_error(None);
         }
 
         let task = commands::open_table(
@@ -1271,8 +1293,11 @@ impl DbUi {
                                 this.focus = Focus::Grid;
                             }
                         }
-                        Some(Err(error)) if is_current && is_active => {
-                            this.status = Status::error(error.to_string());
+                        // Kept on the tab, not just in the footer: a table
+                        // that failed to load behind a tab the user has since
+                        // moved away from still failed to load.
+                        Some(Err(error)) if is_current => {
+                            this.put_run_failure(tab_id, &error, &[], 0, is_active);
                         }
                         _ => {}
                     },
@@ -1612,33 +1637,84 @@ impl DbUi {
         self.selected_cell = None;
         self.loads_in_flight = self.loads_in_flight.saturating_add(1);
         self.status = Status::busy("Running…");
+        // The previous failure belonged to the previous run. It goes now, not
+        // when the new one lands, so a slow query does not leave a stale
+        // complaint sitting over it.
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.set_error(None);
+        }
 
-        let failed_sql = statements.clone();
+        let sent = statements.clone();
         let task = commands::run_queries(&self.runtime, driver, statements);
         cx.spawn(async move |this, cx| {
             let landed = task.await;
             this.update(cx, |this, cx| {
+                let mut catalog_is_stale = false;
                 this.finish_tab_load(
                     tab_id,
                     load_seq,
                     |this, is_current, is_active| match landed {
                         Some(Ok(batch)) if is_current => {
-                            this.absorb_batch_result(tab_id, batch, is_active);
+                            catalog_is_stale =
+                                this.absorb_batch_result(tab_id, batch, &sent, is_active);
                         }
-                        Some(Err(error)) if is_current && is_active => {
-                            if let Some(sql) = failed_sql.first() {
-                                this.record_history_failure(sql);
-                            }
-                            this.status = Status::error(error.to_string());
+                        // Nothing ran at all -- the pool went away, or the
+                        // driver refused before the first statement.
+                        Some(Err(error)) if is_current => {
+                            this.put_run_failure(tab_id, &error, &sent, 0, is_active);
                         }
                         _ => {}
                     },
                 );
+                if catalog_is_stale {
+                    this.refresh_catalog_quietly(cx);
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Record a failed run on the tab that ran it.
+    ///
+    /// The error goes on the tab whether or not that tab is in front. A run
+    /// whose error only reached the status bar of the active tab was a run
+    /// that failed silently the moment the user clicked somewhere else.
+    fn put_run_failure(
+        &mut self,
+        tab_id: crate::tabs::TabId,
+        error: &dbui_app::DriverError,
+        sent: &[String],
+        succeeded: usize,
+        is_active: bool,
+    ) {
+        // The engine names the statement it choked on; when it does not -- a
+        // dropped connection, say -- the batch got as far as `succeeded`, so
+        // the next one is the one that never finished.
+        let sql = error
+            .statement()
+            .map(str::to_string)
+            .or_else(|| sent.get(succeeded).cloned())
+            .unwrap_or_default();
+
+        if !sql.is_empty() {
+            self.record_history_failure(&sql);
+        }
+
+        let failure = crate::tabs::StatementError {
+            sql,
+            message: error.to_string(),
+            code: error.code().map(str::to_string),
+            succeeded,
+            skipped: sent.len().saturating_sub(succeeded + 1),
+        };
+        if is_active {
+            self.status = Status::error(failure.headline());
+        }
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.set_error(Some(failure));
+        }
     }
 
     /// Keep every statement's result, not just the last row-producing one.
@@ -1651,9 +1727,12 @@ impl DbUi {
         &mut self,
         tab_id: crate::tabs::TabId,
         batch: commands::BatchQueryResult,
+        sent: &[String],
         is_active: bool,
-    ) {
+    ) -> bool {
         let summary = batch.summary();
+        let catalog_is_stale = batch.changed_the_catalog();
+        let failure = batch.failure;
         let statements: Vec<crate::tabs::StatementResult> = batch
             .results
             .into_iter()
@@ -1701,16 +1780,29 @@ impl DbUi {
         }
         self.show_statement_result(tab_id, front);
 
-        if is_active {
-            self.status = if produced_rows && count == 1 {
-                Status::Idle
-            } else {
-                Status::info(summary)
-            };
-            if produced_rows {
-                self.focus = Focus::Grid;
+        // A batch that stopped early still has whatever ran before it on
+        // screen; the error says how far it got and what stopped it.
+        // The editor keeps the keyboard when a run failed: the next thing to
+        // do is fix the statement, not walk rows it did not return.
+        if let Some(error) = &failure {
+            self.put_run_failure(tab_id, error, sent, count, is_active);
+        } else {
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                tab.set_error(None);
+            }
+            if is_active {
+                self.status = if produced_rows && count == 1 {
+                    Status::Idle
+                } else {
+                    Status::info(summary)
+                };
+                if produced_rows {
+                    self.focus = Focus::Grid;
+                }
             }
         }
+
+        catalog_is_stale
     }
 
     #[cfg(test)]
@@ -1718,9 +1810,36 @@ impl DbUi {
         &mut self,
         tab_id: crate::tabs::TabId,
         batch: commands::BatchQueryResult,
+        sent: &[String],
         is_active: bool,
-    ) {
-        self.absorb_batch_result(tab_id, batch, is_active);
+    ) -> bool {
+        self.absorb_batch_result(tab_id, batch, sent, is_active)
+    }
+
+    /// Dismiss the error panel on the active tab.
+    pub(crate) fn clear_tab_error(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.set_error(None);
+        }
+        if matches!(self.status, Status::Error(_)) {
+            self.status = Status::Idle;
+        }
+        cx.notify();
+    }
+
+    /// Put a failed statement's error on the clipboard, message and all.
+    pub(crate) fn copy_tab_error(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.error())
+            .map(|error| error.to_clipboard())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = Status::info("Error copied");
+        cx.notify();
     }
 
     /// Put one statement's rows in the grid.

@@ -176,70 +176,87 @@ pub fn fetch_columns(
     })
 }
 
-/// Run several statements in order. Stops on the first error.
+/// Run several statements in order, stopping at the first that fails.
 ///
-/// The UI shows the last result that returned rows and a batch summary for the
-/// status bar.
+/// The failure is carried back *inside* the batch rather than as the whole
+/// call's `Err`. A run of five statements that fails on the third really did
+/// run the first two, and returning only the error threw their results away --
+/// which left the user looking at an empty grid and a one-line footer, with no
+/// way to tell how far the batch got.
 pub fn run_queries(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
     statements: Vec<String>,
 ) -> Task<Outcome<BatchQueryResult>> {
     runtime.spawn(async move {
-        let mut results = Vec::with_capacity(statements.len());
+        let attempted = statements.len();
+        let mut results = Vec::with_capacity(attempted);
         let mut last_rows: Option<QueryResult> = None;
         let mut total_elapsed = std::time::Duration::ZERO;
+        let mut failure = None;
 
         for sql in statements {
-            let result = driver.execute(&sql).await?;
-            total_elapsed += result.stats.elapsed;
-            if matches!(result.outcome, QueryOutcome::Rows(_)) {
-                last_rows = Some(result.clone());
+            match driver.execute(&sql).await {
+                Ok(result) => {
+                    total_elapsed += result.stats.elapsed;
+                    if matches!(result.outcome, QueryOutcome::Rows(_)) {
+                        last_rows = Some(result.clone());
+                    }
+                    results.push(result);
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             }
-            results.push(result);
         }
 
         Ok(BatchQueryResult {
             results,
             last_rows,
             total_elapsed,
+            failure,
+            attempted,
         })
     })
 }
 
-/// Outcome of running more than one statement.
+/// Outcome of running one or more statements.
 pub struct BatchQueryResult {
+    /// Every statement that ran, in order. Stops short of `attempted` when one
+    /// of them failed.
     pub results: Vec<QueryResult>,
     /// Last statement that produced a row set, if any.
     pub last_rows: Option<QueryResult>,
     pub total_elapsed: std::time::Duration,
+    /// Why the run stopped early, if it did.
+    pub failure: Option<DriverError>,
+    /// How many statements were sent, counting the one that failed.
+    pub attempted: usize,
 }
 
 impl BatchQueryResult {
     /// One-line status for a finished batch.
+    ///
+    /// A lone statement speaks for itself: "1 statement ·" in front of its own
+    /// verdict is a prefix that says nothing.
     pub fn summary(&self) -> String {
         let n = self.results.len();
         let ms = self.total_elapsed.as_secs_f64() * 1000.0;
         let stmt = if n == 1 { "statement" } else { "statements" };
-        if let Some(last) = self.results.last() {
-            match &last.outcome {
-                QueryOutcome::Rows(set) => {
-                    let plural = if set.rows.len() == 1 { "row" } else { "rows" };
-                    let truncated = if set.truncated { "+" } else { "" };
-                    format!(
-                        "{n} {stmt} · {}{} {plural} in {ms:.0} ms",
-                        set.rows.len(),
-                        truncated
-                    )
-                }
-                QueryOutcome::Affected(count) => {
-                    let plural = if *count == 1 { "row" } else { "rows" };
-                    format!("{n} {stmt} · {count} {plural} affected in {ms:.0} ms")
-                }
-            }
-        } else {
-            format!("{n} {stmt} in {ms:.0} ms")
+        match self.results.last() {
+            Some(last) if n == 1 => format!("{} in {ms:.0} ms", last.verdict()),
+            Some(last) => format!("{n} {stmt} · {} in {ms:.0} ms", last.verdict()),
+            None => format!("{n} {stmt} in {ms:.0} ms"),
         }
+    }
+
+    /// Whether any statement that *ran* changed the shape of the database, and
+    /// so left the schema tree describing something that is no longer there.
+    pub fn changed_the_catalog(&self) -> bool {
+        self.results
+            .iter()
+            .any(|result| dbui_domain::statement::describe(&result.statement).changes_catalog)
     }
 }
 

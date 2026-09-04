@@ -1894,12 +1894,60 @@ fn put_batch(view: &mut DbUi, statements: &[(&str, Option<usize>)], cx: &mut gpu
         .collect();
 
     let tab_id = view.tabs.active_id().expect("a tab");
+    let sent: Vec<String> = results.iter().map(|r| r.statement.clone()).collect();
     let batch = dbui_app::BatchQueryResult {
         last_rows: results.iter().find(|r| r.rows().is_some()).cloned(),
+        attempted: results.len(),
         results,
         total_elapsed: std::time::Duration::from_millis(3),
+        failure: None,
     };
-    view.absorb_batch_result_for_test(tab_id, batch, true);
+    view.absorb_batch_result_for_test(tab_id, batch, &sent, true);
+    cx.notify();
+}
+
+/// Put a batch that stopped on an error onto a SQL tab.
+///
+/// `ok` are the statements that ran; `failed` is the one that did not, and
+/// `skipped` are the ones the run never reached.
+fn put_failed_batch(
+    view: &mut DbUi,
+    ok: &[&str],
+    failed: (&str, &str, Option<&str>),
+    skipped: &[&str],
+    cx: &mut gpui::Context<DbUi>,
+) {
+    use dbui_app::domain::{QueryOutcome, QueryResult, QueryStats};
+
+    let (failed_sql, message, code) = failed;
+    let results: Vec<QueryResult> = ok
+        .iter()
+        .map(|sql| QueryResult {
+            statement: (*sql).to_string(),
+            outcome: QueryOutcome::Affected(1),
+            stats: QueryStats {
+                elapsed: std::time::Duration::from_millis(1),
+            },
+        })
+        .collect();
+
+    let mut sent: Vec<String> = ok.iter().map(|sql| (*sql).to_string()).collect();
+    sent.push(failed_sql.to_string());
+    sent.extend(skipped.iter().map(|sql| (*sql).to_string()));
+
+    let tab_id = view.tabs.active_id().expect("a tab");
+    let batch = dbui_app::BatchQueryResult {
+        last_rows: None,
+        attempted: sent.len(),
+        results,
+        total_elapsed: std::time::Duration::from_millis(2),
+        failure: Some(dbui_app::DriverError::Query {
+            statement: failed_sql.to_string(),
+            message: message.to_string(),
+            code: code.map(str::to_string),
+        }),
+    };
+    view.absorb_batch_result_for_test(tab_id, batch, &sent, true);
     cx.notify();
 }
 
@@ -1989,6 +2037,149 @@ fn a_statement_with_no_rows_is_still_in_the_strip(cx: &mut TestAppContext) {
             describe(&view.status).contains("affected"),
             "but it says what happened: {}",
             describe(&view.status)
+        );
+    });
+}
+
+/// The bug this fixes: a batch that failed halfway threw away the results of
+/// everything that had already run, so a failed run looked like a run that
+/// never happened.
+#[gpui::test]
+fn a_run_that_fails_halfway_keeps_what_did_run(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_failed_batch(
+            view,
+            &["CREATE TABLE t (a int)", "INSERT INTO t VALUES (1)"],
+            (
+                "SELECT * FROM missing",
+                "relation \"missing\" does not exist",
+                Some("42P01"),
+            ),
+            &["DROP TABLE t"],
+            cx,
+        );
+
+        let Some(WorkspaceTab::Sql { results, .. }) = view.tabs.active() else {
+            panic!("sql tab");
+        };
+        assert_eq!(results.len(), 2, "the two that ran are still in the strip");
+
+        let error = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.error())
+            .expect("the failure is on the tab");
+        assert_eq!(error.sql, "SELECT * FROM missing");
+        assert_eq!(error.code.as_deref(), Some("42P01"));
+        assert_eq!(error.succeeded, 2);
+        assert_eq!(error.skipped, 1, "the one after it was never attempted");
+        let progress = error.progress().expect("a run of four says how far it got");
+        assert!(
+            progress.contains("2 statements ran") && progress.contains("1 was not attempted"),
+            "got: {progress}"
+        );
+        assert!(
+            describe(&view.status).contains("42P01"),
+            "and the footer carries the short version: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// The bug this fixes: the status bar is one line, and the next message
+/// overwrote the reason the query failed. The error now belongs to the tab.
+#[gpui::test]
+fn a_sql_error_outlives_the_status_bar(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_failed_batch(
+            view,
+            &[],
+            ("SELECT bad", "syntax error at or near \"bad\"", None),
+            &[],
+            cx,
+        );
+        assert!(matches!(view.status, Status::Error(_)));
+
+        // Anything at all can own the footer a moment later -- here, reading
+        // the error out to the clipboard.
+        view.copy_tab_error(cx);
+        assert!(
+            !matches!(view.status, Status::Error(_)),
+            "the footer moved on, which is what footers do"
+        );
+
+        let error = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.error())
+            .expect("but the error is still on the tab");
+        assert_eq!(error.message, "syntax error at or near \"bad\"");
+        assert_eq!(
+            error.progress(),
+            None,
+            "a lone statement has no progress to report"
+        );
+    });
+}
+
+/// It goes away when the next run succeeds, and when the user dismisses it --
+/// and not before. An unread error is not a handled one.
+#[gpui::test]
+fn an_error_clears_on_the_next_good_run_and_on_dismissal(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_failed_batch(view, &[], ("SELECT bad", "no", None), &[], cx);
+        view.clear_tab_error(cx);
+        assert!(view.tabs.active().and_then(|tab| tab.error()).is_none());
+        assert!(
+            matches!(view.status, Status::Idle),
+            "the footer cleared with it"
+        );
+
+        put_failed_batch(view, &[], ("SELECT bad", "no", None), &[], cx);
+        put_batch(view, &[("SELECT 1", Some(1))], cx);
+        assert!(
+            view.tabs.active().and_then(|tab| tab.error()).is_none(),
+            "a clean run replaces the last failure"
+        );
+    });
+}
+
+/// The panel has to paint, at every window size, with and without a code.
+#[gpui::test]
+fn the_error_panel_draws(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_failed_batch(
+            view,
+            &["SELECT 1"],
+            (
+                "SELECT * FROM\n  a_very_long_table_name_that_wraps",
+                "relation \"a_very_long_table_name_that_wraps\" does not exist, and this \
+                 message is long enough to need more than one line of the panel",
+                Some("42P01"),
+            ),
+            &["SELECT 2"],
+            cx,
+        );
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.tabs.active().and_then(|tab| tab.error()).is_some(),
+            "and it survived the round trip"
         );
     });
 }
@@ -2173,6 +2364,113 @@ fn a_committed_edit_reaches_the_database(cx: &mut TestAppContext) {
         assert_eq!(rows, Some(2), "the seeded rows arrived");
     });
     draw_at_every_size(&view, cx);
+}
+
+/// The bug this fixes: `CREATE TABLE` came back as "0 rows affected" -- which
+/// reads as a statement that did nothing -- and the schema tree went on
+/// showing the database as it was before, so nothing on screen said the table
+/// existed.
+#[gpui::test]
+fn create_table_says_what_it_did_and_the_tree_catches_up(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "create-table");
+
+    let tables_before = view.update(cx, |view, _| view.sidebar_visible_items().len());
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        !matches!(view.status, Status::Busy(_)) && view.workspace.active().is_some()
+    });
+
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(
+            said.contains("CREATE TABLE") && said.contains("notes"),
+            "the verdict names the statement and its table, got: {said}"
+        );
+        assert!(
+            !said.contains("0 rows affected"),
+            "and not a row count that means nothing: {said}"
+        );
+        assert!(
+            view.tabs.active().and_then(|tab| tab.error()).is_none(),
+            "nothing failed"
+        );
+    });
+
+    // The refresh it triggers is a second trip to the database.
+    settle(&view, cx, |view| {
+        view.sidebar_visible_items().len() > tables_before
+    });
+    view.update(cx, |view, _| {
+        assert!(
+            view.sidebar_visible_items().len() > tables_before,
+            "the new table reached the schema tree"
+        );
+        assert!(
+            describe(&view.status).contains("CREATE TABLE"),
+            "and the quiet refresh did not overwrite the verdict: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// A statement the engine refuses lands on the tab, not only in the footer.
+#[gpui::test]
+fn a_failing_statement_leaves_its_error_on_the_tab(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "sql-error");
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT * FROM no_such_table", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|tab| tab.error()).is_some()
+    });
+
+    view.update(cx, |view, _| {
+        let error = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.error())
+            .expect("the engine refused it");
+        assert_eq!(error.sql, "SELECT * FROM no_such_table");
+        assert!(
+            error.message.contains("no_such_table"),
+            "the engine's own words: {}",
+            error.message
+        );
+        assert_eq!(
+            view.focus,
+            Focus::Editor,
+            "the keyboard stays where the statement is"
+        );
+    });
+
+    // The failed statement is on the clipboard in full when asked for.
+    view.update(cx, |view, cx| {
+        view.copy_tab_error(cx);
+        assert!(
+            describe(&view.status).contains("copied"),
+            "{}",
+            describe(&view.status)
+        );
+    });
+    draw_at_every_size(&view, cx);
+}
+
+/// Pump the runtime until `done`, or give up. The tasks cross to tokio and
+/// back, so parking once is never enough.
+fn settle(view: &Entity<DbUi>, cx: &mut VisualTestContext, done: impl Fn(&DbUi) -> bool) {
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if view.update(cx, |view, _| done(view)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 // -- every surface actually draws -----------------------------------------
