@@ -7,6 +7,7 @@
 
 mod bottom_bar;
 mod change_bubble;
+pub(crate) mod close_guard;
 mod connection_form;
 pub(crate) mod context_menu;
 mod detail_sidebar;
@@ -24,7 +25,7 @@ mod titlebar;
 pub use connection_form::{ConnectionForm, FormAction};
 pub use text_field::DetailInput;
 
-use crate::theme::Theme;
+use crate::theme::{metrics, Theme};
 use gpui::{div, prelude::*, px, Div, ElementId, SharedString, Stateful};
 
 /// A clickable button. The caller attaches `.on_click`.
@@ -55,7 +56,7 @@ pub(crate) fn button_with_focus(
         .items_center()
         .justify_center()
         .px_3()
-        .h(px(26.))
+        .h(metrics::control_height())
         .rounded_md()
         .cursor_pointer()
         .border_1()
@@ -84,8 +85,33 @@ pub(crate) fn button_with_focus(
 pub(crate) fn caption(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
         .text_color(theme.text_muted)
-        .text_size(px(11.))
+        .text_size(metrics::text_size_small())
         .child(text.into())
+}
+
+/// A vertical grab strip for resizing the panel beside it.
+///
+/// Five pixels wide and otherwise invisible: the panels already draw their own
+/// borders, so this only has to be findable by the pointer. It lights up under
+/// the cursor and stays lit for as long as the drag lasts -- the pointer
+/// leaves the strip on the first frame, and without that the handle would
+/// blink off the moment it started working.
+///
+/// The caller attaches `.on_mouse_down`, which is the half that knows which
+/// panel is being dragged.
+pub(crate) fn vertical_resize_handle(
+    id: impl Into<ElementId>,
+    dragging: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(5.))
+        .h_full()
+        .flex_shrink_0()
+        .cursor_col_resize()
+        .when(dragging, |strip| strip.bg(theme.accent))
+        .hover(|strip| strip.bg(theme.hover))
 }
 
 /// A filled dot -- the connection-status light in the sidebar.

@@ -16,12 +16,26 @@ use gpui::{
 };
 
 const SINGLE_LINE_HEIGHT: f32 = 28.;
-const MAX_VISIBLE_LINES: usize = 8;
+/// How many lines a *folded* multiline field shows before it scrolls inside
+/// itself. Only [`FieldHeight::Capped`] uses it; a field is full height until
+/// someone asks for it back.
+pub(crate) const MAX_VISIBLE_LINES: usize = 8;
 /// `py_1` top + bottom, in unzoomed pixels (`py_1` is 0.25rem and rem tracks zoom).
 const FIELD_PAD_Y: f32 = 8.;
 /// `border_1` top + bottom. Borders are not zoomed, and leaving this out of the
 /// field height is what used to make the scrollport shorter than its own text.
 const FIELD_BORDER_Y: f32 = 2.;
+
+/// How tall a multiline field is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldHeight {
+    /// Folded down to [`MAX_VISIBLE_LINES`]; the rest scrolls inside the box.
+    Capped,
+    /// As tall as its content -- what a field gets unless it is folded.
+    /// Nothing scrolls inside the field then; the panel holding it does, which
+    /// is the only scroll a JSON blob should need.
+    Full,
+}
 
 /// Which editable string the shared field is talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +183,30 @@ pub(crate) fn text_field(
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
+    sized_text_field(
+        id,
+        input,
+        target,
+        focused,
+        placeholder,
+        FieldHeight::Capped,
+        theme,
+        cx,
+    )
+}
+
+/// [`text_field`], with a say in how tall a multiline one is drawn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sized_text_field(
+    id: impl Into<ElementId>,
+    input: &TextInput,
+    target: InputTarget,
+    focused: bool,
+    placeholder: Option<&str>,
+    height: FieldHeight,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
     let scroll_id: ElementId = match target {
         InputTarget::WhereDraft => "where-scroll".into(),
         InputTarget::DetailSearch => "detail-search-scroll".into(),
@@ -189,6 +227,7 @@ pub(crate) fn text_field(
             target,
             focused,
             placeholder,
+            height,
             theme,
             cx,
         )
@@ -334,6 +373,7 @@ fn single_line_text_field(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn multiline_text_field(
     id: impl Into<ElementId>,
     scroll_id: impl Into<ElementId>,
@@ -341,6 +381,7 @@ fn multiline_text_field(
     target: InputTarget,
     focused: bool,
     placeholder: Option<&str>,
+    height: FieldHeight,
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
@@ -350,13 +391,19 @@ fn multiline_text_field(
     let line_h = text_input::field_line_height();
     let char_w = text_input::field_char_width();
     let line_count = input.layout().lines.len().max(1);
-    let visible = line_count.min(MAX_VISIBLE_LINES);
+    let visible = match height {
+        FieldHeight::Capped => line_count.min(MAX_VISIBLE_LINES),
+        FieldHeight::Full => line_count,
+    };
+    // A field showing every line it has cannot scroll vertically, so the
+    // wheel-handling below is not just idle -- it would fight the panel.
+    let scrolls = line_count > visible;
     // The scrollport is sized from the same number as the text it holds, so a
     // field that fits its lines has *no* vertical scroll range. When that was
     // off by the border's 2px, `ensure_caret_visible` kept flipping the offset
     // between 0 and -2 on every keystroke -- the vertical bounce.
     let port_h = px(f32::from(line_h) * visible as f32);
-    let height = px(f32::from(port_h) + FIELD_PAD_Y * metrics::zoom() + FIELD_BORDER_Y);
+    let box_h = px(f32::from(port_h) + FIELD_PAD_Y * metrics::zoom() + FIELD_BORDER_Y);
 
     div()
         .id(id)
@@ -366,7 +413,7 @@ fn multiline_text_field(
         .relative()
         .flex()
         .items_start()
-        .h(height)
+        .h(box_h)
         .px_2()
         .py_1()
         .rounded_md()
@@ -386,12 +433,12 @@ fn multiline_text_field(
                 .h(port_h)
                 .overflow_x_scroll()
                 .scrollbar_width(px(0.))
-                .when(line_count > MAX_VISIBLE_LINES, |el| el.overflow_y_scroll())
+                .when(scrolls, |el| el.overflow_y_scroll())
                 .map(|mut el| {
                     el.style().restrict_scroll_to_axis = Some(true);
                     el
                 })
-                .when(line_count > MAX_VISIBLE_LINES, {
+                .when(scrolls, {
                     let scroll_handle = scroll_handle.clone();
                     move |el| {
                         el.on_scroll_wheel(move |event: &ScrollWheelEvent, window, cx| {

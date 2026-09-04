@@ -394,8 +394,9 @@ fn light() -> Theme {
 }
 
 /// Fixed metrics. Sizes that several components have to agree on -- a row
-/// height the grid and its header both use, a sidebar width the layout depends
-/// on -- rather than every dimension in the app.
+/// height the grid and its header both use, a toolbar height the sidebar and
+/// the detail panel line their headers up on -- rather than every dimension in
+/// the app. Anything the user can drag is state on `DbUi` instead.
 ///
 /// Values scale with [`zoom_pct`] so ⌘+/⌘- zooms the whole chrome.
 pub mod metrics {
@@ -449,6 +450,21 @@ pub mod metrics {
         px(base * zoom())
     }
 
+    /// A one-off dimension at the current zoom.
+    ///
+    /// The named metrics above are the sizes several components have to agree
+    /// on. This is for the rest -- a panel width, a chip height, a caption
+    /// size -- which still have to grow with ⌘+ or the chrome comes apart at
+    /// 150%: the text gets bigger and the box holding it does not.
+    pub fn scaled(base: f32) -> Pixels {
+        z(base)
+    }
+
+    /// Height of a button, chip or any other single-line control.
+    pub fn control_height() -> Pixels {
+        z(26.)
+    }
+
     pub fn titlebar_height() -> Pixels {
         z(38.)
     }
@@ -456,9 +472,6 @@ pub mod metrics {
     /// control in the titlebar.
     pub fn traffic_light_inset() -> Pixels {
         z(78.)
-    }
-    pub fn sidebar_width() -> Pixels {
-        z(258.)
     }
     pub fn status_height() -> Pixels {
         z(26.)

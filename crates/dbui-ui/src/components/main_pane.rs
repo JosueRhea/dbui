@@ -96,7 +96,7 @@ impl DbUi {
             .gap_1()
             .px_3()
             .py_2()
-            .max_h(px(160.))
+            .max_h(metrics::scaled(160.))
             .overflow_y_scroll()
             .flex_shrink_0()
             .bg(theme.elevated)
@@ -174,7 +174,7 @@ impl DbUi {
                     .items_center()
                     .gap_1()
                     .px_2()
-                    .h(px(22.))
+                    .h(metrics::scaled(22.))
                     .rounded_md()
                     .cursor_pointer()
                     .flex_shrink_0()
@@ -196,7 +196,7 @@ impl DbUi {
                     .when(empty, |chip| {
                         chip.child(
                             div()
-                                .text_size(px(9.))
+                                .text_size(metrics::scaled(9.))
                                 .text_color(theme.text_faint)
                                 .child("·"),
                         )
@@ -370,7 +370,7 @@ impl DbUi {
                     .h(line_h)
                     .child(
                         div()
-                            .w(px(32.))
+                            .w(text_input::editor_gutter())
                             .flex_shrink_0()
                             .pr_2()
                             .text_color(theme.text_faint)

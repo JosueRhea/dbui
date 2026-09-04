@@ -3,11 +3,30 @@
 A database editor for PostgreSQL, MySQL and SQLite — TablePlus-shaped, written in Rust,
 drawn with [GPUI](https://www.gpui.rs).
 
+![Browsing a table in dbui: the schema tree on the left, 1,400 rows of a typed grid in the middle, and the selected row's fields on the right](docs/screenshots/table.png)
+
 This is a **starter**: the architecture is complete and the whole path works
 end to end — connect, browse the tree, click a table, page through its rows,
 run a query, read the result. What it does not have yet is listed under
 [Known limits](ARCHITECTURE.md#known-limits), and the layering is set up so
 those are additions rather than rewrites.
+
+## A look around
+
+**Edits stage before they commit.** Type over a cell, stage rows for deletion with
+`⌘⌫`, and nothing reaches the server: the pending edits are struck through in the
+grid and listed and counted in the bar underneath it. `⌘S` sends the whole batch in one
+transaction; `⌘Z` throws it away. With several rows selected, the panel on the right
+edits all of them at once — `MIXED` marks a column they disagree on, and a field left
+reading `MIXED` is written to nobody.
+
+![Three rows struck through and staged for deletion beside an edited cell, with the change list open showing "status: shipped to fulfilled" and three DELETE ROW entries](docs/screenshots/changes.png)
+
+**SQL, with the catalog behind it.** `⌘↵` runs the statement under the caret, `⌘⇧↵`
+runs every statement in the buffer, and `⌃Space` completes against the schemas, tables
+and columns the connection actually has. Results land in the same typed grid, timed.
+
+![The SQL editor with a highlighted GROUP BY query above its result grid, reporting 10 rows in 5 ms](docs/screenshots/query.png)
 
 ## Install
 
@@ -61,6 +80,17 @@ Then in the app (`⌘N`), add a connection:
 
 Ports are non-default so they never collide with a Postgres or MySQL already
 running on the machine.
+
+For something to click through — the storefront in the screenshots above — load
+`docs/demo.sql` into a database of its own, so it stays clear of the tables the live
+driver tests create in `dbui_test`:
+
+```sh
+docker compose exec -T postgres psql -U postgres -d postgres -c 'CREATE DATABASE dbui_demo'
+docker compose exec -T postgres psql -U postgres -d dbui_demo < docs/demo.sql
+```
+
+Then give the connection `dbui_demo` as its database instead of `dbui_test`.
 
 SQLite needs no server: pick it in the connection sheet and give it the path to
 a `.db` file. The file has to exist — a path that is not there is reported as
@@ -168,18 +198,27 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘D` | Duplicate the selected rows |
 | `↵` | Edit the selected cell in place |
 | `⌘↵` / `⌥-click` | Follow the foreign key under the cursor (run, in the editor) |
+| `↑` / `↓` | Move the row cursor (the grid scrolls to keep it in view) |
 | `←` / `→` | Move the cell cursor along a row |
 | `⌘F` | Filter the rows of the open table |
+| `⌘P` | Go to table |
+| `⌘⇧P` | Command palette |
+| `⌘⇧T` | Choose a theme |
 | `⌘N` | New connection |
 | `⌘R` | Refresh the result (or the catalog) |
 | `⌘E` | Open / focus the SQL editor |
 | `⌘K` | Clear the editor |
 | `⌘[` / `⌘]` | Previous / next page of a table |
 | `⌘W` | Close the table / SQL tab |
-| `⌃⇥` / `⌃⇧⇥` | Next / previous table tab |
+| `⌃⇥` / `⌃⇧⇥`, `⌘⇧[` / `⌘⇧]` | Next / previous table tab |
+| `⌘1` … `⌘9` | Jump to a table tab by position |
 | `⌘⌥[` / `⌘⌥]` | Previous / next connection tab |
 | `⌘⇧W` | Close the connection tab |
+| `⌘+` / `⌘-` / `⌘0` | Zoom the interface in, out, back to actual size |
 | `Esc` | Close the sheet, dismiss autocomplete, or leave the editor |
+
+Closing a tab or a connection that is holding staged changes asks before it
+throws them away, and a tab holding some is marked with a dot.
 
 ## Layout
 

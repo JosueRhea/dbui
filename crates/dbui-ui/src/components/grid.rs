@@ -378,6 +378,9 @@ impl DbUi {
                     .collect::<Vec<_>>()
             }),
         )
+        // So the arrow keys can put a row back on screen -- see
+        // `DbUi::reveal_row`.
+        .track_scroll(self.grid_scroll.clone())
         .w(px(total_width))
         .flex_1()
         .min_h(px(0.));
@@ -394,6 +397,7 @@ impl DbUi {
             .child(
                 div()
                     .id("grid-h-scroll")
+                    .track_scroll(&self.grid_h_scroll)
                     .size_full()
                     .min_h(px(0.))
                     .min_w(px(0.))
@@ -592,7 +596,7 @@ fn render_header(
                 .child(SharedString::from(column.name.clone()))
                 .child(
                     div()
-                        .text_size(px(9.))
+                        .text_size(metrics::scaled(9.))
                         .text_color(theme.text_faint)
                         .child(SharedString::from(column.type_name.to_lowercase())),
                 )

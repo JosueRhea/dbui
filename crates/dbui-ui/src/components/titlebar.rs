@@ -64,7 +64,7 @@ impl DbUi {
                     .border_1()
                     .border_color(theme.warning)
                     .text_color(theme.warning)
-                    .text_size(px(10.))
+                    .text_size(metrics::scaled(10.))
                     .child("READ ONLY")
             }))
             .child(
@@ -78,8 +78,8 @@ impl DbUi {
                     .flex_shrink_0()
                     .items_center()
                     .justify_center()
-                    .w(px(24.))
-                    .h(px(22.))
+                    .w(metrics::scaled(24.))
+                    .h(metrics::scaled(22.))
                     .rounded(px(6.))
                     .cursor_pointer()
                     .text_color(theme.text_muted)
@@ -160,6 +160,17 @@ impl DbUi {
                 let is_active = active == Some(id);
                 let light = status_color(&entry.status, theme);
                 let name = SharedString::from(entry.config.name.clone());
+                // Staged work anywhere under this connection, including the
+                // tabs that are not in front -- ⌘⇧W closes all of them.
+                let changes: usize = self
+                    .connection_tabs(id)
+                    .map(|tabs| {
+                        tabs.items
+                            .iter()
+                            .map(|tab| tab.pending_change_count())
+                            .sum()
+                    })
+                    .unwrap_or(0);
 
                 div()
                     .id(("connection-tab", key))
@@ -170,7 +181,7 @@ impl DbUi {
                     .pl_2()
                     .pr_1()
                     .py_1()
-                    .max_w(px(200.))
+                    .max_w(metrics::scaled(200.))
                     .rounded(px(6.))
                     .cursor_pointer()
                     .when(is_active, |tab| tab.bg(theme.selection))
@@ -189,6 +200,7 @@ impl DbUi {
                     )
                     .child(dot(light))
                     .child(div().truncate().child(name))
+                    .children((changes > 0).then(|| dot(theme.warning)))
                     .child(
                         div()
                             .id(("connection-tab-close", key))
@@ -334,8 +346,8 @@ impl DbUi {
                 .top_full()
                 .left_0()
                 .mt_1()
-                .w(px(320.))
-                .max_h(px(360.))
+                .w(metrics::scaled(320.))
+                .max_h(metrics::scaled(360.))
                 .flex()
                 .flex_col()
                 .rounded(px(10.))

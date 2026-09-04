@@ -694,10 +694,13 @@ fn detail_field_has_no_vertical_scroll_range(cx: &mut TestAppContext) {
     );
 }
 
-/// A field taller than its window still scrolls -- the fix above must not have
-/// pinned the vertical offset for everyone.
+/// A *folded* field taller than its window still scrolls -- the fix above must
+/// not have pinned the vertical offset for everyone.
+///
+/// Folding is what puts a field back into a box smaller than its text: left
+/// alone it draws every line it has, and the panel does the scrolling.
 #[gpui::test]
-fn a_long_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
+fn a_long_folded_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
     let _layout = layout_lock();
     use crate::components::text_field::InputTarget;
 
@@ -708,6 +711,7 @@ fn a_long_detail_field_still_scrolls_vertically(cx: &mut TestAppContext) {
     let (view, cx) = open_detail_draft(cx, &[("id", "1", true), ("body", long.as_str(), false)]);
 
     view.update(cx, |this, cx| {
+        this.toggle_detail_collapsed("body", cx);
         this.focus_input(InputTarget::DetailField(1), cx);
     });
     cx.run_until_parked();
@@ -1484,7 +1488,11 @@ fn commit_with_nothing_staged_says_so(cx: &mut TestAppContext) {
 
     cx.simulate_keystrokes("cmd-s");
     view.update(cx, |view, _| {
-        assert_eq!(describe(&view.status), "info: No changes to commit");
+        assert_eq!(
+            describe(&view.status),
+            "info: No changes to commit on this tab",
+            "and with no other tab holding any, it does not send the user hunting"
+        );
     });
 }
 
@@ -2377,6 +2385,62 @@ fn the_context_menu_and_confirmation_draw(cx: &mut TestAppContext) {
     draw_at_every_size(&view, cx);
 }
 
+/// Every surface, drawn at both ends of the zoom range.
+///
+/// The chrome used to be half-scaled: `metrics` grew with ⌘+ but the captions,
+/// buttons and panel widths were written as raw pixels, so at 200% the text
+/// outgrew the boxes holding it. Nothing here can assert on how it *looks*, but
+/// drawing the lot at each end is what catches a surface that was measured for
+/// one zoom and painted at another.
+#[gpui::test]
+fn every_surface_draws_at_every_zoom(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 40);
+
+    for pct in [50, 100, 200] {
+        crate::theme::metrics::set_zoom_pct(pct);
+
+        view.update(cx, |view, cx| {
+            view.grid_pointer_down(3, Some(1), gpui::Modifiers::default(), cx);
+            view.detail_open = true;
+            view.toggle_filters_open(cx);
+            view.toggle_columns_open(cx);
+        });
+        draw_at_every_size(&view, cx);
+
+        view.update(cx, |view, cx| {
+            view.toggle_filters_open(cx);
+            view.toggle_columns_open(cx);
+            view.open_sql_tab(cx);
+            view.toggle_connection_picker(cx);
+        });
+        draw_at_every_size(&view, cx);
+        view.update(cx, |view, cx| {
+            view.close_connection_picker(cx);
+            view.close_tab(view.tabs.active, cx);
+        });
+    }
+
+    crate::theme::metrics::zoom_reset();
+}
+
+/// The "discard staged changes?" guard, at every window size.
+#[gpui::test]
+fn the_close_guard_draws(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "the guard has to be up to draw");
+    });
+    draw_at_every_size(&view, cx);
+
+    // And the dirty dot beside the tab that put it there.
+    view.update(cx, |view, cx| view.cancel_close(cx));
+    draw_at_every_size(&view, cx);
+}
+
 /// The connection sheet, the picker, and the read-only badge beside them.
 #[gpui::test]
 fn the_connection_surfaces_draw(cx: &mut TestAppContext) {
@@ -2979,6 +3043,101 @@ fn a_drag_that_goes_nowhere_leaves_the_size_alone(cx: &mut TestAppContext) {
         view.end_editor_drag(cx);
         assert_eq!(view.change_bubble_height, bubble);
         assert_eq!(view.editor_height, editor);
+    });
+}
+
+/// The left rail's handle is its right edge, so rightward is wider.
+#[gpui::test]
+fn dragging_the_left_rail_rightward_widens_it(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        let before = view.sidebar_width;
+        view.begin_sidebar_drag(gpui::px(258.), cx);
+        view.drag_sidebar(gpui::px(330.), cx);
+        assert!(view.sidebar_width > before, "right is wider");
+
+        view.drag_sidebar(gpui::px(180.), cx);
+        assert!(view.sidebar_width < before, "and left is narrower");
+
+        // Dragging it into the window edge leaves a rail, not nothing.
+        view.drag_sidebar(gpui::px(-9_000.), cx);
+        assert!(view.sidebar_width > 0., "it clamps rather than closing");
+        view.end_sidebar_drag(cx);
+        assert!(view.sidebar_drag.is_none());
+    });
+}
+
+/// The detail panel is dragged by its *left* edge, so the delta runs the
+/// other way -- the half of this that is not obvious from the pointer.
+#[gpui::test]
+fn dragging_the_detail_panel_leftward_widens_it(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        let before = view.detail_width;
+        view.begin_detail_drag(gpui::px(900.), cx);
+        view.drag_detail(gpui::px(820.), cx);
+        assert!(view.detail_width > before, "left is wider");
+
+        view.drag_detail(gpui::px(960.), cx);
+        assert!(view.detail_width < before, "and right is narrower");
+
+        view.drag_detail(gpui::px(9_000.), cx);
+        assert!(view.detail_width > 0., "it clamps rather than closing");
+        view.end_detail_drag(cx);
+        assert!(view.detail_drag.is_none());
+    });
+}
+
+/// A rail grabbed and released without moving keeps the width it had.
+#[gpui::test]
+fn a_rail_drag_that_goes_nowhere_leaves_the_width_alone(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        let sidebar = view.sidebar_width;
+        let detail = view.detail_width;
+        view.begin_sidebar_drag(gpui::px(258.), cx);
+        view.end_sidebar_drag(cx);
+        view.begin_detail_drag(gpui::px(900.), cx);
+        view.end_detail_drag(cx);
+        assert_eq!(view.sidebar_width, sidebar);
+        assert_eq!(view.detail_width, detail);
+    });
+}
+
+/// A field folded down to a scrolling box stays folded as the selection moves.
+///
+/// Nothing is in the set until the user puts it there -- a field is full height
+/// by default. The set is keyed by column name for exactly this: selecting the
+/// next row rebuilds every editor, and a column that sprang back open on each
+/// arrow key would be a control that does not hold.
+#[gpui::test]
+fn a_folded_field_survives_moving_to_the_next_row(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    cx.simulate_keystrokes("down");
+    view.update(cx, |view, cx| {
+        assert!(
+            view.detail_collapsed.is_empty(),
+            "a field is full height until it is folded"
+        );
+        view.toggle_detail_collapsed("name", cx);
+        assert!(view.detail_collapsed.contains("name"));
+    });
+
+    cx.simulate_keystrokes("down");
+    view.update(cx, |view, cx| {
+        assert!(
+            view.detail_collapsed.contains("name"),
+            "the next row shows the same column at the same height"
+        );
+        view.toggle_detail_collapsed("name", cx);
+        assert!(
+            !view.detail_collapsed.contains("name"),
+            "and it opens back up"
+        );
     });
 }
 
@@ -3940,6 +4099,253 @@ fn tab_moves_to_the_next_editable_cell(cx: &mut TestAppContext) {
         // `id` is the key and `name` is where we started, so it wraps back.
         assert_eq!(view.editing_cell, Some((0, 1)));
         assert_eq!(view.collect_batch_edits()[0].changes[0].new_text, "first");
+    });
+}
+
+// -- closing something that is holding staged work --------------------------
+
+/// Stage one edit on the open table tab.
+fn stage_one_edit(view: &mut DbUi, cx: &mut gpui::Context<DbUi>) {
+    view.begin_cell_edit(0, 1, cx);
+    view.cell_editor.set_text("edited");
+    view.finish_cell_edit(cx);
+    assert_eq!(
+        view.collect_batch_edits().len(),
+        1,
+        "the fixture has to actually stage something"
+    );
+}
+
+/// The bug: the × and ⌘W threw a staged batch away without a word.
+#[gpui::test]
+fn closing_a_tab_holding_changes_asks_first(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        let before = view.tabs.items.len();
+
+        view.close_tab(0, cx);
+
+        assert_eq!(view.tabs.items.len(), before, "the tab is still open");
+        let guard = view.close_guard.as_ref().expect("it asked");
+        assert_eq!(guard.changes, 1, "and said how much is at stake");
+    });
+}
+
+/// Answering "keep open" leaves the tab and the batch exactly as they were.
+#[gpui::test]
+fn keeping_a_tab_open_keeps_its_batch(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tab(0, cx);
+        view.cancel_close(cx);
+
+        assert!(view.close_guard.is_none());
+        assert_eq!(view.tabs.items.len(), 1);
+        assert_eq!(view.collect_batch_edits().len(), 1, "nothing was discarded");
+    });
+}
+
+/// Answering "discard" goes through with the close it was guarding.
+#[gpui::test]
+fn discarding_closes_the_tab_it_was_asked_about(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tab(0, cx);
+        view.confirm_close(cx);
+
+        assert!(view.close_guard.is_none());
+        assert!(view.tabs.items.is_empty(), "the tab is gone");
+    });
+}
+
+/// A tab with nothing staged still closes on the first press: the guard must
+/// not become a speed bump in front of every ⌘W.
+#[gpui::test]
+fn closing_a_clean_tab_does_not_ask(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_none());
+        assert!(view.tabs.items.is_empty());
+    });
+}
+
+/// A value typed into the detail sidebar and never committed is work too --
+/// it reaches the staged batch before the count is taken.
+#[gpui::test]
+fn an_uncommitted_draft_still_counts_as_a_change(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        let Some(WorkspaceTab::Table { draft: Some(draft), .. }) = view.tabs.active_mut() else {
+            panic!("selecting a row opens a draft");
+        };
+        draft.fields[1].1.set_text("typed, never committed");
+
+        view.close_tab(0, cx);
+        assert!(
+            view.close_guard.is_some(),
+            "it must not be closed out from under the draft"
+        );
+    });
+}
+
+/// Dropping the table takes its tabs with it and does not offer to keep a
+/// batch that has nothing left to be committed against.
+#[gpui::test]
+fn dropping_a_table_closes_its_tabs_without_asking(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tabs_for_table(&TableRef::new("public", "users"), cx);
+
+        assert!(view.close_guard.is_none());
+        assert!(view.tabs.items.is_empty());
+    });
+}
+
+/// ⌘⇧W closes every tab under the connection at once, so it counts them all.
+#[gpui::test]
+fn closing_a_connection_holding_changes_asks_first(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+    let id = view.update(cx, |view, _| view.workspace.active_id().expect("connected"));
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_connection_tab(id, cx);
+
+        assert_eq!(view.workspace.open_count(), 1, "still open");
+        let guard = view.close_guard.as_ref().expect("it asked");
+        assert_eq!(guard.changes, 1);
+
+        view.confirm_close(cx);
+        assert_eq!(view.workspace.open_count(), 0);
+    });
+}
+
+/// The hole the close guard had: opening a new tab left the typed value in the
+/// old tab's draft, where nothing counted it -- so the dot stayed dark and
+/// closing that tab discarded the value without asking.
+#[gpui::test]
+fn opening_a_tab_folds_the_draft_away_first(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("typed, then moved on");
+        view.finish_cell_edit(cx);
+
+        // Opening a SQL tab pushes the table tab to the back.
+        view.open_sql_tab(cx);
+
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            1,
+            "the value has to be staged where it can be seen and counted"
+        );
+    });
+
+    // And closing the tab it belongs to now asks, rather than dropping it.
+    view.update(cx, |view, cx| {
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some());
+    });
+}
+
+/// Same for opening a table tab.
+#[gpui::test]
+fn opening_a_table_tab_folds_the_draft_away_first(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("typed, then moved on");
+        view.finish_cell_edit(cx);
+        view.open_table_tab(TableRef::new("public", "teams"), cx);
+
+        assert_eq!(view.tabs.items[0].pending_change_count(), 1);
+    });
+}
+
+/// ⌘S commits the tab it is pressed on, so pressed on the wrong one it has to
+/// say where the work is -- otherwise it reads as the key having failed.
+#[gpui::test]
+fn commit_on_the_wrong_tab_says_where_the_changes_are(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.open_sql_tab(cx);
+        view.save_pending_edits(cx);
+
+        let said = describe(&view.status);
+        assert!(said.contains("users"), "it names the tab: {said}");
+        assert!(said.contains('1'), "and how much is on it: {said}");
+    });
+}
+
+/// The guard's own caption points at ⌘S, so ⌘S has to answer it -- and take
+/// the panel, with its now-stale count, down with it.
+///
+/// Against a real database, because a commit that cannot be sent leaves the
+/// question standing, which is the other half of the behaviour.
+#[gpui::test]
+fn committing_from_under_the_guard_dismisses_it(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "guard-commit");
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    for _ in 0..200 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    view.update(cx, |view, cx| {
+        let rows = view.tabs.active().and_then(|t| t.result()).map(|v| v.set.rows.len());
+        assert_eq!(rows, Some(2), "the table has to have loaded first");
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        assert_eq!(view.collect_batch_edits().len(), 1, "the edit is staged");
+        view.close_tab(view.tabs.active, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+
+    view.update(cx, |view, _| {
+        assert!(view.close_guard.is_none(), "the question has been answered");
+        assert_eq!(view.tabs.items.len(), 1, "and the tab stayed open");
+    });
+}
+
+/// A commit that never leaves the app leaves the question standing: nothing
+/// has been saved, so there is still something to lose.
+#[gpui::test]
+fn a_commit_that_cannot_be_sent_keeps_the_guard_up(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tab(0, cx);
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.close_guard.is_some(),
+            "the batch is still staged, so the guard still has a job"
+        );
     });
 }
 

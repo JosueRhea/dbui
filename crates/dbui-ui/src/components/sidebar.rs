@@ -85,6 +85,7 @@ impl DbUi {
         };
         self.sidebar_cursor = Some(items[next].clone());
         self.focus = Focus::Sidebar;
+        self.reveal_sidebar_cursor();
         cx.notify();
     }
 
@@ -137,6 +138,7 @@ impl DbUi {
                             }
                         }
                     }
+                    self.reveal_sidebar_cursor();
                     cx.notify();
                 } else if !expand && is_expanded {
                     self.toggle_schema(connection, &name, cx);
@@ -153,6 +155,7 @@ impl DbUi {
                             {
                                 if *c == connection {
                                     self.sidebar_cursor = Some(items[i].clone());
+                                    self.reveal_sidebar_cursor();
                                     cx.notify();
                                     break;
                                 }
@@ -168,7 +171,19 @@ impl DbUi {
         self.finish_cell_edit(cx);
         self.sidebar_cursor = Some(item);
         self.focus = Focus::Sidebar;
+        self.reveal_sidebar_cursor();
         cx.notify();
+    }
+
+    /// The strip between the schema tree and the grid.
+    pub(crate) fn render_sidebar_resize(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        super::vertical_resize_handle("sidebar-resize", self.sidebar_drag.is_some(), &self.theme)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.begin_sidebar_drag(event.position.x, cx);
+                }),
+            )
     }
 
     pub(crate) fn render_sidebar(
@@ -186,7 +201,7 @@ impl DbUi {
         };
 
         div()
-            .w(metrics::sidebar_width())
+            .w(px(self.sidebar_width * metrics::zoom()))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -210,7 +225,7 @@ impl DbUi {
                             .flex_1()
                             .min_w(px(0.))
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(metrics::scaled(11.))
                             .text_color(theme.text_faint)
                             .child(header),
                     )
@@ -226,6 +241,7 @@ impl DbUi {
             .child(
                 div()
                     .id("sidebar-scroll")
+                    .track_scroll(&self.sidebar_scroll)
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
@@ -275,8 +291,8 @@ impl DbUi {
                 strip.child(
                     div()
                         .id("sidebar-filter-clear")
-                        .w(px(20.))
-                        .h(px(20.))
+                        .w(metrics::scaled(20.))
+                        .h(metrics::scaled(20.))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -447,7 +463,7 @@ impl DbUi {
                     )
                     .child(
                         div()
-                            .w(px(12.))
+                            .w(metrics::scaled(12.))
                             .text_color(theme.text_faint)
                             .child(if expanded { "▾" } else { "▸" }),
                     )
@@ -481,7 +497,7 @@ impl DbUi {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .pl(px(28.))
+                        .pl(metrics::scaled(28.))
                         .pr_3()
                         .py_1()
                         .cursor_pointer()

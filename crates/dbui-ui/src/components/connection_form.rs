@@ -318,7 +318,7 @@ impl DbUi {
                     .gap_3()
                     .child(
                         div()
-                            .w(px(72.))
+                            .w(metrics::scaled(72.))
                             .flex_shrink_0()
                             .text_color(theme.text_muted)
                             .child(label),
@@ -330,7 +330,7 @@ impl DbUi {
                             .relative()
                             .flex()
                             .items_center()
-                            .h(px(28.))
+                            .h(metrics::scaled(28.))
                             .px_2()
                             .rounded_md()
                             .bg(theme.background)
@@ -442,7 +442,7 @@ impl DbUi {
             .gap_3()
             .child(
                 div()
-                    .w(px(72.))
+                    .w(metrics::scaled(72.))
                     .flex_shrink_0()
                     .text_color(theme.text_muted)
                     .child("Engine"),
@@ -459,7 +459,7 @@ impl DbUi {
                             .items_center()
                             .gap_2()
                             .px_3()
-                            .h(px(28.))
+                            .h(metrics::scaled(28.))
                             .rounded_md()
                             .cursor_pointer()
                             .bg(if active { theme.accent } else { theme.background })
@@ -487,7 +487,7 @@ impl DbUi {
             .gap_3()
             .child(
                 div()
-                    .w(px(72.))
+                    .w(metrics::scaled(72.))
                     .flex_shrink_0()
                     .text_color(theme.text_muted)
                     .child("TLS"),
@@ -503,10 +503,10 @@ impl DbUi {
                             .flex()
                             .items_center()
                             .px_3()
-                            .h(px(26.))
+                            .h(metrics::control_height())
                             .rounded_md()
                             .cursor_pointer()
-                            .text_size(px(11.))
+                            .text_size(metrics::scaled(11.))
                             .bg(if active { theme.elevated } else { theme.background })
                             .text_color(if active { theme.text } else { theme.text_faint })
                             .border_1()
@@ -528,7 +528,7 @@ impl DbUi {
             .gap_3()
             .child(
                 div()
-                    .w(px(72.))
+                    .w(metrics::scaled(72.))
                     .flex_shrink_0()
                     .text_color(theme.text_muted)
                     .child("Access"),
@@ -540,7 +540,7 @@ impl DbUi {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .h(px(26.))
+                    .h(metrics::control_height())
                     .rounded_md()
                     .cursor_pointer()
                     .bg(if read_only { theme.elevated } else { theme.background })
@@ -554,8 +554,8 @@ impl DbUi {
                     }))
                     .child(
                         div()
-                            .w(px(12.))
-                            .h(px(12.))
+                            .w(metrics::scaled(12.))
+                            .h(metrics::scaled(12.))
                             .rounded_sm()
                             .border_1()
                             .border_color(theme.border)
@@ -567,7 +567,7 @@ impl DbUi {
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(metrics::scaled(11.))
                             .text_color(if read_only { theme.text } else { theme.text_faint })
                             .child("Read only — refuse every write"),
                     ),
@@ -575,7 +575,7 @@ impl DbUi {
 
         let message = form.message.as_ref().map(|(ok, text)| {
             div()
-                .text_size(px(11.))
+                .text_size(metrics::scaled(11.))
                 .text_color(if *ok { theme.success } else { theme.danger })
                 .child(SharedString::from(text.clone()))
         });
@@ -601,7 +601,7 @@ impl DbUi {
             .child(
                 div()
                     .id("modal-sheet")
-                    .w(px(420.))
+                    .w(metrics::scaled(420.))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -614,7 +614,7 @@ impl DbUi {
                     // sheet through the scrim behind it. An empty handler is
                     // not enough -- GPUI still bubbles unless stopped.
                     .on_click(|_, _window, cx| cx.stop_propagation())
-                    .child(div().text_size(px(15.)).child(title))
+                    .child(div().text_size(metrics::scaled(15.)).child(title))
                     .child(driver_choice)
                     .children(rows)
                     .child(tls_choice)
@@ -638,7 +638,7 @@ impl DbUi {
                                     div()
                                         .id("form-remove")
                                         .px_2()
-                                        .text_size(px(11.))
+                                        .text_size(metrics::scaled(11.))
                                         .text_color(theme.text_faint)
                                         .cursor_pointer()
                                         .hover(|label| label.text_color(theme.danger))
