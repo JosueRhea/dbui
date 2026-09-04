@@ -610,6 +610,10 @@ impl DbUi {
     }
 
     /// Close every tab pointing at a relation that no longer exists.
+    ///
+    /// Unguarded: the table has just been dropped, so there is nothing left
+    /// for a staged batch to be committed against, and asking whether to keep
+    /// it would be offering something that cannot happen.
     pub(crate) fn close_tabs_for_table(&mut self, table: &TableRef, cx: &mut Context<Self>) {
         while let Some(index) = self
             .tabs
@@ -617,7 +621,7 @@ impl DbUi {
             .iter()
             .position(|tab| tab.table_ref() == Some(table))
         {
-            self.close_tab(index, cx);
+            self.close_tab_now(index, cx);
         }
     }
 
@@ -783,7 +787,7 @@ impl DbUi {
                 // Without this the panel stretches to the full height of the
                 // window instead of hugging its own text.
                 .items_start()
-                .pt(px(140.))
+                .pt(metrics::scaled(140.))
                 .bg(scrim)
                 // Modal to the pointer as well as to the keyboard: the surfaces
                 // underneath stay visible, but a click cannot reach them. This
@@ -794,7 +798,7 @@ impl DbUi {
                 .child(
                     div()
                         .id("confirm-panel")
-                        .w(px(440.))
+                        .w(metrics::scaled(440.))
                         .flex()
                         .flex_col()
                         .gap_3()

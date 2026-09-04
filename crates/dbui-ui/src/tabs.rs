@@ -875,6 +875,25 @@ impl WorkspaceTab {
         }
     }
 
+    /// How much staged work closing this tab would throw away.
+    ///
+    /// Counted the same way the change bubble counts it, so the number in the
+    /// "discard?" prompt is the number the user was just looking at. The open
+    /// draft is not included: it is folded into `pending_edits` before anything
+    /// asks -- see `DbUi::stash_current_draft` -- which is what keeps a value
+    /// typed into the detail sidebar and not yet committed from being missed.
+    pub fn pending_change_count(&self) -> usize {
+        match self {
+            Self::Table {
+                pending_edits,
+                pending_deletes,
+                pending_inserts,
+                ..
+            } => pending_edits.len() + pending_deletes.len() + pending_inserts.len(),
+            Self::Sql { .. } => 0,
+        }
+    }
+
     /// The staged edit covering the row at `index`, if any.
     ///
     /// `batch` is the effective batch the caller already computed; matching is

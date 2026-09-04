@@ -5,6 +5,7 @@
 //! blocks that only render -- they read state and attach listeners, they do not
 //! define it. When a task lands, exactly one of the methods here folds it in.
 
+use crate::components::close_guard::{CloseGuard, CloseTarget};
 use crate::components::context_menu::{ConfirmPrompt, ContextMenu};
 use crate::components::palette::{Palette, PaletteKind};
 use crate::components::{ConnectionForm, DetailInput, FormAction};
@@ -19,10 +20,11 @@ use dbui_app::{
     session, store, ConnectionStatus, DbRuntime, RowUpdate, SavedConnectionTab, Session, Workspace,
 };
 use gpui::{
-    div, prelude::*, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
-    MouseUpEvent, Pixels, SharedString, Window,
+    div, prelude::*, point, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
+    MouseUpEvent, Pixels, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
+    Window,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Which surface the keyboard is talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +219,24 @@ pub struct DbUi {
     pub(crate) change_bubble_height: Pixels,
     /// Live drag: `(pointer y, height)` as they were when the edge was grabbed.
     pub(crate) change_bubble_drag: Option<(Pixels, Pixels)>,
+    /// Schema tree width, in unzoomed pixels -- so a rail the user has
+    /// resized still scales with ⌘+ like everything else.
+    pub(crate) sidebar_width: f32,
+    /// Live drag for the left rail: `(pointer x, width)` at the grab.
+    pub(crate) sidebar_drag: Option<(Pixels, f32)>,
+    /// Row detail panel width, in unzoomed pixels.
+    pub(crate) detail_width: f32,
+    /// Live drag for the detail panel: `(pointer x, width)` at the grab.
+    pub(crate) detail_drag: Option<(Pixels, f32)>,
+    /// Detail fields the user has folded back down to a scrolling box, by
+    /// column name. A field draws at its full content height unless it is in
+    /// here: the value is the point of the panel, and a box that hides two
+    /// thirds of it makes you scroll inside a thing you are already scrolling.
+    ///
+    /// Keyed by name rather than index so a folded column stays folded as the
+    /// selection moves down the table, and a different table -- with different
+    /// column names -- starts fresh.
+    pub(crate) detail_collapsed: HashSet<String>,
     /// SQL editor pane height (dragged by the strip under the editor).
     pub(crate) editor_height: Pixels,
     /// Live drag for the SQL editor resize: `(pointer y, height)`.
@@ -246,8 +266,21 @@ pub struct DbUi {
     pub(crate) context_menu: Option<ContextMenu>,
     /// A destructive action waiting on the user typing the table's name.
     pub(crate) confirm: Option<ConfirmPrompt>,
+    /// A close waiting on the user deciding what to do about staged changes.
+    pub(crate) close_guard: Option<CloseGuard>,
     /// Every statement run, newest first. Loaded once at launch.
     pub(crate) history: dbui_app::History,
+
+    /// Vertical scroll of the result grid, and horizontal scroll of the pane
+    /// holding it.
+    ///
+    /// Held here rather than left to the elements because the keyboard moves
+    /// the cell cursor and the pointer does not: a cursor the arrow keys can
+    /// walk off the bottom of the viewport is a cursor that has vanished.
+    pub(crate) grid_scroll: UniformListScrollHandle,
+    pub(crate) grid_h_scroll: ScrollHandle,
+    /// Same, for the arrow-key cursor in the schema tree.
+    pub(crate) sidebar_scroll: ScrollHandle,
 }
 
 /// Starting height of the diff area, and the range the drag is allowed.
@@ -255,6 +288,18 @@ pub(crate) const BUBBLE_HEIGHT_DEFAULT: f32 = 180.;
 const BUBBLE_HEIGHT_MIN: f32 = 48.;
 /// Past this the bubble is eating the grid it is describing.
 const BUBBLE_HEIGHT_MAX_FRACTION: f32 = 0.7;
+
+/// Starting widths of the two rails, and how far a drag may take them.
+///
+/// The minimums are "still a panel"; the maximums are "still a window with a
+/// grid in it".
+const SIDEBAR_WIDTH_DEFAULT: f32 = 258.;
+const SIDEBAR_WIDTH_MIN: f32 = 150.;
+const SIDEBAR_WIDTH_MAX: f32 = 560.;
+
+const DETAIL_WIDTH_DEFAULT: f32 = 280.;
+const DETAIL_WIDTH_MIN: f32 = 180.;
+const DETAIL_WIDTH_MAX: f32 = 720.;
 
 pub(crate) const EDITOR_HEIGHT_DEFAULT: f32 = 150.;
 const EDITOR_HEIGHT_MIN: f32 = 80.;
@@ -265,6 +310,15 @@ const EDITOR_HEIGHT_MAX_FRACTION: f32 = 0.6;
 fn bubble_height_for(start_height: Pixels, rise: Pixels, viewport_height: Pixels) -> Pixels {
     let max = (f32::from(viewport_height) * BUBBLE_HEIGHT_MAX_FRACTION).max(BUBBLE_HEIGHT_MIN);
     px((f32::from(start_height) + f32::from(rise)).clamp(BUBBLE_HEIGHT_MIN, max))
+}
+
+/// Resolve a rail drag into a width.
+///
+/// `delta` is the pointer's travel in real pixels; widths are kept unzoomed,
+/// so the travel is divided by the zoom before it is added -- otherwise the
+/// rail runs away from the pointer at any zoom but 100%.
+fn panel_width_for(start_width: f32, delta: Pixels, zoom: f32, min: f32, max: f32) -> f32 {
+    (start_width + f32::from(delta) / zoom.max(0.1)).clamp(min, max)
 }
 
 fn editor_height_for(start_height: Pixels, delta: Pixels, viewport_height: Pixels) -> Pixels {
@@ -318,6 +372,11 @@ impl DbUi {
             sidebar_cursor: None,
             theme_prev: None,
             update: crate::update::UpdateState::default(),
+            sidebar_width: SIDEBAR_WIDTH_DEFAULT,
+            sidebar_drag: None,
+            detail_width: DETAIL_WIDTH_DEFAULT,
+            detail_drag: None,
+            detail_collapsed: HashSet::new(),
             change_bubble_height: px(BUBBLE_HEIGHT_DEFAULT),
             change_bubble_drag: None,
             editor_height: px(EDITOR_HEIGHT_DEFAULT),
@@ -331,6 +390,10 @@ impl DbUi {
             column_drag: None,
             context_menu: None,
             confirm: None,
+            close_guard: None,
+            grid_scroll: UniformListScrollHandle::new(),
+            grid_h_scroll: ScrollHandle::new(),
+            sidebar_scroll: ScrollHandle::new(),
             history: dbui_app::history::history_path()
                 .map(|path| dbui_app::history::load(&path))
                 .unwrap_or_default(),
@@ -390,6 +453,76 @@ impl DbUi {
         self.editor_height = px((px_value as f32).clamp(EDITOR_HEIGHT_MIN, 600.));
     }
 
+    pub fn apply_sidebar_width_px(&mut self, px_value: u32) {
+        self.sidebar_width = (px_value as f32).clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+    }
+
+    pub fn apply_detail_width_px(&mut self, px_value: u32) {
+        self.detail_width = (px_value as f32).clamp(DETAIL_WIDTH_MIN, DETAIL_WIDTH_MAX);
+    }
+
+    /// Grab the left rail's right edge at pointer position `x`.
+    pub(crate) fn begin_sidebar_drag(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        self.sidebar_drag = Some((x, self.sidebar_width));
+        cx.notify();
+    }
+
+    pub(crate) fn drag_sidebar(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some((start_x, start_width)) = self.sidebar_drag else {
+            return;
+        };
+        // The handle is on the rail's right edge: rightward is wider.
+        self.sidebar_width = panel_width_for(
+            start_width,
+            x - start_x,
+            metrics::zoom(),
+            SIDEBAR_WIDTH_MIN,
+            SIDEBAR_WIDTH_MAX,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn end_sidebar_drag(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_drag.take().is_some() {
+            self.persist_prefs(cx);
+        }
+    }
+
+    /// Grab the detail panel's left edge at pointer position `x`.
+    pub(crate) fn begin_detail_drag(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        self.detail_drag = Some((x, self.detail_width));
+        cx.notify();
+    }
+
+    pub(crate) fn drag_detail(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some((start_x, start_width)) = self.detail_drag else {
+            return;
+        };
+        // This handle is on the panel's *left* edge, so leftward is wider.
+        self.detail_width = panel_width_for(
+            start_width,
+            start_x - x,
+            metrics::zoom(),
+            DETAIL_WIDTH_MIN,
+            DETAIL_WIDTH_MAX,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn end_detail_drag(&mut self, cx: &mut Context<Self>) {
+        if self.detail_drag.take().is_some() {
+            self.persist_prefs(cx);
+        }
+    }
+
+    /// Flip one detail field between its whole content and the eight-line cap.
+    pub(crate) fn toggle_detail_collapsed(&mut self, field: &str, cx: &mut Context<Self>) {
+        if !self.detail_collapsed.remove(field) {
+            self.detail_collapsed.insert(field.to_string());
+        }
+        cx.notify();
+    }
+
     pub fn apply_theme_id(&mut self, id: &str) {
         self.theme = Theme::named(id);
     }
@@ -398,12 +531,19 @@ impl DbUi {
         metrics::set_zoom_pct(pct);
     }
 
-    pub fn persist_prefs(&mut self, cx: &mut Context<Self>) {
-        let prefs = store::Prefs {
+    /// Everything the app remembers about how the window is laid out.
+    fn current_prefs(&self) -> store::Prefs {
+        store::Prefs {
             theme: self.theme.id.to_string(),
             zoom_pct: metrics::zoom_pct(),
             sql_editor_height_px: f32::from(self.editor_height).round() as u32,
-        };
+            sidebar_width_px: self.sidebar_width.round() as u32,
+            detail_width_px: self.detail_width.round() as u32,
+        }
+    }
+
+    pub fn persist_prefs(&mut self, cx: &mut Context<Self>) {
+        let prefs = self.current_prefs();
         match store::prefs_path().and_then(|path| store::save_prefs(&path, &prefs)) {
             Ok(()) => {}
             Err(error) => {
@@ -414,11 +554,7 @@ impl DbUi {
     }
 
     pub fn persist_theme(&mut self, cx: &mut Context<Self>) {
-        let prefs = store::Prefs {
-            theme: self.theme.id.to_string(),
-            zoom_pct: metrics::zoom_pct(),
-            sql_editor_height_px: f32::from(self.editor_height).round() as u32,
-        };
+        let prefs = self.current_prefs();
         match store::prefs_path().and_then(|path| store::save_prefs(&path, &prefs)) {
             Ok(()) => {
                 self.status = Status::info(format!("Theme: {}", self.theme.label));
@@ -470,7 +606,39 @@ impl DbUi {
         cx.notify();
     }
 
+    /// Close a tab, asking first if it is holding staged changes.
     pub(crate) fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.items.len() {
+            return;
+        }
+        // What is in the detail sidebar has to reach `pending_edits` before
+        // anything counts them, or a value typed and not yet committed is
+        // work the prompt does not know about.
+        if index == self.tabs.active {
+            self.stash_current_draft(cx);
+        }
+        let Some(tab) = self.tabs.items.get(index) else {
+            return;
+        };
+        let changes = tab.pending_change_count();
+        if changes > 0 {
+            self.close_guard = Some(CloseGuard {
+                target: CloseTarget::Tab(index),
+                label: SharedString::from(tab.label()),
+                changes,
+            });
+            cx.notify();
+            return;
+        }
+        self.close_tab_now(index, cx);
+    }
+
+    /// Close a tab and take the staged batch with it, no questions asked.
+    ///
+    /// For the callers where the question makes no sense: the guard has just
+    /// been answered, or the table the tab was showing has been dropped and
+    /// there is nothing left to commit the batch against.
+    pub(crate) fn close_tab_now(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.items.len() {
             return;
         }
@@ -585,6 +753,12 @@ impl DbUi {
     }
 
     pub(crate) fn open_sql_tab(&mut self, cx: &mut Context<Self>) {
+        // Opening a tab moves the front of the deck the same way clicking one
+        // does, so the draft has to be folded away first -- see the note on
+        // `activate_tab`. Without it the tab left behind holds a typed value
+        // that nothing counts, and closing it later throws the value away
+        // without asking.
+        self.stash_current_draft(cx);
         self.tabs.open_sql();
         self.focus = Focus::Editor;
         self.persist_session();
@@ -735,10 +909,75 @@ impl DbUi {
         if !self.workspace.is_open(id) {
             return;
         }
-        let was_active = self.workspace.active_id() == Some(id);
-        if was_active {
+        if self.workspace.active_id() == Some(id) {
             self.stash_current_draft(cx);
         }
+
+        // Every tab this connection owns goes with it, so the count is over
+        // all of them -- the ones behind the front tab included.
+        let changes: usize = self
+            .connection_tabs(id)
+            .map(|tabs| {
+                tabs.items
+                    .iter()
+                    .map(|tab| tab.pending_change_count())
+                    .sum()
+            })
+            .unwrap_or(0);
+        if changes > 0 {
+            let label = self
+                .workspace
+                .get(id)
+                .map(|entry| entry.config.name.clone())
+                .unwrap_or_else(|| "This connection".to_string());
+            self.close_guard = Some(CloseGuard {
+                target: CloseTarget::Connection(id),
+                label: SharedString::from(label),
+                changes,
+            });
+            cx.notify();
+            return;
+        }
+        self.close_connection_tab_now(id, cx);
+    }
+
+    /// Go through with the close the guard is holding.
+    pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) {
+        let Some(guard) = self.close_guard.take() else {
+            return;
+        };
+        match guard.target {
+            CloseTarget::Tab(index) => self.close_tab_now(index, cx),
+            CloseTarget::Connection(id) => self.close_connection_tab_now(id, cx),
+        }
+        cx.notify();
+    }
+
+    /// Leave everything as it was.
+    pub(crate) fn cancel_close(&mut self, cx: &mut Context<Self>) {
+        self.close_guard = None;
+        cx.notify();
+    }
+
+    /// The tab set belonging to a connection, wherever it is currently kept.
+    pub(crate) fn connection_tabs(&self, id: ConnectionId) -> Option<&Tabs> {
+        if self.workspace.active_id() == Some(id) {
+            Some(&self.tabs)
+        } else {
+            self.stashed_tabs.get(&id)
+        }
+    }
+
+    /// Close a connection tab and take every staged batch under it, no
+    /// questions asked.
+    ///
+    /// Reached only once [`Self::close_connection_tab`] has folded the open
+    /// draft away and had its question answered, so it does not stash again.
+    pub(crate) fn close_connection_tab_now(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if !self.workspace.is_open(id) {
+            return;
+        }
+        let was_active = self.workspace.active_id() == Some(id);
 
         if let Some(entry) = self.workspace.get(id) {
             if let Some(driver) = entry.status.driver().cloned() {
@@ -930,6 +1169,9 @@ impl DbUi {
     // -- tables and queries -----------------------------------------------
 
     pub(crate) fn open_table_tab(&mut self, table: TableRef, cx: &mut Context<Self>) {
+        // Same as `open_sql_tab`: what was typed reaches the staged batch
+        // before the tab it belongs to stops being the one in front.
+        self.stash_current_draft(cx);
         self.tabs.open_table(table.clone());
         self.workspace.open_table = Some(table);
         self.selected_cell = None;
@@ -2027,6 +2269,7 @@ impl DbUi {
         };
 
         self.selected_cell = Some((row, next));
+        self.reveal_column(next);
         self.focus = Focus::Grid;
         cx.notify();
     }
@@ -2055,6 +2298,7 @@ impl DbUi {
         };
         selection.extend_to(next);
         self.rebuild_draft(Some(next), cx);
+        self.reveal_row(next, delta > 0);
         self.focus = Focus::Grid;
         cx.notify();
     }
@@ -2896,6 +3140,37 @@ impl DbUi {
     /// splitting them into two round trips would let one succeed while the
     /// other rolls back, which is exactly the state a batch editor exists to
     /// prevent.
+    /// Explain a refused ⌘S, naming where the staged work actually is.
+    ///
+    /// ⌘S commits the tab it is pressed on. Pressed on a tab with nothing
+    /// staged -- a query tab, or a table the user has not touched -- while a
+    /// dot is lit on another one, a bare "nothing to commit" reads as the key
+    /// having failed. The batch is per-tab because each one commits in its own
+    /// transaction against its own table; the fix is to say which tab to press
+    /// it on, not to quietly commit a table the user is not looking at.
+    fn nothing_here_because(&self, reason: &str) -> String {
+        let active = self.tabs.active;
+        let mut count = 0usize;
+        let mut where_it_is: Option<String> = None;
+        for (index, tab) in self.tabs.items.iter().enumerate() {
+            if index == active {
+                continue;
+            }
+            let staged = tab.pending_change_count();
+            if staged > 0 {
+                count += staged;
+                where_it_is.get_or_insert_with(|| tab.label());
+            }
+        }
+
+        match where_it_is {
+            Some(label) => format!(
+                "{reason} — {count} staged on “{label}”. Switch to that tab and press ⌘S.",
+            ),
+            None => reason.to_string(),
+        }
+    }
+
     pub(crate) fn save_pending_edits(&mut self, cx: &mut Context<Self>) {
         if self.refuse_if_read_only("Commit", cx) {
             return;
@@ -2942,7 +3217,8 @@ impl DbUi {
             // ⌘S is a global shortcut, so it lands on tabs with nothing to
             // commit. Saying so beats a silent no-op.
             Some(WorkspaceTab::Sql { .. }) => {
-                self.status = Status::info("Nothing to commit on a query tab");
+                let message = self.nothing_here_because("A query tab has nothing to commit");
+                self.status = Status::info(message);
                 cx.notify();
                 return;
             }
@@ -2950,7 +3226,8 @@ impl DbUi {
         };
 
         if edits.is_empty() && deletes.is_empty() && inserts.is_empty() {
-            self.status = Status::info("No changes to commit");
+            let message = self.nothing_here_because("No changes to commit on this tab");
+            self.status = Status::info(message);
             cx.notify();
             return;
         }
@@ -2967,6 +3244,10 @@ impl DbUi {
         if let Some(WorkspaceTab::Table { saving, .. }) = self.tabs.get_mut(tab_id) {
             *saving = true;
         }
+        // Answering "discard or keep?" with ⌘S is answering it: the batch the
+        // guard was standing in front of is on its way to the server, so the
+        // question -- and the count it was quoting -- is stale.
+        self.close_guard = None;
         self.status = Status::busy(format!("Committing {count} change(s)…"));
         cx.notify();
 
@@ -3074,12 +3355,102 @@ impl DbUi {
         let column = self.selected_cell.map(|(_, column)| column);
 
         self.select_row(next, cx);
+        self.reveal_row(next, delta > 0);
         if stay_on_grid {
             if let Some(column) = column {
                 self.selected_cell = Some((next, column));
             }
             self.focus = Focus::Grid;
             cx.notify();
+        }
+    }
+
+    // -- keeping the keyboard cursor on screen ------------------------------
+
+    /// Scroll the grid so `row` is visible.
+    ///
+    /// `uniform_list` has no "nearest" strategy: once it decides a scroll is
+    /// needed it honours whichever it was given, so a bare `Top` would fling a
+    /// row that fell off the *bottom* all the way up. Passing the direction the
+    /// cursor moved makes each strategy the minimal scroll for that direction --
+    /// down pins the row to the bottom edge, up pins it to the top -- which is
+    /// what keeps holding an arrow key reading as one row at a time.
+    pub(crate) fn reveal_row(&self, row: usize, downward: bool) {
+        self.grid_scroll.scroll_to_item(
+            row,
+            if downward {
+                ScrollStrategy::Bottom
+            } else {
+                ScrollStrategy::Top
+            },
+        );
+    }
+
+    /// Scroll the grid sideways so `column` is visible.
+    ///
+    /// The horizontal pane scrolls whole rows, not cells, so there is no item
+    /// index to scroll to -- the offset has to be computed from the widths the
+    /// header is already drawing with. Nothing happens until the pane has been
+    /// laid out at least once, which is also the only time the arrow keys can
+    /// have moved anything.
+    pub(crate) fn reveal_column(&self, column: usize) {
+        let Some(view) = self.tabs.active().and_then(|tab| tab.result()) else {
+            return;
+        };
+        let hidden = match self.tabs.active() {
+            Some(WorkspaceTab::Table { hidden_columns, .. }) => Some(hidden_columns),
+            _ => None,
+        };
+
+        // Only the drawn columns take up room, so a hidden one contributes
+        // nothing to the offset of the ones after it.
+        let mut start = f32::from(metrics::row_number_width());
+        let mut width = None;
+        for (index, info) in view.set.columns.iter().enumerate() {
+            if hidden.is_some_and(|hidden| hidden.contains(&info.name)) {
+                continue;
+            }
+            let w = view
+                .widths
+                .get(index)
+                .copied()
+                .unwrap_or(metrics::column_min_width());
+            if index == column {
+                width = Some(w);
+                break;
+            }
+            start += w;
+        }
+        let Some(width) = width else {
+            return;
+        };
+
+        let viewport = f32::from(self.grid_h_scroll.bounds().size.width);
+        if viewport <= 0. {
+            return;
+        }
+        let offset = self.grid_h_scroll.offset();
+        let scrolled = -f32::from(offset.x);
+
+        if let Some(next) = h_offset_for(start, width, viewport, scrolled) {
+            self.grid_h_scroll.set_offset(point(px(-next), offset.y));
+        }
+    }
+
+    /// Scroll the schema tree so the item at `index` in
+    /// [`Self::sidebar_visible_items`] is visible.
+    pub(crate) fn reveal_sidebar_cursor(&self) {
+        let Some(cursor) = self.sidebar_cursor.as_ref() else {
+            return;
+        };
+        // The tree renders exactly this list, in this order, so the position
+        // here is the child index the scroll handle knows.
+        if let Some(index) = self
+            .sidebar_visible_items()
+            .iter()
+            .position(|item| item == cursor)
+        {
+            self.sidebar_scroll.scroll_to_item(index);
         }
     }
 
@@ -3367,6 +3738,19 @@ impl DbUi {
         // nothing else can be triggered by accident while it is up.
         if self.confirm.is_some() {
             self.handle_confirm_key(keystroke, cx);
+            return;
+        }
+
+        // The close guard owns it for the same reason. Enter goes through with
+        // the close rather than cancelling it: the prompt is only up because
+        // the user asked to close, and it names the count they are agreeing to
+        // lose. Escape is the way back.
+        if self.close_guard.is_some() {
+            match key {
+                "escape" => self.cancel_close(cx),
+                "enter" => self.confirm_close(cx),
+                _ => {}
+            }
             return;
         }
 
@@ -3979,6 +4363,26 @@ fn draft_is_open(tab: &WorkspaceTab) -> bool {
     )
 }
 
+/// Where the grid has to be scrolled sideways to show a column, or `None` if
+/// it is already on screen.
+///
+/// `start` and `width` place the column in the full width of the row; `scrolled`
+/// is how far the pane has already been panned. The result is the *minimal*
+/// move: a column off the left edge comes to the left edge and one off the
+/// right comes to the right, so walking with ← and → travels a column at a time
+/// rather than jumping the pane around.
+fn h_offset_for(start: f32, width: f32, viewport: f32, scrolled: f32) -> Option<f32> {
+    if start < scrolled {
+        Some(start)
+    } else if start + width > scrolled + viewport {
+        // A column wider than the pane cannot be shown whole; its left edge is
+        // the half worth showing, so it is clamped rather than pushed past.
+        Some((start + width - viewport).max(0.).min(start))
+    } else {
+        None
+    }
+}
+
 fn table_summary(contents: &dbui_app::TableContents) -> String {
     let shown = contents.rows.rows.len();
     let base = match contents.total_rows {
@@ -4009,6 +4413,7 @@ impl Render for DbUi {
         let change_bubble = self.render_change_bubble(cx);
         let context_menu = self.render_context_menu(window, cx);
         let confirm = self.render_confirm(cx);
+        let close_guard = self.render_close_guard(cx);
 
         div()
             .size_full()
@@ -4027,7 +4432,9 @@ impl Render for DbUi {
                 self.change_bubble_drag.is_some()
                     || self.editor_drag.is_some()
                     || self.row_drag.is_some()
-                    || self.column_drag.is_some(),
+                    || self.column_drag.is_some()
+                    || self.sidebar_drag.is_some()
+                    || self.detail_drag.is_some(),
                 |root| {
                     root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         if this.change_bubble_drag.is_some() {
@@ -4039,6 +4446,12 @@ impl Render for DbUi {
                         if this.column_drag.is_some() {
                             this.drag_column(event.position.x, cx);
                         }
+                        if this.sidebar_drag.is_some() {
+                            this.drag_sidebar(event.position.x, cx);
+                        }
+                        if this.detail_drag.is_some() {
+                            this.drag_detail(event.position.x, cx);
+                        }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
@@ -4047,6 +4460,8 @@ impl Render for DbUi {
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
                             this.end_column_drag(cx);
+                            this.end_sidebar_drag(cx);
+                            this.end_detail_drag(cx);
                         }),
                     )
                     // Releasing outside the window has to end the drag too, or
@@ -4059,6 +4474,8 @@ impl Render for DbUi {
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
                             this.end_column_drag(cx);
+                            this.end_sidebar_drag(cx);
+                            this.end_detail_drag(cx);
                         }),
                     )
                 },
@@ -4177,7 +4594,9 @@ impl Render for DbUi {
                     .min_h(px(0.))
                     .overflow_hidden()
                     .child(self.render_sidebar(window, cx))
+                    .child(self.render_sidebar_resize(cx))
                     .child(self.render_main(window, cx))
+                    .children(self.render_detail_resize(cx))
                     .child(self.render_detail_sidebar(cx)),
             )
             .children(change_bubble)
@@ -4186,6 +4605,7 @@ impl Render for DbUi {
             .children(palette)
             .children(context_menu)
             .children(confirm)
+            .children(close_guard)
     }
 }
 
@@ -4225,6 +4645,62 @@ mod tests {
             bubble_height_for(px(BUBBLE_HEIGHT_DEFAULT), px(9000.), px(10.)),
             px(BUBBLE_HEIGHT_MIN)
         );
+    }
+
+    #[test]
+    fn a_rail_follows_the_pointer_whatever_the_zoom() {
+        // Widths are unzoomed, so 60 real pixels of travel is 60 of width at
+        // 100% and only 30 at 200% -- which is what puts the edge back under
+        // the pointer that dragged it.
+        assert_eq!(
+            panel_width_for(SIDEBAR_WIDTH_DEFAULT, px(60.), 1.0, 100., 600.),
+            SIDEBAR_WIDTH_DEFAULT + 60.
+        );
+        assert_eq!(
+            panel_width_for(SIDEBAR_WIDTH_DEFAULT, px(60.), 2.0, 100., 600.),
+            SIDEBAR_WIDTH_DEFAULT + 30.
+        );
+    }
+
+    #[test]
+    fn a_rail_cannot_be_dragged_past_either_stop() {
+        assert_eq!(
+            panel_width_for(SIDEBAR_WIDTH_DEFAULT, px(-9000.), 1.0, 150., 560.),
+            150.,
+            "it must never close by being dragged"
+        );
+        assert_eq!(
+            panel_width_for(DETAIL_WIDTH_DEFAULT, px(9000.), 1.0, 180., 720.),
+            720.,
+            "and never take the whole window"
+        );
+    }
+
+    // -- keeping the cell cursor on screen ------------------------------------
+
+    #[test]
+    fn a_column_already_on_screen_does_not_move_the_pane() {
+        // Columns at 0..100 and 100..200 in a 300-wide pane, nothing panned.
+        assert_eq!(h_offset_for(0., 100., 300., 0.), None);
+        assert_eq!(h_offset_for(100., 100., 300., 0.), None);
+        // And one that ends exactly on the edge is still whole.
+        assert_eq!(h_offset_for(200., 100., 300., 0.), None);
+    }
+
+    #[test]
+    fn a_column_off_an_edge_moves_the_pane_the_minimum() {
+        // Off the right: its right edge comes to the pane's right edge, which
+        // is one column of travel and not a jump to the top of the row.
+        assert_eq!(h_offset_for(300., 100., 300., 0.), Some(100.));
+        // Off the left: its left edge comes to the pane's left edge.
+        assert_eq!(h_offset_for(50., 100., 300., 200.), Some(50.));
+    }
+
+    /// A column too wide to fit shows its left edge, which is where the values
+    /// start -- pinning its right edge instead would scroll the content away.
+    #[test]
+    fn a_column_wider_than_the_pane_shows_its_start() {
+        assert_eq!(h_offset_for(100., 900., 300., 0.), Some(100.));
     }
 
     // -- restoring the tree ---------------------------------------------------

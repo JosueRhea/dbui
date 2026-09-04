@@ -5,7 +5,7 @@ use super::{button, caption};
 use crate::root::{DbUi, Focus, ResultSource};
 use crate::tabs::{TablePane, WorkspaceTab};
 use crate::theme::metrics;
-use gpui::{div, prelude::*, px, ClickEvent, Context, SharedString, Window};
+use gpui::{div, prelude::*, ClickEvent, Context, SharedString, Window};
 
 fn mode_button(
     id: &'static str,
@@ -20,7 +20,7 @@ fn mode_button(
         .items_center()
         .justify_center()
         .px_3()
-        .h(px(26.))
+        .h(metrics::control_height())
         .rounded_md()
         .cursor_pointer()
         .bg(if active { theme.selection } else { theme.elevated })
@@ -195,7 +195,7 @@ impl DbUi {
                 bar.child(caption("Rows / page", theme))
                     .child(
                         div()
-                            .w(px(64.))
+                            .w(metrics::scaled(64.))
                             .flex_shrink_0()
                             .child(text_field(
                                 "page-size-input",

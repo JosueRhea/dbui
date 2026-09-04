@@ -1,20 +1,44 @@
 //! Right-hand detail panel for the selected row.
 
 use super::caption;
-use super::text_field::{text_field, DetailInput, InputTarget};
+use super::text_field::{
+    sized_text_field, text_field, DetailInput, FieldHeight, InputTarget, MAX_VISIBLE_LINES,
+};
 use crate::json_format::{self, JsonStyle};
 use crate::root::DbUi;
 use crate::tabs::WorkspaceTab;
 use crate::theme::{metrics, Theme};
 use dbui_app::domain::Value;
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, Context, SharedString,
+    deferred, div, prelude::*, px, AnyElement, Context, MouseButton, MouseDownEvent, SharedString,
 };
+use std::collections::HashSet;
 
-const DETAIL_WIDTH_BASE: f32 = 280.;
 const STRIP_WIDTH_BASE: f32 = 24.;
 
 impl DbUi {
+    /// The strip between the grid and the detail panel.
+    ///
+    /// Nothing when the panel is collapsed: the 24px rail it leaves behind is
+    /// a button, not a panel, and has no width to drag.
+    pub(crate) fn render_detail_resize(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !self.detail_open {
+            return None;
+        }
+        Some(
+            super::vertical_resize_handle("detail-resize", self.detail_drag.is_some(), &self.theme)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                        this.begin_detail_drag(event.position.x, cx);
+                    }),
+                ),
+        )
+    }
+
     pub(crate) fn render_detail_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
 
@@ -68,7 +92,13 @@ impl DbUi {
                             .and_then(|index| tab.pending_inserts().get(index))
                     })
                 {
-                    render_insert_draft(insert, self.detail_input, theme, cx)
+                    render_insert_draft(
+                        insert,
+                        self.detail_input,
+                        &self.detail_collapsed,
+                        theme,
+                        cx,
+                    )
                 } else if let Some(draft) = draft.as_ref() {
                     // The lead row only decides which write tokens are on
                     // offer; the values on screen come from the draft, which
@@ -79,7 +109,15 @@ impl DbUi {
                         .and_then(|(view, lead)| view.set.rows.get(*lead))
                         .map(|row| row.0.as_slice())
                         .unwrap_or(&[]);
-                    render_table_draft(draft, originals, open_menu, self.detail_input, theme, cx)
+                    render_table_draft(
+                        draft,
+                        originals,
+                        open_menu,
+                        self.detail_input,
+                        &self.detail_collapsed,
+                        theme,
+                        cx,
+                    )
                 } else if selected_row.is_some() {
                     caption("Loading row…", theme).into_any_element()
                 } else {
@@ -91,7 +129,7 @@ impl DbUi {
 
         div()
             .id("detail-sidebar")
-            .w(px(DETAIL_WIDTH_BASE * metrics::zoom()))
+            .w(px(self.detail_width * metrics::zoom()))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -110,7 +148,7 @@ impl DbUi {
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(theme.divider)
-                    .child(div().text_size(px(13.)).child("Details"))
+                    .child(div().text_size(metrics::scaled(13.)).child("Details"))
                     .child(
                         div()
                             .id("detail-collapse")
@@ -156,11 +194,13 @@ fn empty_selection(theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_table_draft(
     draft: &crate::tabs::RowDraft,
     originals: &[Value],
     open_menu: Option<usize>,
     detail_input: Option<DetailInput>,
+    collapsed: &HashSet<String>,
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
@@ -179,6 +219,7 @@ fn render_table_draft(
             let focused = detail_input == Some(DetailInput::Field(index));
             let original = originals.get(index);
             let allow_empty = original.map(allows_empty_token).unwrap_or(true);
+            let height = field_height(name, collapsed);
             div()
                 .id(("detail-field", index))
                 .w_full()
@@ -187,26 +228,30 @@ fn render_table_draft(
                 .flex_col()
                 .gap_1()
                 .child(field_header(
-                    index,
-                    name,
-                    *is_pk,
-                    TokenMenu {
-                        open: open_menu == Some(index),
-                        allow_empty,
-                        bulk,
+                    FieldHeader {
+                        index,
+                        name,
+                        is_pk: *is_pk,
+                        menu: (!*is_pk).then_some(TokenMenu {
+                            open: open_menu == Some(index),
+                            allow_empty,
+                            bulk,
+                        }),
+                        fold: foldable(input, *is_pk).then_some(height),
                     },
                     theme,
                     cx,
                 ))
                 .child(if *is_pk {
-                    read_only_field(input.text(), true, theme).into_any_element()
+                    read_only_field(input.text(), true, height, theme).into_any_element()
                 } else {
-                    text_field(
+                    sized_text_field(
                         ("detail-field-input", index),
                         input,
                         InputTarget::DetailField(index),
                         focused,
                         None,
+                        height,
                         theme,
                         cx,
                     )
@@ -217,7 +262,7 @@ fn render_table_draft(
 
     let message = draft.message.as_ref().map(|(ok, text)| {
         div()
-            .text_size(px(11.))
+            .text_size(metrics::scaled(11.))
             .text_color(if *ok { theme.success } else { theme.danger })
             .child(SharedString::from(text.clone()))
     });
@@ -251,6 +296,7 @@ fn render_table_draft(
 fn render_insert_draft(
     insert: &crate::tabs::PendingRowInsert,
     detail_input: Option<DetailInput>,
+    collapsed: &HashSet<String>,
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
@@ -259,6 +305,7 @@ fn render_insert_draft(
         .iter()
         .enumerate()
         .map(|(index, (name, input, _))| {
+            let height = field_height(name, collapsed);
             div()
                 .id(("insert-field", index))
                 .w_full()
@@ -266,18 +313,27 @@ fn render_insert_draft(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(
-                    div()
-                        .text_color(theme.text_muted)
-                        .text_size(metrics::text_size_small())
-                        .child(SharedString::from(name.clone())),
-                )
-                .child(text_field(
+                .child(field_header(
+                    FieldHeader {
+                        index,
+                        name,
+                        is_pk: false,
+                        // An insert has no stored row behind it, so the write
+                        // tokens have nothing to say: every field already
+                        // reads DEFAULT and is typed over directly.
+                        menu: None,
+                        fold: foldable(input, false).then_some(height),
+                    },
+                    theme,
+                    cx,
+                ))
+                .child(sized_text_field(
                     ("insert-field-input", index),
                     input,
                     InputTarget::InsertField(index),
                     detail_input == Some(DetailInput::Field(index)),
                     None,
+                    height,
                     theme,
                     cx,
                 ))
@@ -311,7 +367,7 @@ fn render_insert_draft(
                 )
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(metrics::scaled(11.))
                         .text_color(theme.text_muted)
                         .child(
                             "Nothing is written until you commit. A field left \
@@ -350,7 +406,7 @@ fn bulk_banner(rows: usize, theme: &Theme) -> AnyElement {
         )
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(metrics::scaled(11.))
                 .text_color(theme.text_muted)
                 .child(
                     "A field you change is written to all of them. MIXED means \
@@ -369,21 +425,33 @@ struct TokenMenu {
     bulk: bool,
 }
 
-fn field_header(
+/// The line above one field: its name, and whatever controls it earns.
+struct FieldHeader<'a> {
     index: usize,
-    name: &str,
+    name: &'a str,
     is_pk: bool,
-    menu: TokenMenu,
-    theme: &Theme,
-    cx: &mut Context<DbUi>,
-) -> AnyElement {
+    /// The write-token dropdown, for a field that can take one.
+    menu: Option<TokenMenu>,
+    /// The height toggle and the height it is currently showing, for a field
+    /// with more lines than a folded box would hold.
+    fold: Option<FieldHeight>,
+}
+
+fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) -> AnyElement {
+    let FieldHeader {
+        index,
+        name,
+        is_pk,
+        menu,
+        fold,
+    } = header;
     let label_color = if is_pk {
         theme.warning
     } else {
         theme.text_muted
     };
 
-    let mut header = div()
+    let mut row = div()
         .relative()
         .flex()
         .items_center()
@@ -391,13 +459,35 @@ fn field_header(
         .gap_2()
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
                 .text_color(label_color)
                 .text_size(metrics::text_size_small())
                 .child(SharedString::from(name.to_string())),
         );
 
-    if !is_pk {
-        header = header.child(
+    if let Some(height) = fold {
+        let open = height == FieldHeight::Full;
+        let field = name.to_string();
+        row = row.child(
+            div()
+                .id(("detail-field-fold", index))
+                .px_1()
+                .rounded_sm()
+                .text_size(metrics::text_size_small())
+                .text_color(if open { theme.text } else { theme.text_faint })
+                .cursor_pointer()
+                .hover(|btn| btn.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_detail_collapsed(&field, cx);
+                }))
+                .child(if open { "⤡" } else { "⤢" }),
+        );
+    }
+
+    if let Some(menu) = menu {
+        row = row.child(
             div()
                 .id(("detail-value-menu-btn", index))
                 .px_1()
@@ -415,13 +505,38 @@ fn field_header(
                 }))
                 .child("▾"),
         );
+        if menu.open {
+            row = row.child(special_value_menu(index, &menu, theme, cx));
+        }
     }
 
-    if menu.open && !is_pk {
-        header = header.child(special_value_menu(index, &menu, theme, cx));
-    }
+    row.into_any_element()
+}
 
-    header.into_any_element()
+/// How tall to draw one field: all of it, unless it has been folded down.
+fn field_height(name: &str, collapsed: &HashSet<String>) -> FieldHeight {
+    if collapsed.contains(name) {
+        FieldHeight::Capped
+    } else {
+        FieldHeight::Full
+    }
+}
+
+/// Whether a field is long enough for folding to change anything.
+///
+/// A value that fits inside the cap gets no toggle: a control that does
+/// nothing is worse than no control, and most columns in a row are one line.
+///
+/// A read-only field is measured after [`json_format::display_text`], which is
+/// what it actually paints -- a one-line JSON blob that pretty-prints to thirty
+/// is thirty lines on screen, whatever its buffer says.
+fn foldable(input: &crate::text_input::TextInput, read_only: bool) -> bool {
+    let lines = if read_only {
+        json_format::display_text(input.text()).split('\n').count()
+    } else {
+        input.layout().lines.len()
+    };
+    lines > MAX_VISIBLE_LINES
 }
 
 fn special_value_menu(
@@ -483,7 +598,7 @@ fn special_value_menu(
             .top_full()
             .right_0()
             .mt_1()
-            .min_w(px(160.))
+            .min_w(metrics::scaled(160.))
             .flex()
             .flex_col()
             .py_1()
@@ -513,7 +628,7 @@ fn allows_empty_token(value: &Value) -> bool {
     )
 }
 
-fn read_only_field(text: &str, muted: bool, theme: &Theme) -> AnyElement {
+fn read_only_field(text: &str, muted: bool, height: FieldHeight, theme: &Theme) -> AnyElement {
     let display = json_format::display_text(text);
     let color = if muted {
         theme.text_faint
@@ -527,7 +642,7 @@ fn read_only_field(text: &str, muted: bool, theme: &Theme) -> AnyElement {
             .min_w(px(0.))
             .flex()
             .items_center()
-            .h(px(28.))
+            .h(metrics::scaled(28.))
             .px_2()
             .rounded_md()
             .bg(theme.background)
@@ -550,15 +665,19 @@ fn read_only_field(text: &str, muted: bool, theme: &Theme) -> AnyElement {
 
     let spans = json_format::highlight_spans(&display);
     let lines: Vec<&str> = display.split('\n').collect();
-    let visible = lines.len().min(8).max(1);
+    let visible = match height {
+        FieldHeight::Capped => lines.len().min(MAX_VISIBLE_LINES),
+        FieldHeight::Full => lines.len(),
+    }
+    .max(1);
     let line_h = px(18.);
     // Lines + `py_1` + `border_1`; without the border the last line was clipped.
-    let height = px(18. * visible as f32 + 8. + 2.);
+    let box_h = px(18. * visible as f32 + 8. + 2.);
 
     let mut consumed = 0usize;
     let painted: Vec<AnyElement> = lines
         .into_iter()
-        .take(8)
+        .take(visible)
         .map(|line| {
             let line_start = consumed;
             let line_end = consumed + line.len();
@@ -589,7 +708,7 @@ fn read_only_field(text: &str, muted: bool, theme: &Theme) -> AnyElement {
     div()
         .w_full()
         .min_w(px(0.))
-        .h(height)
+        .h(box_h)
         .px_2()
         .py_1()
         .rounded_md()
@@ -656,4 +775,28 @@ fn read_only_line_chunks(
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default is the whole value. Folding is the exception, and it is the
+    /// user's to ask for -- nothing puts a column in the set on its own.
+    #[test]
+    fn a_field_is_full_height_until_it_is_folded() {
+        let mut collapsed = HashSet::new();
+        assert_eq!(field_height("feature_flags", &collapsed), FieldHeight::Full);
+
+        collapsed.insert("feature_flags".to_string());
+        assert_eq!(
+            field_height("feature_flags", &collapsed),
+            FieldHeight::Capped
+        );
+        assert_eq!(
+            field_height("grupo_id", &collapsed),
+            FieldHeight::Full,
+            "folding one column says nothing about the next"
+        );
+    }
 }

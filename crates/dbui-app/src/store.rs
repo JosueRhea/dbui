@@ -91,6 +91,12 @@ pub struct Prefs {
     /// SQL editor pane height in CSS pixels (unzoomed).
     #[serde(default = "default_sql_editor_height_px")]
     pub sql_editor_height_px: u32,
+    /// Schema tree width in CSS pixels (unzoomed).
+    #[serde(default = "default_sidebar_width_px")]
+    pub sidebar_width_px: u32,
+    /// Row detail panel width in CSS pixels (unzoomed).
+    #[serde(default = "default_detail_width_px")]
+    pub detail_width_px: u32,
 }
 
 fn default_theme_id() -> String {
@@ -105,12 +111,22 @@ fn default_sql_editor_height_px() -> u32 {
     150
 }
 
+fn default_sidebar_width_px() -> u32 {
+    258
+}
+
+fn default_detail_width_px() -> u32 {
+    280
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
             theme: default_theme_id(),
             zoom_pct: default_zoom_pct(),
             sql_editor_height_px: default_sql_editor_height_px(),
+            sidebar_width_px: default_sidebar_width_px(),
+            detail_width_px: default_detail_width_px(),
         }
     }
 }
