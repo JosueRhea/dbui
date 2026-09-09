@@ -44,15 +44,31 @@ pub fn run() {
     };
 
     // A store that cannot be read is not fatal: the app opens with no saved
-    // connections, and says why on the status bar once there is one.
-    let (saved, load_error) = match store::connections_path().and_then(|path| store::load(&path)) {
-        Ok(configs) => (configs, None),
-        Err(error) => (Vec::new(), Some(error.to_string())),
+    // connections, and says why on the status bar once there is one. The same
+    // goes for a keychain that will not hand back the passwords, and for
+    // preferences that will not parse -- each one is a default the user did not
+    // choose, so each one is reported rather than assumed.
+    let mut startup_errors = Vec::new();
+
+    let saved = match store::connections_path().and_then(|path| store::load(&path)) {
+        Ok(loaded) => {
+            startup_errors.extend(loaded.password_error);
+            loaded.configs
+        }
+        Err(error) => {
+            startup_errors.push(error.to_string());
+            Vec::new()
+        }
     };
 
-    let prefs = store::prefs_path()
-        .and_then(|path| store::load_prefs(&path))
-        .unwrap_or_default();
+    let prefs = match store::prefs_path().and_then(|path| store::load_prefs(&path)) {
+        Ok(prefs) => prefs,
+        Err(error) => {
+            startup_errors.push(format!("Could not read preferences: {error}"));
+            store::Prefs::default()
+        }
+    };
+    let load_error = (!startup_errors.is_empty()).then(|| startup_errors.join("; "));
 
     // What was open last time. Pruned against the connections that actually
     // loaded, so a session naming a deleted -- or unreadable -- connection

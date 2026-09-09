@@ -185,12 +185,12 @@ async fn fetch_latest(current: Version) -> Result<Option<Update>, UpdateError> {
         return Ok(None);
     };
 
-    // The checksums file is best-effort: a release without one still installs,
-    // because `install` verifies the signature either way.
-    let sha256 = match checksum_for(&client, &body, &update.url).await {
-        Ok(sum) => sum,
-        Err(_) => None,
-    };
+    // A release *without* a checksums file still installs, because `install`
+    // verifies the signature either way -- that case is `Ok(None)`. A
+    // checksums file that is published but cannot be read is different: the
+    // release means to be verified byte for byte, and quietly downgrading to
+    // an unverified download is not ours to decide.
+    let sha256 = checksum_for(&client, &body, &update.url).await?;
     Ok(Some(Update { sha256, ..update }))
 }
 

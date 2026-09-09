@@ -37,3 +37,5 @@ keyring = { version = "3", default-features = false, features = [
 [dev-dependencies]
 # The updater's live tests drive async code directly.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The command tests stand a stub driver up against the `DatabaseDriver` port.
+async-trait = { workspace = true }

@@ -205,39 +205,36 @@ impl DatabaseDriver for MySqlDriver {
             .await
             .map_err(|error| DriverError::catalog(&error))?;
 
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                Some(Column {
-                    name: row.try_get::<String, _>("column_name").ok()?,
-                    data_type: row.try_get::<String, _>("data_type").ok()?,
+        // A row that will not decode fails the whole read. Dropping it would
+        // hide a column the table really has, and defaulting its key flag away
+        // would leave the grid paging an unordered table and refusing edits,
+        // both of them silently.
+        rows.iter()
+            .map(|row| {
+                let catalog = |error: sqlx::Error| DriverError::catalog(&error);
+                let name = row.try_get::<String, _>("column_name").map_err(catalog)?;
+                Ok(Column {
+                    references: keys.iter().find(|key| key.column == name).cloned(),
+                    name,
+                    data_type: row.try_get::<String, _>("data_type").map_err(catalog)?,
                     // information_schema answers with the strings "YES"/"NO".
                     nullable: row
                         .try_get::<String, _>("is_nullable")
-                        .map(|flag| flag.eq_ignore_ascii_case("YES"))
-                        .unwrap_or(true),
-                    default: row.try_get::<Option<String>, _>("column_default").ok().flatten(),
+                        .map_err(catalog)?
+                        .eq_ignore_ascii_case("YES"),
+                    // Only cosmetic, so still best effort.
+                    default: row
+                        .try_get::<Option<String>, _>("column_default")
+                        .ok()
+                        .flatten(),
                     // "PRI" marks a primary-key member; "UNI" and "MUL" are
                     // other index kinds and are not what the grid highlights.
-                    is_primary_key: row
-                        .try_get::<String, _>("column_key")
-                        .map(|key| key == "PRI")
-                        .unwrap_or(false),
-                    ordinal: row
-                        .try_get::<u32, _>("ordinal")
-                        .map(|n| n as i32)
-                        .unwrap_or(0),
-                    references: None,
+                    is_primary_key: row.try_get::<String, _>("column_key").map_err(catalog)?
+                        == "PRI",
+                    ordinal: row.try_get::<u32, _>("ordinal").map_err(catalog)? as i32,
                 })
             })
-            .map(|mut column: Column| {
-                column.references = keys
-                    .iter()
-                    .find(|key| key.column == column.name)
-                    .cloned();
-                column
-            })
-            .collect())
+            .collect()
     }
 
     async fn table_rows(

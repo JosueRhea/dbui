@@ -139,25 +139,30 @@ impl DatabaseDriver for SqliteDriver {
             .await
             .map_err(|error| DriverError::catalog(&error))?;
 
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let name = row.try_get::<String, _>("column_name").ok()?;
-                Some(Column {
+        // A row that will not decode fails the whole read: a dropped column is
+        // a column missing from the structure pane, and a defaulted key flag is
+        // an unordered page the grid will not let anyone edit -- neither with a
+        // word on screen to say so.
+        rows.iter()
+            .map(|row| {
+                let catalog = |error: sqlx::Error| DriverError::catalog(&error);
+                let name = row.try_get::<String, _>("column_name").map_err(catalog)?;
+                Ok(Column {
                     references: keys.iter().find(|key| key.column == name).cloned(),
                     name,
-                    data_type: row.try_get::<String, _>("data_type").unwrap_or_default(),
-                    nullable: row.try_get::<i64, _>("not_null").unwrap_or(0) == 0,
+                    data_type: row.try_get::<String, _>("data_type").map_err(catalog)?,
+                    nullable: row.try_get::<i64, _>("not_null").map_err(catalog)? == 0,
+                    // Only cosmetic, so still best effort.
                     default: row
                         .try_get::<Option<String>, _>("column_default")
                         .ok()
                         .flatten(),
                     // `pk` is the 1-based position in the key, 0 outside it.
-                    is_primary_key: row.try_get::<i64, _>("pk_position").unwrap_or(0) > 0,
-                    ordinal: row.try_get::<i64, _>("ordinal").unwrap_or(0) as i32,
+                    is_primary_key: row.try_get::<i64, _>("pk_position").map_err(catalog)? > 0,
+                    ordinal: row.try_get::<i64, _>("ordinal").map_err(catalog)? as i32,
                 })
             })
-            .collect())
+            .collect()
     }
 
     async fn table_rows(
