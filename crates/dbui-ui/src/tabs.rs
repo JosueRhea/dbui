@@ -812,8 +812,39 @@ pub enum WorkspaceTab {
         /// it with one bolted on would be rewriting the user's SQL behind
         /// their back -- so this reorders the rows already fetched and leaves
         /// the statement alone.
-        sort: Option<SortKey>,
+        sort: Option<QuerySort>,
     },
+}
+
+/// Which column a query result is sorted by, and which way.
+///
+/// By index, where a table tab's [`SortKey`] is by name: `SELECT a.id, b.id`
+/// returns two columns both called `id`, and a name would sort the first of
+/// them whichever header was clicked. A table cannot have two columns of one
+/// name, so the clause the server runs is safe to spell out in names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuerySort {
+    /// Index into the result's own columns, not a position in the drawn order.
+    pub column: usize,
+    pub ascending: bool,
+}
+
+impl QuerySort {
+    /// Ascending, descending, then unsorted -- the same three steps a table
+    /// header cycles through, see [`SortKey::cycled`].
+    pub fn cycled(current: Option<QuerySort>, column: usize) -> Option<QuerySort> {
+        match current {
+            Some(key) if key.column == column && key.ascending => Some(QuerySort {
+                column,
+                ascending: false,
+            }),
+            Some(key) if key.column == column => None,
+            _ => Some(QuerySort {
+                column,
+                ascending: true,
+            }),
+        }
+    }
 }
 
 impl WorkspaceTab {

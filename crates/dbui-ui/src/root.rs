@@ -438,6 +438,9 @@ pub struct DbUi {
     pub(crate) completion_scroll: ScrollHandle,
     pub(crate) picker_scroll: ScrollHandle,
     pub(crate) change_bubble_scroll: ScrollHandle,
+    /// Test-only: see `persist_session`.
+    #[cfg(test)]
+    pub(crate) session_writes: std::cell::Cell<usize>,
 }
 
 /// A tab being dragged along the strip.
@@ -604,6 +607,8 @@ impl DbUi {
             completion_scroll: ScrollHandle::new(),
             picker_scroll: ScrollHandle::new(),
             change_bubble_scroll: ScrollHandle::new(),
+            #[cfg(test)]
+            session_writes: std::cell::Cell::new(0),
             history: dbui_app::history::history_path()
                 .map(|path| dbui_app::history::load(&path))
                 .unwrap_or_default(),
@@ -1638,7 +1643,19 @@ impl DbUi {
         self.stash_current_draft(cx);
 
         if matches!(self.tabs.active(), Some(WorkspaceTab::Sql { .. })) {
-            self.sort_query_result(column, cx);
+            // By name, so the first column of that name is the one sorted.
+            // Only reached from callers that have nothing better -- the
+            // header itself knows which column it is and uses
+            // `toggle_sort_at`, because a query can name two of them alike.
+            let Some(at) = self
+                .tabs
+                .active()
+                .and_then(|tab| tab.result())
+                .and_then(|view| view.set.columns.iter().position(|info| info.name == column))
+            else {
+                return;
+            };
+            self.sort_query_result(at, cx);
             return;
         }
 
@@ -1658,24 +1675,42 @@ impl DbUi {
         self.load_active_table(cx);
     }
 
+    /// Click a header, when the header knows which column it is.
+    ///
+    /// The index, not the name: a query result can carry two columns of the
+    /// same name (`SELECT a.id, b.id`), and sorting by name would sort the
+    /// first of them whichever of the two was clicked.
+    pub(crate) fn toggle_sort_at(&mut self, column: usize, cx: &mut Context<Self>) {
+        if matches!(self.tabs.active(), Some(WorkspaceTab::Sql { .. })) {
+            self.stash_current_draft(cx);
+            self.sort_query_result(column, cx);
+            return;
+        }
+        let name = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|view| view.set.columns.get(column))
+            .map(|info| info.name.clone());
+        if let Some(name) = name {
+            self.toggle_sort(&name, cx);
+        }
+    }
+
     /// Sort a query result without touching the query.
     ///
     /// The rows already fetched are reordered in place. Nothing is sent, the
     /// statement in the editor is left exactly as written, and a third click
     /// puts the server's own order back -- which is why the view keeps where
     /// each row started.
-    fn sort_query_result(&mut self, column_name: &str, cx: &mut Context<Self>) {
-        let Some(column) = self
+    fn sort_query_result(&mut self, column: usize, cx: &mut Context<Self>) {
+        let column_name = self
             .tabs
             .active()
             .and_then(|tab| tab.result())
-            .and_then(|view| {
-                view.set
-                    .columns
-                    .iter()
-                    .position(|info| info.name == column_name)
-            })
-        else {
+            .and_then(|view| view.set.columns.get(column))
+            .map(|info| info.name.clone());
+        let Some(column_name) = column_name else {
             return;
         };
 
@@ -1691,12 +1726,12 @@ impl DbUi {
             return;
         };
 
-        let next = dbui_app::domain::SortKey::cycled(sort.as_ref(), column_name);
+        let next = crate::tabs::QuerySort::cycled(*sort, column);
         match &next {
             Some(key) => view.sort_rows(column, key.ascending),
             None => view.restore_server_order(),
         }
-        *sort = next.clone();
+        *sort = next;
 
         // Every row index the rest of the window is holding refers to a
         // position, and the positions just moved. Keeping the selection would
@@ -1751,13 +1786,47 @@ impl DbUi {
         self.load_active_table(cx);
     }
 
-    /// The sort the active tab is showing, for the header arrow.
-    pub(crate) fn active_sort(&self) -> Option<&dbui_app::domain::SortKey> {
-        match self.tabs.active() {
-            Some(WorkspaceTab::Table { sort, .. }) | Some(WorkspaceTab::Sql { sort, .. }) => {
-                sort.as_ref()
+    /// The sort the active tab is showing, named -- for the palette and for
+    /// anything reporting it in words.
+    ///
+    /// Owned rather than borrowed because a query's sort is held by index and
+    /// the name is read back off the result to answer this.
+    pub(crate) fn active_sort(&self) -> Option<dbui_app::domain::SortKey> {
+        match self.tabs.active()? {
+            WorkspaceTab::Table { sort, .. } => sort.clone(),
+            WorkspaceTab::Sql { sort, result, .. } => {
+                let sort = (*sort)?;
+                let name = result
+                    .as_ref()
+                    .and_then(|view| view.set.columns.get(sort.column))
+                    .map(|info| info.name.clone())?;
+                Some(dbui_app::domain::SortKey {
+                    column: name,
+                    ascending: sort.ascending,
+                })
             }
-            None => None,
+        }
+    }
+
+    /// Which column carries the header arrow, by index into the result's
+    /// columns.
+    ///
+    /// The header draws by index rather than matching on the name, so that a
+    /// query returning two columns of one name marks the one that is actually
+    /// sorted instead of both of them.
+    pub(crate) fn active_sort_column(&self) -> Option<(usize, bool)> {
+        match self.tabs.active()? {
+            WorkspaceTab::Sql { sort, .. } => sort.map(|key| (key.column, key.ascending)),
+            WorkspaceTab::Table { sort, result, .. } => {
+                let sort = sort.as_ref()?;
+                let at = result
+                    .as_ref()?
+                    .set
+                    .columns
+                    .iter()
+                    .position(|info| info.name == sort.column)?;
+                Some((at, sort.ascending))
+            }
         }
     }
 
@@ -2818,13 +2887,14 @@ impl DbUi {
             return;
         };
         if drag.moved {
-            if let Some(index) = self.tabs.items.iter().position(|tab| tab.id() == drag.id) {
-                self.activate_tab(index, cx);
+            match self.tabs.items.iter().position(|tab| tab.id() == drag.id) {
+                // `activate_tab` writes the session on its way through.
+                Some(index) if index != self.tabs.active => self.activate_tab(index, cx),
+                // Dragging the tab that was already in front leaves it there,
+                // so there is nothing to activate -- but the order around it
+                // changed, and that still has to be written.
+                _ => self.persist_session(),
             }
-            // Unconditionally, not by way of `activate_tab`: dragging the tab
-            // that was already in front leaves it there, and that early
-            // return would take the new order down with it.
-            self.persist_session();
         }
         cx.notify();
     }
@@ -2861,35 +2931,50 @@ impl DbUi {
     /// which leaves everything keyed off the selected cell — editing in place,
     /// following a foreign key — out of reach.
     pub(crate) fn move_selected_cell(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(view) = self.tabs.active().and_then(|tab| tab.result()) else {
+        let Some(tab) = self.tabs.active() else {
             return;
         };
-        let columns = view.set.columns.len();
-        if columns == 0 {
+        // The columns as drawn, by result index. Stepping through the
+        // result's own order instead would walk a reordered grid sideways in
+        // whatever order the server happened to send, and would stop on
+        // columns the user has hidden.
+        let drawn: Vec<usize> = tab
+            .display_columns()
+            .into_iter()
+            .map(|(at, _)| at)
+            .collect();
+        if drawn.is_empty() {
             return;
         }
+        let selected_row = tab.selected_row();
 
         let row = match self.selected_cell {
             Some((row, _)) => row,
             // No cell yet: start at the row the detail sidebar is describing.
-            None => match self.tabs.active().and_then(|tab| tab.selected_row()) {
+            None => match selected_row {
                 Some(row) => row,
                 None => return,
             },
         };
-        let next = match self.selected_cell {
-            Some((_, column)) => {
+        // Where the cell sits *on screen*, so a step is a step the eye can
+        // follow. A column that has since been hidden is not on screen at
+        // all, and starts the walk from the near edge instead.
+        let at = self
+            .selected_cell
+            .and_then(|(_, column)| drawn.iter().position(|drawn| *drawn == column));
+        let next = match at {
+            Some(at) => {
                 let step = if delta < 0 {
-                    column + columns - 1
+                    at + drawn.len() - 1
                 } else {
-                    column + 1
+                    at + 1
                 };
-                step % columns
+                drawn[step % drawn.len()]
             }
             // Arriving from a row selection lands on the first column going
             // right and the last going left.
-            None if delta < 0 => columns - 1,
-            None => 0,
+            None if delta < 0 => drawn[drawn.len() - 1],
+            None => drawn[0],
         };
 
         self.selected_cell = Some((row, next));
@@ -3369,8 +3454,10 @@ impl DbUi {
                 .and_then(|tab| tab.result())
                 .and_then(|view| view.set.columns.get(drag.column))
                 .map(|info| info.name.clone());
-            if let Some(name) = name {
-                self.toggle_sort(&name, cx);
+            if name.is_some() {
+                // By index: the header knows which column it is, and a query
+                // can return two of that name.
+                self.toggle_sort_at(drag.column, cx);
                 return;
             }
         } else {
@@ -4532,6 +4619,11 @@ impl DbUi {
     /// an unwritable one is not worth taking over the status bar that is
     /// describing the user's actual query.
     pub(crate) fn persist_session(&self) {
+        // How many times the session has been written, so a test can hold the
+        // line that a drag writes once on release and not once a slot.
+        #[cfg(test)]
+        self.session_writes.set(self.session_writes.get() + 1);
+
         let session = self.session_snapshot();
         let _ = session::session_path().and_then(|path| session::save(&path, &session));
     }

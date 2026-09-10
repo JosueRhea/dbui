@@ -1942,6 +1942,74 @@ fn a_moved_column_survives_a_relaunch(cx: &mut TestAppContext) {
     assert_eq!(column_order.as_slice(), ["name", "id"]);
 }
 
+/// The column the cell cursor is on, by name.
+fn selected_column_name(view: &DbUi) -> Option<String> {
+    let (_, column) = view.selected_cell?;
+    view.tabs
+        .active()
+        .and_then(|tab| tab.result())
+        .and_then(|v| v.set.columns.get(column))
+        .map(|info| info.name.clone())
+}
+
+/// Arrow keys walk the columns the way they are drawn.
+///
+/// The cursor used to step through the result's own column order, which is
+/// the order the server sent -- so on a grid whose columns had been dragged
+/// about, pressing the right arrow could move the highlight leftwards.
+#[gpui::test]
+fn the_cell_cursor_walks_the_columns_as_they_are_drawn(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        // "name" (result index 1) carried onto "id" (result index 0).
+        view.begin_column_move(1, gpui::px(200.));
+        view.drag_column_over(0, gpui::px(60.), cx);
+        view.end_column_move(cx);
+        assert_eq!(drawn_columns(view), ["name", "id"]);
+
+        view.selected_cell = None;
+        view.move_selected_cell(1, cx);
+        assert_eq!(
+            selected_column_name(view).as_deref(),
+            Some("name"),
+            "the first column as drawn, not as the server sent it"
+        );
+        view.move_selected_cell(1, cx);
+        assert_eq!(selected_column_name(view).as_deref(), Some("id"));
+        view.move_selected_cell(1, cx);
+        assert_eq!(
+            selected_column_name(view).as_deref(),
+            Some("name"),
+            "and it wraps round the drawn order"
+        );
+    });
+}
+
+/// A hidden column is not on screen, so the cursor does not stop on it --
+/// there would be nothing to see where the highlight had gone.
+#[gpui::test]
+fn the_cell_cursor_steps_over_a_hidden_column(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        view.toggle_column_hidden("name", cx);
+        assert_eq!(drawn_columns(view), ["id"]);
+
+        view.selected_cell = None;
+        view.move_selected_cell(1, cx);
+        assert_eq!(selected_column_name(view).as_deref(), Some("id"));
+        view.move_selected_cell(1, cx);
+        assert_eq!(
+            selected_column_name(view).as_deref(),
+            Some("id"),
+            "the only drawn column is the only one it can land on"
+        );
+    });
+}
+
 /// A sort is part of where the user was, so it comes back with the session.
 #[gpui::test]
 fn a_sort_survives_a_relaunch(cx: &mut TestAppContext) {
@@ -2382,6 +2450,90 @@ fn picking_another_statement_starts_unsorted(cx: &mut TestAppContext) {
         view.select_statement_result(0, cx);
         assert!(view.active_sort().is_none());
         assert_eq!(grid_column(view, 0), vec!["0", "1", "2"]);
+    });
+}
+
+/// Put one query result on the tab, with columns named exactly as given.
+fn put_query_result(
+    view: &mut DbUi,
+    columns: &[&str],
+    rows: Vec<Vec<i64>>,
+    cx: &mut gpui::Context<DbUi>,
+) {
+    use dbui_app::domain::{
+        ColumnInfo, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, Value,
+    };
+    let sql = "SELECT a.id, b.id FROM a JOIN b";
+    let result = QueryResult {
+        statement: sql.into(),
+        outcome: QueryOutcome::Rows(ResultSet {
+            columns: columns
+                .iter()
+                .map(|name| ColumnInfo {
+                    name: (*name).to_string(),
+                    type_name: "int8".into(),
+                })
+                .collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| Row(row.into_iter().map(Value::Int).collect()))
+                .collect(),
+            truncated: false,
+        }),
+        stats: QueryStats {
+            elapsed: std::time::Duration::from_millis(1),
+        },
+    };
+    let tab_id = view.tabs.active_id().expect("a tab");
+    let batch = dbui_app::BatchQueryResult {
+        last_rows: Some(result.clone()),
+        attempted: 1,
+        results: vec![result],
+        total_elapsed: std::time::Duration::from_millis(1),
+        failure: None,
+    };
+    view.absorb_batch_result_for_test(tab_id, batch, &[sql.to_string()], true);
+    cx.notify();
+}
+
+/// `SELECT a.id, b.id` returns two columns both called `id`. Clicking the
+/// second header has to sort the second column.
+///
+/// The sort used to be carried by name, so it found the first column of that
+/// name and sorted that one -- clicking the right-hand header reordered the
+/// left-hand one, or looked like it did nothing at all.
+#[gpui::test]
+fn a_query_sorts_the_header_that_was_clicked_not_the_first_of_its_name(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_query_result(
+            view,
+            &["id", "id"],
+            vec![vec![1, 30], vec![2, 20], vec![3, 10]],
+            cx,
+        );
+        assert_eq!(grid_column(view, 0), ["1", "2", "3"]);
+        assert_eq!(grid_column(view, 1), ["30", "20", "10"]);
+
+        // A press on the second header that never travels is a click on it.
+        view.begin_column_move(1, gpui::px(300.));
+        view.end_column_move(cx);
+
+        assert_eq!(
+            grid_column(view, 1),
+            ["10", "20", "30"],
+            "the column that was clicked is the column that sorted"
+        );
+        assert_eq!(
+            grid_column(view, 0),
+            ["3", "2", "1"],
+            "and its row carried the other column along with it"
+        );
+
+        // The arrow belongs to that one header, not to both of them.
+        assert_eq!(view.active_sort_column(), Some((1, true)));
     });
 }
 
@@ -5461,6 +5613,162 @@ fn a_dragged_order_survives_a_restart(cx: &mut TestAppContext) {
 }
 
 // -- the tab bar's own right-click menu -------------------------------------
+
+/// Clicking in the SQL editor puts the caret under the pointer.
+///
+/// The mapping runs through two separate offsets -- a hit canvas inset past
+/// the pane's padding, and a gutter subtracted from the local x -- and they
+/// have to add up to exactly where the text is drawn. The check that they do
+/// is that the canvas and the scrollport share a left edge.
+#[gpui::test]
+fn clicking_in_the_sql_editor_lands_the_caret_under_the_pointer(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            *editor = crate::text_input::TextInput::with_text("ABCDEFGHIJKLMNOP", true);
+            editor.move_to(0);
+        }
+        view.focus = crate::root::Focus::Editor;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let (hit, port) = view.read_with(cx, |view, _| match view.tabs.active() {
+        Some(WorkspaceTab::Sql { editor, .. }) => (
+            editor.hit_bounds_slot().get(),
+            Some(editor.scroll_handle().bounds()),
+        ),
+        _ => (None, None),
+    });
+    let (hit, port) = (
+        hit.expect("the editor was laid out"),
+        port.expect("a scrollport"),
+    );
+    assert_eq!(
+        hit.left(),
+        port.left(),
+        "the hit canvas and the text it maps onto start at the same x"
+    );
+
+    // Then the mapping itself, at three points along the line.
+    let char_w = crate::text_input::char_width();
+    let gutter = crate::text_input::editor_gutter();
+    for target in [0usize, 5, 10] {
+        let x = hit.left() + gutter + gpui::px(char_w * target as f32 + char_w * 0.5);
+        cx.simulate_click(
+            gpui::point(x, hit.top() + gpui::px(4.)),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let caret = view.read_with(cx, |view, _| match view.tabs.active() {
+            Some(WorkspaceTab::Sql { editor, .. }) => editor.cursor(),
+            _ => usize::MAX,
+        });
+        assert_eq!(caret, target, "clicking character {target}");
+    }
+}
+
+/// The scrollbar is one component used by ten panes, and the grid is only
+/// the one it was written against. This is the same thumb over the connection
+/// picker: a list long enough to overflow, dragged by its bar.
+#[gpui::test]
+fn dragging_the_connection_picker_scrollbar_scrolls_the_list(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_with(cx, saved_connections(60));
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(800.)));
+    view.update(cx, |view, cx| {
+        view.connection_picker_open = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let port = view.read_with(cx, |view, _| view.picker_scroll.bounds());
+    assert!(port.size.height > gpui::px(0.), "the picker was laid out");
+    let max = view.read_with(cx, |view, _| view.picker_scroll.max_offset().height);
+    assert!(
+        max > gpui::px(0.),
+        "60 connections overflow it, got {max:?}"
+    );
+
+    let x = port.right() - gpui::px(6.);
+    let top = port.top() + gpui::px(6.);
+    let offset =
+        |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.picker_scroll.offset().y);
+    assert_eq!(offset(cx), gpui::px(0.), "starts at the top");
+
+    cx.simulate_mouse_move(gpui::point(x, top), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(
+        gpui::point(x, top),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        gpui::point(x, port.center().y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        gpui::point(x, port.center().y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let scrolled = offset(cx);
+    assert!(
+        scrolled < gpui::px(0.),
+        "dragging the thumb scrolled the picker, got {scrolled:?}"
+    );
+}
+
+/// A drag writes the session once, when it is let go.
+///
+/// It used to write on every slot the tab crossed -- a whole-file,
+/// synchronous write per mouse-move, in the middle of a gesture.
+#[gpui::test]
+fn dragging_a_tab_writes_the_session_once_on_release(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+        view.session_writes.set(0);
+
+        view.begin_tab_drag(ids[2], gpui::px(260.));
+        view.drag_tab_over(1, gpui::px(160.), cx);
+        view.drag_tab_over(0, gpui::px(40.), cx);
+        assert_eq!(
+            view.session_writes.get(),
+            0,
+            "a drag in flight writes nothing"
+        );
+
+        view.end_tab_drag(cx);
+        assert_eq!(
+            view.session_writes.get(),
+            1,
+            "and letting go writes it exactly once"
+        );
+    });
+}
+
+/// The same bargain for a column dragged across the header.
+#[gpui::test]
+fn dragging_a_column_writes_the_session_once_on_release(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.session_writes.set(0);
+        view.begin_column_move(1, gpui::px(200.));
+        view.drag_column_over(0, gpui::px(60.), cx);
+        assert_eq!(view.session_writes.get(), 0, "nothing mid-drag");
+
+        view.end_column_move(cx);
+        assert_eq!(view.session_writes.get(), 1, "written once on release");
+    });
+}
 
 /// Three tabs, and the id of each, left to right.
 fn open_three_tabs(view: &mut DbUi, cx: &mut gpui::Context<DbUi>) -> Vec<crate::tabs::TabId> {

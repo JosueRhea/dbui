@@ -62,7 +62,7 @@ impl DbUi {
             .sum::<f32>()
             + f32::from(metrics::row_number_width());
 
-        let sort = self.active_sort().cloned();
+        let sort = self.active_sort_column();
         // Both kinds of tab sort, by two different means. A table tab sends
         // the order to the server and pages through it; a query tab reorders
         // the rows already fetched, because a query's order is whatever its
@@ -595,7 +595,9 @@ fn render_header(
     visible: &[(usize, &dbui_app::domain::ColumnInfo)],
     theme: &crate::theme::Theme,
     total_width: f32,
-    sort: Option<dbui_app::domain::SortKey>,
+    // `sort` is the sorted column's index into the result, not its name: a
+    // query can return two columns of one name and only one of them is sorted.
+    sort: Option<(usize, bool)>,
     // `moving` is the column being carried, once the press has travelled far
     // enough to be a drag rather than a click on the heading.
     moving: Option<usize>,
@@ -614,7 +616,7 @@ fn render_header(
                 .structure
                 .iter()
                 .any(|meta| meta.name == column.name && meta.is_primary_key);
-            let sorted = sort.as_ref().filter(|key| key.column == column.name);
+            let sorted = sort.filter(|(at, _)| *at == *index);
 
             div()
                 .id(("header", *index))
@@ -667,11 +669,11 @@ fn render_header(
                         .text_color(theme.text_faint)
                         .child(SharedString::from(column.type_name.to_lowercase())),
                 )
-                .children(sorted.map(|key| {
+                .children(sorted.map(|(_, ascending)| {
                     div()
                         .flex_shrink_0()
                         .text_color(theme.accent)
-                        .child(if key.ascending { "↑" } else { "↓" })
+                        .child(if ascending { "↑" } else { "↓" })
                 }))
                 // The grab strip for resizing, on the column's right edge.
                 // `absolute` so it sits over the border rather than taking
