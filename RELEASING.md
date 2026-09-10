@@ -50,13 +50,41 @@ xcrun notarytool store-credentials dbui-notary \
 This is an Apple ID + team credential, not a per-app one — if you already have a
 profile from another project, `make notarize NOTARY_PROFILE=<name>` reuses it.
 
+## Before you cut one
+
+```sh
+make preflight                # formatting, the whole test suite, a clippy report
+```
+
+`preflight` gates on formatting and tests. The suite it runs ends with
+`a_whole_session_from_connect_to_commit`, which is the check worth knowing
+about: it starts a real window on a real SQLite file and drives one session
+through it — connect, read the catalog, open a table, sort it, drag a column
+somewhere else, run a query and sort the page in hand, open the templates
+palette, reorder the tabs and close a run of them, then edit a cell and commit
+it. It finishes by opening the database file on a *second* connection and
+asking whether the edit is actually in there, because the app's own answer is
+the thing being tested.
+
+Clippy is reported, not gated — the tree carries a backlog of lints older than
+this target, and failing a release on them would only teach everyone to skip
+the check. `make clippy` is the strict form.
+
 ## Releasing from your Mac
 
 ```sh
 # 1. bump [workspace.package] version in Cargo.toml, commit, push
+make preflight                # formatting + tests, including the full session
 make release-macos            # build, sign, notarize, staple, package
+make smoke                    # the bundled app actually starts
 make publish TAG=v0.1.0       # create the GitHub release from build/
 ```
+
+`preflight` proves the UI works in-process; it cannot prove that *this bundle*
+starts. `make smoke` execs the binary inside `build/dbui.app` and fails if it
+is not still running a few seconds later — a resource left out of the bundle, a
+signature the hardened runtime rejects, or a broken universal slice all look
+fine until something opens the thing Apple hands a user.
 
 Builds both slices, `lipo`s them together, bundles, signs, notarizes the app,
 builds the `.dmg`, notarizes *that*, staples both, and writes the `.zip`. The

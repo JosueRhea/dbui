@@ -459,7 +459,7 @@ mod prototype_tests {
     /// out shuffled, integers and all.
     #[test]
     fn nan_sorts_above_the_numbers_rather_than_equal_to_them() {
-        let mut values = vec![
+        let mut values = [
             Value::Float(2.),
             Value::Float(f64::NAN),
             Value::Int(1),
@@ -490,7 +490,7 @@ mod prototype_tests {
     /// that lexicographic order is chronological order.
     #[test]
     fn temporals_sort_chronologically_as_written() {
-        let mut values = vec![
+        let mut values = [
             Value::Temporal("2026-01-02 00:00:00".into()),
             Value::Temporal("2025-12-31 23:59:59".into()),
         ];

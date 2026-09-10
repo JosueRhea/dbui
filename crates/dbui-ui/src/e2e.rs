@@ -7098,3 +7098,280 @@ fn the_tree_filter_takes_a_press(cx: &mut TestAppContext) {
         assert_eq!(view.focus, Focus::SidebarSearch, "and kept the keyboard");
     });
 }
+
+// -- the whole app, end to end ---------------------------------------------
+//
+// Everything above proves one behaviour at a time, mostly over a fixture built
+// in memory. What follows is the other kind of check: the app as it actually
+// starts, on a real database file, driven the way a person drives it, with the
+// database asked out of band at the end whether any of it was real.
+//
+// This is the pass to run before cutting a release. The parts are covered
+// individually; this says they still add up to an application.
+
+/// Ask the database directly, on a connection of its own.
+///
+/// The app's answer is the thing under test, so it cannot also be the source
+/// of the answer -- this opens the same file separately and reads what is
+/// actually stored in it.
+fn read_back(path: &std::path::Path, sql: &str) -> Vec<Vec<String>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime to read with");
+    let file = path.to_string_lossy().to_string();
+    runtime.block_on(async {
+        let mut config = ConnectionConfig::new(Driver::Sqlite);
+        config.database = file;
+        let db = dbui_driver_connect(&config).await;
+        let result = db.execute(sql).await.expect("read back");
+        let rows = match result.outcome {
+            dbui_app::domain::QueryOutcome::Rows(set) => set
+                .rows
+                .iter()
+                .map(|row| row.0.iter().map(|value| value.to_text()).collect())
+                .collect(),
+            _ => Vec::new(),
+        };
+        db.close().await;
+        rows
+    })
+}
+
+/// The rows of the active tab's result, whole.
+fn grid_rows(view: &DbUi) -> Vec<Vec<String>> {
+    view.tabs
+        .active()
+        .and_then(|tab| tab.result())
+        .map(|result| {
+            result
+                .set
+                .rows
+                .iter()
+                .map(|row| row.0.iter().map(|value| value.to_text()).collect())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Wait for the active tab to be holding rows.
+fn settle_rows(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    settle(view, cx, |view| {
+        view.tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .is_some_and(|result| !result.set.rows.is_empty())
+    });
+}
+
+/// Wait for one column of the grid to read a particular way.
+///
+/// A reload swaps one set of rows for another, so "has rows" is true
+/// throughout and says nothing about whether the new ones have landed. What
+/// the caller is waiting for is the content.
+fn settle_column(view: &Entity<DbUi>, cx: &mut VisualTestContext, column: usize, want: &[&str]) {
+    settle(view, cx, |view| {
+        let got: Vec<String> = grid_rows(view)
+            .iter()
+            .filter_map(|row| row.get(column).cloned())
+            .collect();
+        got == want
+    });
+}
+
+/// One session, connect to commit, against a real database.
+#[gpui::test]
+fn a_whole_session_from_connect_to_commit(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "journey");
+    let path = db.path.clone();
+
+    // -- the app came up connected, and knows what is in there --------------
+    view.update(cx, |view, _| {
+        let catalog = view
+            .workspace
+            .active()
+            .and_then(|entry| entry.catalog.as_ref())
+            .expect("a catalog arrived with the connection");
+        let tables: Vec<String> = catalog
+            .schemas
+            .iter()
+            .flat_map(|schema| schema.tables.iter())
+            .map(|table| table.name.clone())
+            .collect();
+        for expected in ["members", "teams", "active_members"] {
+            assert!(tables.contains(&expected.to_string()), "{tables:?}");
+        }
+    });
+
+    // -- open a table, and the rows are the ones in the file ----------------
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert_eq!(
+            drawn_columns(view),
+            ["id", "name", "team_slug"],
+            "the columns the table actually has"
+        );
+        let names: Vec<String> = grid_rows(view).iter().map(|row| row[1].clone()).collect();
+        assert_eq!(names, ["Ada", "Grace"]);
+    });
+
+    // -- sorting a table is a clause the server runs ------------------------
+    view.update(cx, |view, cx| view.toggle_sort("name", cx));
+    settle_column(&view, cx, 1, &["Ada", "Grace"]);
+    view.update(cx, |view, cx| view.toggle_sort("name", cx));
+    settle_column(&view, cx, 1, &["Grace", "Ada"]);
+    view.update(cx, |view, cx| {
+        let names: Vec<String> = grid_rows(view).iter().map(|row| row[1].clone()).collect();
+        assert_eq!(
+            names,
+            ["Grace", "Ada"],
+            "descending came back from the engine"
+        );
+        assert!(view.active_sort().is_some_and(|key| !key.ascending));
+        view.clear_sort(cx);
+    });
+    settle_column(&view, cx, 1, &["Ada", "Grace"]);
+
+    // -- and the columns can be rearranged over the top of it ---------------
+    view.update(cx, |view, cx| {
+        view.begin_column_move(1, gpui::px(200.));
+        view.drag_column_over(0, gpui::px(40.), cx);
+        view.end_column_move(cx);
+        assert_eq!(
+            drawn_columns(view),
+            ["name", "id", "team_slug"],
+            "the header was carried to the front"
+        );
+        // Which is part of where the user was, so it is in the session.
+        let saved = view.tabs.to_saved().0;
+        match &saved[0] {
+            dbui_app::SavedTab::Table { column_order, .. } => {
+                assert_eq!(column_order.as_slice(), ["name", "id", "team_slug"]);
+            }
+            _ => panic!("a table tab"),
+        }
+    });
+
+    // -- a real query, run against the real engine --------------------------
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "SELECT m.name, t.name FROM members m JOIN teams t ON t.slug = m.team_slug",
+            cx,
+        );
+        view.run_query(cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert!(
+            view.tabs.active().and_then(|tab| tab.error()).is_none(),
+            "the engine accepted it"
+        );
+        let rows = grid_rows(view);
+        assert_eq!(rows.len(), 2, "both members matched a team: {rows:?}");
+        // Two columns both called `name` -- the case the sort has to get right.
+        let columns = drawn_columns(view);
+        assert_eq!(columns.len(), 2, "{columns:?}");
+    });
+
+    // -- sorted on the client, without the statement being touched ----------
+    let sql_before = view.update(cx, |view, cx| {
+        let before = match view.tabs.active() {
+            Some(WorkspaceTab::Sql { editor, .. }) => editor.text().to_string(),
+            _ => panic!("a query tab"),
+        };
+        // The second column, by index: both are named `name`.
+        view.toggle_sort_at(1, cx);
+        view.toggle_sort_at(1, cx);
+        before
+    });
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.active_sort_column(),
+            Some((1, false)),
+            "the second column, descending"
+        );
+        let teams: Vec<String> = grid_rows(view).iter().map(|row| row[1].clone()).collect();
+        let mut expected = teams.clone();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(teams, expected, "the page in hand was reordered");
+        let after = match view.tabs.active() {
+            Some(WorkspaceTab::Sql { editor, .. }) => editor.text().to_string(),
+            _ => panic!("a query tab"),
+        };
+        assert_eq!(after, sql_before, "and the statement was left alone");
+    });
+
+    // -- the templates palette opens on its own shortcut --------------------
+    cx.simulate_keystrokes("cmd-shift-e");
+    view.update(cx, |view, cx| {
+        assert!(view.palette.is_some(), "⌘⇧E opened it");
+        view.close_palette(cx);
+    });
+
+    // -- several tabs, dragged about and closed in a batch -------------------
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        assert_eq!(view.tabs.items.len(), 3, "members, the query, and teams");
+        let ids: Vec<_> = view.tabs.items.iter().map(|tab| tab.id()).collect();
+
+        // Carry the last tab to the front.
+        view.begin_tab_drag(ids[2], gpui::px(300.));
+        view.drag_tab_over(0, gpui::px(20.), cx);
+        view.end_tab_drag(cx);
+        assert_eq!(
+            view.tabs.items[0].id(),
+            ids[2],
+            "it landed in the first slot"
+        );
+        assert_eq!(view.tabs.active_id(), Some(ids[2]), "and stayed in front");
+
+        // Then close everything to the right of it.
+        view.close_tab_scope(
+            crate::components::close_guard::TabScope::ToRight(ids[2]),
+            cx,
+        );
+        assert_eq!(view.tabs.items.len(), 1, "the tail went");
+        assert_eq!(view.tabs.items[0].id(), ids[2], "the anchor stayed");
+    });
+
+    // -- an edit, committed, and then the database's own account of it ------
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    let before = read_back(&path, "SELECT name FROM members ORDER BY id");
+    assert_eq!(
+        before,
+        vec![vec!["Ada".to_string()], vec!["Grace".to_string()]],
+        "the file as it stands"
+    );
+
+    view.update(cx, |view, cx| {
+        // Column 1 is `name`, whatever the drawn order says.
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        assert_eq!(view.collect_batch_edits().len(), 1, "the edit is staged");
+    });
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| view.collect_batch_edits().is_empty());
+
+    let after = read_back(&path, "SELECT name FROM members ORDER BY id");
+    assert_eq!(
+        after,
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+        "the commit reached the database, not just the grid"
+    );
+
+    // -- and all of it still draws ------------------------------------------
+    draw_at_every_size(&view, cx);
+}

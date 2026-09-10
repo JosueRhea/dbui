@@ -53,7 +53,8 @@ else
 NOTARY_AUTH := --keychain-profile "$(NOTARY_PROFILE)"
 endif
 
-.PHONY: all run sign-dev test fmt clippy check-version icon universal bundle sign \
+.PHONY: all run sign-dev test preflight smoke fmt clippy check-version icon \
+        universal bundle sign \
         notarize dmg notarize-dmg zip-app checksums release-macos publish \
         verify clean
 
@@ -86,6 +87,54 @@ sign-dev:
 
 test:
 	@cargo test --workspace
+
+# Everything that has to be true before a release is cut, in one command.
+#
+# The e2e suite this runs includes `a_whole_session_from_connect_to_commit`,
+# which drives a real window against a real SQLite file -- connect, browse,
+# sort, rearrange, query, edit, commit -- and then asks the database, on a
+# connection of its own, whether the commit is really there.
+#
+# Formatting and the test suite are hard gates. Clippy is reported but not
+# gated: the tree carries a backlog of lints older than this target, and
+# failing a release on them would only teach everyone to skip the check. `make
+# clippy` is the strict form, for when that backlog is being worked through.
+preflight:
+	@echo "  FMT   --check"
+	@cargo fmt --all -- --check
+	@echo "  TEST  workspace"
+	@cargo test --workspace
+	@echo "  CLIPPY (advisory)"
+	@cargo clippy --workspace --all-targets 2>&1 \
+	    | grep -E '^warning: ' | grep -vE 'generated|future version' \
+	    | sort | uniq -c | sort -rn | sed 's/^/        /' || true
+	@echo "  ->    preflight clean -- 'make release-macos', then 'make smoke'"
+
+# Launch the built app and make sure it is still up a moment later.
+#
+# `preflight` proves the UI works in-process; it cannot prove that *this
+# bundle* starts. A resource left out of the bundle, a signature the hardened
+# runtime rejects, a broken universal slice -- none of those show up until
+# something actually execs the binary Apple will hand a user.
+#
+# Point it somewhere else to smoke a different build:
+#   make smoke SMOKE_BIN=target/debug/dbui
+SMOKE_BIN ?= $(APP_BIN)/dbui
+SMOKE_SECONDS ?= 4
+smoke:
+	@test -x "$(SMOKE_BIN)" || \
+	    (echo "ERROR: no $(SMOKE_BIN) -- run 'make bundle' first"; exit 1)
+	@echo "  SMOKE $(SMOKE_BIN)"
+	@"$(SMOKE_BIN)" & pid=$$!; \
+	  sleep $(SMOKE_SECONDS); \
+	  if kill -0 $$pid 2>/dev/null; then \
+	      echo "        still running after $(SMOKE_SECONDS)s"; \
+	      kill $$pid 2>/dev/null; wait $$pid 2>/dev/null || true; \
+	      echo "  ->    ok"; \
+	  else \
+	      wait $$pid; status=$$?; \
+	      echo "ERROR: it exited on its own (status $$status)"; exit 1; \
+	  fi
 
 fmt:
 	@cargo fmt --all
