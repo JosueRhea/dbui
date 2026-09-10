@@ -69,6 +69,20 @@ the thing being tested.
 Formatting, clippy (`-D warnings`) and the tests are all hard gates. Keep them
 that way — a lint left to rot is a lint everyone learns to scroll past.
 
+`preflight` covers SQLite, which is linked in and needs nothing running. The
+Postgres and MySQL adapters are only exercised with servers up, and they are
+where the engine-specific decoding lives — arrays, `DATETIME` versus
+`TIMESTAMP`, non-finite floats. Before a release, run those too:
+
+```sh
+docker compose up -d          # postgres on 55432, mysql on 53306
+DBUI_LIVE_TESTS=1 cargo test  # the same suite, plus ~46 tests against both
+docker compose down
+```
+
+Without `DBUI_LIVE_TESTS` those tests print why they did nothing and pass, so a
+green `make preflight` on its own says nothing about either engine.
+
 ## Releasing from your Mac
 
 ```sh

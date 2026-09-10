@@ -1156,3 +1156,38 @@ both_engines!(closing_is_idempotent, |fx: Fixture| async move {
 fn names(catalog: &dbui_domain::Catalog) -> Vec<&str> {
     catalog.schemas.iter().map(|s| s.name.as_str()).collect()
 }
+
+/// `float8` has three values that are not numbers, and the grid sorts on
+/// them.
+///
+/// `dbui_domain::compare` gives NaN a place of its own -- above every real
+/// number, below NULL -- because a comparator that calls it equal to all of
+/// them is not a total order, and sorting such a column came out shuffled.
+/// That fix is only worth anything if the engine really hands NaN over as
+/// one, which is what this pins: the decode, not the ordering.
+#[tokio::test]
+async fn non_finite_floats_decode_as_floats() {
+    let Some(fx) = live(Driver::Postgres, "non_finite_floats").await else {
+        return;
+    };
+    let out = fx
+        .execute("SELECT 'NaN'::float8, 'Infinity'::float8, '-Infinity'::float8")
+        .await
+        .expect("the engine has no trouble with these");
+
+    let QueryOutcome::Rows(set) = out.outcome else {
+        panic!("a SELECT returns rows");
+    };
+    let row = &set.rows[0].0;
+    assert!(
+        matches!(row[0], Value::Float(f) if f.is_nan()),
+        "NaN stays a float rather than falling back to text: {:?}",
+        row[0]
+    );
+    assert_eq!(row[1], Value::Float(f64::INFINITY));
+    assert_eq!(row[2], Value::Float(f64::NEG_INFINITY));
+
+    // And they are written the way a person reads them.
+    assert_eq!(row[0].to_text(), "NaN");
+    assert_eq!(row[1].to_text(), "Infinity");
+}
