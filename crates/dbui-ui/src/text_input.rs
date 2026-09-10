@@ -491,12 +491,10 @@ impl TextInput {
             return range.start;
         }
         let char_col = ((x / char_width) + 0.5) as usize;
-        let mut chars = 0usize;
-        for (byte_idx, _) in line.char_indices() {
+        for (chars, (byte_idx, _)) in line.char_indices().enumerate() {
             if chars >= char_col {
                 return range.start + byte_idx;
             }
-            chars += 1;
         }
         range.end
     }

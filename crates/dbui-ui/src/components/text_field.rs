@@ -245,6 +245,8 @@ pub(crate) fn sized_text_field(
     }
 }
 
+// See `palette_row`: every argument is a distinct part of the field.
+#[allow(clippy::too_many_arguments)]
 fn single_line_text_field(
     id: impl Into<ElementId>,
     scroll_id: impl Into<ElementId>,

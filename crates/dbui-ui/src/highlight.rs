@@ -29,6 +29,10 @@ pub fn styles_on_line<S: Copy>(
 ///
 /// `styles` are relative to `line` (byte offsets). `color_at` maps each style
 /// tag to a colour; unstyled regions use `theme.text`.
+// Every argument is a separate fact about the line: its text, its spans, the
+// selection over it, where the caret is, and how to colour it. A struct would
+// carry exactly the same eight.
+#[allow(clippy::too_many_arguments)]
 pub fn render_highlighted_line<S: Copy>(
     line: &str,
     styles: &[(usize, usize, S)],

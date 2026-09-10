@@ -328,7 +328,7 @@ fn an_empty_query_does_nothing_at_all(cx: &mut TestAppContext) {
 fn the_editor_takes_typed_text_only_when_it_has_focus(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
 
-    view.update(cx, |view, cx| open_sql_editor(view, cx));
+    view.update(cx, open_sql_editor);
     view.update(cx, |view, _| view.focus = Focus::Sidebar);
 
     cx.simulate_keystrokes(&typing("nope"));
@@ -1192,10 +1192,10 @@ fn disconnecting_does_not_collapse_the_tree(cx: &mut TestAppContext) {
 ///
 /// No server is involved: the point of these tests is what the keyboard and
 /// the pointer do to rows that are already on screen.
-fn open_table_with_rows<'a>(
-    cx: &'a mut TestAppContext,
+fn open_table_with_rows(
+    cx: &mut TestAppContext,
     count: usize,
-) -> (Entity<DbUi>, &'a mut VisualTestContext) {
+) -> (Entity<DbUi>, &mut VisualTestContext) {
     use crate::root::{ResultSource, ResultView};
     use dbui_app::domain::{Column, ColumnInfo, Page, ResultSet, Row, Value};
 
@@ -3930,17 +3930,17 @@ fn the_view_toggles_flip_and_flip_back(cx: &mut TestAppContext) {
         assert_eq!(open(view), (false, false));
 
         view.toggle_filters_open(cx);
-        assert_eq!(open(view).0, true);
+        assert!(open(view).0);
         // Opening the filter strip hands it the keyboard, or it is a box the
         // user has to click before typing in.
         assert_eq!(view.focus, Focus::Filter);
         view.toggle_filters_open(cx);
-        assert_eq!(open(view).0, false);
+        assert!(!open(view).0);
 
         view.toggle_columns_open(cx);
-        assert_eq!(open(view).1, true);
+        assert!(open(view).1);
         view.toggle_columns_open(cx);
-        assert_eq!(open(view).1, false);
+        assert!(!open(view).1);
     });
 }
 
@@ -6799,10 +6799,6 @@ struct Box2 {
     /// pass. That is exactly how the cell editor closing under the pointer
     /// went unnoticed.
     holds_keys: fn(&DbUi) -> bool,
-}
-
-fn by_target(target: InputTarget) -> impl Fn(&mut DbUi) -> Option<&mut TextInput> {
-    move |view: &mut DbUi| view.input_mut(target)
 }
 
 /// Every box the app draws.

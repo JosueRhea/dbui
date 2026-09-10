@@ -187,10 +187,9 @@ async fn fetch_latest(current: Version) -> Result<Option<Update>, UpdateError> {
 
     // The checksums file is best-effort: a release without one still installs,
     // because `install` verifies the signature either way.
-    let sha256 = match checksum_for(&client, &body, &update.url).await {
-        Ok(sum) => sum,
-        Err(_) => None,
-    };
+    let sha256 = checksum_for(&client, &body, &update.url)
+        .await
+        .unwrap_or_default();
     Ok(Some(Update { sha256, ..update }))
 }
 

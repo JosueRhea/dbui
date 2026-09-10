@@ -95,19 +95,16 @@ test:
 # sort, rearrange, query, edit, commit -- and then asks the database, on a
 # connection of its own, whether the commit is really there.
 #
-# Formatting and the test suite are hard gates. Clippy is reported but not
-# gated: the tree carries a backlog of lints older than this target, and
-# failing a release on them would only teach everyone to skip the check. `make
-# clippy` is the strict form, for when that backlog is being worked through.
+# All three are hard gates. Keep them that way: a lint left to rot is a lint
+# everyone learns to scroll past, and the backlog this target started life
+# reporting rather than failing on took one sitting to clear.
 preflight:
 	@echo "  FMT   --check"
 	@cargo fmt --all -- --check
+	@echo "  CLIPPY -D warnings"
+	@cargo clippy --workspace --all-targets -- -D warnings
 	@echo "  TEST  workspace"
 	@cargo test --workspace
-	@echo "  CLIPPY (advisory)"
-	@cargo clippy --workspace --all-targets 2>&1 \
-	    | grep -E '^warning: ' | grep -vE 'generated|future version' \
-	    | sort | uniq -c | sort -rn | sed 's/^/        /' || true
 	@echo "  ->    preflight clean -- 'make release-macos', then 'make smoke'"
 
 # Launch the built app and make sure it is still up a moment later.

@@ -11,6 +11,10 @@ use cocoa::base::{id, nil};
 use objc::{msg_send, sel, sel_impl};
 
 /// Begin a native window drag using the current AppKit event.
+// `msg_send!` expands to a `cfg(feature = "cargo-clippy")` test from inside
+// the `objc` crate, which this crate has no such feature for. Nothing here can
+// fix that; the alternative is a warning on every call.
+#[allow(unexpected_cfgs)]
 pub fn perform_window_drag() {
     unsafe {
         let app = NSApplication::sharedApplication(nil);

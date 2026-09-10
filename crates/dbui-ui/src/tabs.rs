@@ -741,6 +741,12 @@ fn unquote_draft_literal(text: &str) -> Option<String> {
     Some(out)
 }
 
+// The two variants differ by ~400 bytes, and clippy would have `result` boxed
+// to even them up. It is left unboxed on purpose: a `Vec<WorkspaceTab>` holds
+// one entry per open tab -- tens, not thousands -- so the whole difference is
+// a few kilobytes, and the indirection would be paid for by every read of the
+// grid's rows, which is the hottest path in the app.
+#[allow(clippy::large_enum_variant)]
 pub enum WorkspaceTab {
     Table {
         id: TabId,

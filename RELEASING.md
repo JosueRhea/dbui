@@ -66,9 +66,8 @@ it. It finishes by opening the database file on a *second* connection and
 asking whether the edit is actually in there, because the app's own answer is
 the thing being tested.
 
-Clippy is reported, not gated — the tree carries a backlog of lints older than
-this target, and failing a release on them would only teach everyone to skip
-the check. `make clippy` is the strict form.
+Formatting, clippy (`-D warnings`) and the tests are all hard gates. Keep them
+that way — a lint left to rot is a lint everyone learns to scroll past.
 
 ## Releasing from your Mac
 

@@ -949,9 +949,7 @@ impl DbUi {
 
     pub(crate) fn render_palette(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = &self.theme;
-        let Some(palette) = self.palette.as_ref() else {
-            return None;
-        };
+        let palette = self.palette.as_ref()?;
         let kind = palette.kind;
         let selected = palette.selected;
         let query = &palette.query;
@@ -1242,6 +1240,10 @@ fn one_line(sql: &str) -> String {
     }
 }
 
+// Eight arguments, and each one is a different part of the row being drawn.
+// Gathering them into a struct would put the same eight values in a literal at
+// every call site and tell the reader nothing new.
+#[allow(clippy::too_many_arguments)]
 fn palette_row(
     index: usize,
     selected: bool,

@@ -111,10 +111,10 @@ pub fn texts_equivalent(a: &str, b: &str) -> bool {
 /// True when the buffer is a JSON object or array (highlight-worthy).
 pub fn is_structured_json(text: &str) -> bool {
     let trimmed = text.trim();
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(serde_json::Value::Object(_)) | Ok(serde_json::Value::Array(_)) => true,
-        _ => false,
-    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(trimmed),
+        Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_))
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
