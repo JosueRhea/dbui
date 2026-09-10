@@ -648,6 +648,72 @@ fn detail_search_does_not_move_vertically_while_typing(cx: &mut TestAppContext) 
     );
 }
 
+/// A statement wider than the pane has to be reachable.
+///
+/// The SQL editor only ever scrolled vertically, so everything past the right
+/// edge of the pane was simply gone: no scrollbar, no wheel, and typing kept
+/// writing where the user could not see it.
+#[gpui::test]
+fn a_long_statement_scrolls_the_sql_editor_sideways(cx: &mut TestAppContext) {
+    let _layout = layout_lock();
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        view.focus = Focus::Editor;
+    });
+    cx.run_until_parked();
+
+    // A short statement fits, and must not pan.
+    view.update(cx, |view, _| set_sql_editor_text(view, "select 1"));
+    cx.simulate_keystrokes(&typing("0"));
+    cx.run_until_parked();
+    let short = editor_scroll(&view, cx);
+    assert_eq!(
+        short,
+        (0., 0.),
+        "a statement that fits gave the editor a scroll range (offset.x, max.width): {short:?}",
+    );
+
+    view.update(cx, |view, _| {
+        set_sql_editor_text(
+            view,
+            &format!(
+                "select * from orders where status = 5 and note = '{}'",
+                "x".repeat(300)
+            ),
+        )
+    });
+    cx.run_until_parked();
+    // One keystroke at the caret, which `set_text` left at the end of the line.
+    cx.simulate_keystrokes(&typing("x"));
+    cx.run_until_parked();
+
+    let (offset_x, max_x) = editor_scroll(&view, cx);
+    assert!(
+        max_x > 0.,
+        "a long statement must leave the editor something to scroll: max {max_x}",
+    );
+    assert!(
+        offset_x < 0.,
+        "typing past the right edge must pan the editor: offset {offset_x}",
+    );
+}
+
+/// The SQL editor's horizontal offset and scroll range, in pixels.
+fn editor_scroll(view: &Entity<DbUi>, cx: &mut VisualTestContext) -> (f32, f32) {
+    view.read_with(cx, |view, _| {
+        let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active() else {
+            unreachable!("the SQL tab is the active one")
+        };
+        let handle = editor.scroll_handle();
+        (
+            f32::from(handle.offset().x),
+            f32::from(handle.max_offset().width),
+        )
+    })
+}
+
 /// The bounce, measured where it lives.
 ///
 /// A detail field that fits its own text must have no vertical scroll range.
@@ -1458,7 +1524,10 @@ fn text_surfaces_keep_cmd_z_for_their_own_undo(cx: &mut TestAppContext) {
         view.detail_input = Some(crate::components::DetailInput::Field(1));
         assert!(view.text_undo_has_focus());
         view.detail_input = None;
-        assert!(!view.text_undo_has_focus(), "row chrome is not a text field");
+        assert!(
+            !view.text_undo_has_focus(),
+            "row chrome is not a text field"
+        );
 
         view.focus = Focus::Grid;
         assert!(!view.text_undo_has_focus());
@@ -1717,6 +1786,162 @@ fn sorting_cycles_and_returns_to_the_first_page(cx: &mut TestAppContext) {
     });
 }
 
+/// The columns as the grid would draw them, in order.
+fn drawn_columns(view: &DbUi) -> Vec<String> {
+    view.tabs
+        .active()
+        .map(|tab| {
+            tab.display_columns()
+                .iter()
+                .map(|(_, info)| info.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A header does two jobs: released where it was pressed it sorts, dragged
+/// sideways it carries the column somewhere else. Which one it was is decided
+/// by whether the pointer travelled, so both have to be checked against the
+/// same press.
+#[gpui::test]
+fn dragging_a_header_moves_the_column(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        assert_eq!(drawn_columns(view), ["id", "name"]);
+
+        view.begin_column_move(0, gpui::px(100.));
+        view.drag_column_over(1, gpui::px(102.), cx);
+        assert_eq!(
+            drawn_columns(view),
+            ["id", "name"],
+            "two pixels of travel is still a click"
+        );
+
+        view.drag_column_over(1, gpui::px(160.), cx);
+        assert_eq!(
+            drawn_columns(view),
+            ["name", "id"],
+            "and past the slop the column follows the pointer"
+        );
+
+        // The cells have to follow the heading: rows are stored in the
+        // result's order, so the column carries its index with it.
+        let first = view.tabs.active().expect("a tab").display_columns()[0].0;
+        assert_eq!(
+            first, 1,
+            "the first column drawn is still the result's `name`"
+        );
+
+        view.end_column_move(cx);
+        assert!(view.active_sort().is_none(), "a drag is not a sort");
+    });
+}
+
+/// The same thing again, but through the pointer -- the press, the crossing
+/// and the release all dispatched into a real window.
+///
+/// The state machine above is only half of it: the other half is that the
+/// header hands it the right column, that the press does not also reach the
+/// sort, and that letting go anywhere ends the drag.
+#[gpui::test]
+fn a_header_dragged_with_the_pointer_moves_its_column(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 40);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(800.)));
+    cx.run_until_parked();
+
+    // The header sits directly above the rows, along the top of the pane.
+    let (pane, list, widths) = view.read_with(cx, |view, _| {
+        (
+            view.grid_h_scroll.bounds(),
+            view.grid_scroll.0.borrow().base_handle.bounds(),
+            view.tabs
+                .active()
+                .and_then(|tab| tab.result())
+                .map(|result| result.widths.clone())
+                .unwrap_or_default(),
+        )
+    });
+    assert!(widths.len() >= 2, "the fixture has two columns");
+    let y = list.top() - crate::theme::metrics::header_height() / 2.;
+    let centre = |column: usize| {
+        let before: f32 = widths[..column].iter().sum();
+        pane.left()
+            + crate::theme::metrics::row_number_width()
+            + gpui::px(before + widths[column] / 2.)
+    };
+
+    cx.simulate_mouse_move(gpui::point(centre(0), y), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(
+        gpui::point(centre(0), y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        gpui::point(centre(1), y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        gpui::point(centre(1), y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(drawn_columns(view), ["name", "id"], "the pointer moved it");
+        assert!(
+            view.active_sort().is_none(),
+            "and the press that moved it did not also sort"
+        );
+        assert!(view.column_move.is_none(), "the drag ended on release");
+    });
+}
+
+/// A press that never travels is still a click on the heading.
+#[gpui::test]
+fn a_header_press_that_stays_put_sorts(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 5);
+
+    view.update(cx, |view, cx| {
+        view.begin_column_move(1, gpui::px(100.));
+        view.end_column_move(cx);
+
+        assert_eq!(view.active_sort().expect("sorted").column, "name");
+        assert_eq!(drawn_columns(view), ["id", "name"], "and nothing moved");
+    });
+}
+
+/// Where the columns were put is part of where the user was, so it comes back
+/// with the session -- by name, like the widths.
+#[gpui::test]
+fn a_moved_column_survives_a_relaunch(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+    let saved = view.update(cx, |view, cx| {
+        view.begin_column_move(1, gpui::px(200.));
+        view.drag_column_over(0, gpui::px(60.), cx);
+        assert_eq!(drawn_columns(view), ["name", "id"]);
+        view.end_column_move(cx);
+        view.tabs.to_saved().0
+    });
+
+    let order = match &saved[0] {
+        dbui_app::SavedTab::Table { column_order, .. } => column_order.clone(),
+        _ => panic!("a table tab"),
+    };
+    assert_eq!(order, ["name", "id"]);
+
+    // And a fresh window restores it onto the result it loads next.
+    let restored = crate::tabs::Tabs::from_saved(&saved, 0);
+    let mut tab = restored.items.into_iter().next().expect("the tab");
+    let crate::tabs::WorkspaceTab::Table { column_order, .. } = &mut tab else {
+        panic!("a table tab");
+    };
+    assert_eq!(column_order.as_slice(), ["name", "id"]);
+}
+
 /// A sort is part of where the user was, so it comes back with the session.
 #[gpui::test]
 fn a_sort_survives_a_relaunch(cx: &mut TestAppContext) {
@@ -1797,8 +2022,7 @@ fn a_new_rows_values_take_their_type_from_the_column(cx: &mut TestAppContext) {
             pending_inserts, ..
         }) = view.tabs.active_mut()
         {
-            pending_inserts[0].fields[0].1 =
-                crate::text_input::TextInput::with_text("6", true);
+            pending_inserts[0].fields[0].1 = crate::text_input::TextInput::with_text("6", true);
         }
 
         let staged = view.collect_batch_inserts().expect("parses");
@@ -1856,10 +2080,13 @@ fn cmd_c_copies_the_selected_rows_as_tsv(cx: &mut TestAppContext) {
             .read_from_clipboard()
             .and_then(|item| item.text())
             .expect("clipboard");
-        assert_eq!(text, "id	name
+        assert_eq!(
+            text,
+            "id	name
 1	row 1
 2	row 2
-");
+"
+        );
     });
 }
 
@@ -1927,7 +2154,11 @@ fn a_selected_range_still_copies_as_rows(cx: &mut TestAppContext) {
     view.update(cx, |view, cx| {
         view.grid_pointer_down(0, Some(1), gpui::Modifiers::default(), cx);
         view.grid_pointer_down(1, None, gpui::Modifiers::shift(), cx);
-        assert_eq!(view.selected_cell, Some((0, 1)), "the cell cursor stays put");
+        assert_eq!(
+            view.selected_cell,
+            Some((0, 1)),
+            "the cell cursor stays put"
+        );
     });
     cx.simulate_keystrokes("cmd-c");
 
@@ -1996,7 +2227,9 @@ fn copying_a_cell_with_none_focused_does_nothing(cx: &mut TestAppContext) {
 
 /// Put a finished batch onto a SQL tab, the way a run does.
 fn put_batch(view: &mut DbUi, statements: &[(&str, Option<usize>)], cx: &mut gpui::Context<DbUi>) {
-    use dbui_app::domain::{ColumnInfo, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, Value};
+    use dbui_app::domain::{
+        ColumnInfo, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, Value,
+    };
 
     let results: Vec<QueryResult> = statements
         .iter()
@@ -2008,7 +2241,9 @@ fn put_batch(view: &mut DbUi, statements: &[(&str, Option<usize>)], cx: &mut gpu
                         name: "n".into(),
                         type_name: "int8".into(),
                     }],
-                    rows: (0..*count).map(|n| Row(vec![Value::Int(n as i64)])).collect(),
+                    rows: (0..*count)
+                        .map(|n| Row(vec![Value::Int(n as i64)]))
+                        .collect(),
                     truncated: false,
                 }),
                 None => QueryOutcome::Affected(3),
@@ -2030,6 +2265,188 @@ fn put_batch(view: &mut DbUi, statements: &[(&str, Option<usize>)], cx: &mut gpu
     };
     view.absorb_batch_result_for_test(tab_id, batch, &sent, true);
     cx.notify();
+}
+
+/// The rows of a query, in the order they are on screen.
+fn grid_column(view: &DbUi, column: usize) -> Vec<String> {
+    view.tabs
+        .active()
+        .and_then(|tab| tab.result())
+        .map(|result| {
+            result
+                .set
+                .rows
+                .iter()
+                .map(|row| row.get(column).map(|v| v.to_text()).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A query's order is its own `ORDER BY`, so the grid reorders the page it
+/// already has rather than re-running the statement with one bolted on.
+#[gpui::test]
+fn a_query_result_sorts_without_touching_the_sql(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            *editor = crate::text_input::TextInput::with_text("SELECT n FROM series", true);
+        }
+        put_batch(view, &[("SELECT n FROM series", Some(3))], cx);
+        assert_eq!(grid_column(view, 0), vec!["0", "1", "2"]);
+
+        view.toggle_sort("n", cx);
+        assert_eq!(grid_column(view, 0), vec!["0", "1", "2"], "ascending");
+        assert!(view.active_sort().is_some_and(|key| key.ascending));
+
+        view.toggle_sort("n", cx);
+        assert_eq!(grid_column(view, 0), vec!["2", "1", "0"], "descending");
+        assert_eq!(describe(&view.status), "info: Sorted by n ↓");
+
+        // The statement is untouched throughout -- nothing was re-run.
+        let sql = match view.tabs.active() {
+            Some(WorkspaceTab::Sql { editor, .. }) => editor.text().to_string(),
+            _ => panic!("a query tab"),
+        };
+        assert_eq!(sql, "SELECT n FROM series");
+    });
+}
+
+/// A third click puts the server's own order back, which is the reason the
+/// view remembers where each row started.
+#[gpui::test]
+fn a_third_click_restores_the_order_the_server_sent(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_batch(view, &[("SELECT n FROM series", Some(4))], cx);
+
+        view.toggle_sort("n", cx);
+        view.toggle_sort("n", cx);
+        assert_eq!(grid_column(view, 0), vec!["3", "2", "1", "0"]);
+
+        view.toggle_sort("n", cx);
+        assert!(view.active_sort().is_none());
+        assert_eq!(grid_column(view, 0), vec!["0", "1", "2", "3"]);
+        assert_eq!(describe(&view.status), "info: Sort cleared");
+    });
+}
+
+/// Every row index the window holds is a position, and sorting moves them --
+/// so the selection goes rather than pointing at whoever landed there.
+#[gpui::test]
+fn sorting_a_query_result_drops_the_selection(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_batch(view, &[("SELECT n FROM series", Some(3))], cx);
+
+        view.grid_pointer_down(2, Some(0), gpui::Modifiers::default(), cx);
+        assert_eq!(selected_rows(view), vec![2]);
+        assert_eq!(view.selected_cell, Some((2, 0)));
+
+        view.toggle_sort("n", cx);
+        assert!(selected_rows(view).is_empty());
+        assert_eq!(view.selected_cell, None);
+    });
+}
+
+/// Selecting another statement from the strip shows its rows as it returned
+/// them, not under the sort the last one was wearing.
+#[gpui::test]
+fn picking_another_statement_starts_unsorted(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        put_batch(
+            view,
+            &[("SELECT n FROM a", Some(3)), ("SELECT n FROM b", Some(3))],
+            cx,
+        );
+
+        view.toggle_sort("n", cx);
+        view.toggle_sort("n", cx);
+        assert!(view.active_sort().is_some());
+
+        view.select_statement_result(1, cx);
+        assert!(view.active_sort().is_none());
+        assert_eq!(grid_column(view, 0), vec!["0", "1", "2"]);
+    });
+}
+
+/// A template lands in the editor at the caret, and does not eat what is
+/// already there.
+#[gpui::test]
+fn a_template_is_inserted_rather_than_pasted_over(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            *editor = crate::text_input::TextInput::with_text("SELECT 1;", true);
+            editor.move_end();
+        }
+
+        view.insert_sql_template("INSERT", "INSERT INTO t (a)\nVALUES ('v');\n", cx);
+
+        let sql = match view.tabs.active() {
+            Some(WorkspaceTab::Sql { editor, .. }) => editor.text().to_string(),
+            _ => panic!("a query tab"),
+        };
+        assert!(
+            sql.starts_with("SELECT 1;"),
+            "what was typed survives: {sql}"
+        );
+        assert!(sql.contains("INSERT INTO t (a)"));
+        assert!(
+            sql.contains("SELECT 1;\nINSERT"),
+            "and the template starts its own line: {sql}"
+        );
+        assert_eq!(view.focus, Focus::Editor);
+    });
+}
+
+/// The templates that can empty a table carry their `WHERE` already written.
+#[gpui::test]
+fn the_destructive_templates_ship_with_a_where(_cx: &mut TestAppContext) {
+    use dbui_app::domain::Driver;
+
+    for driver in Driver::ALL {
+        for template in crate::sql_scaffold::templates(driver, None) {
+            let body = template.body.to_uppercase();
+            if body.starts_with("DELETE") || body.starts_with("UPDATE") {
+                assert!(
+                    body.contains("WHERE"),
+                    "{} on {driver:?} has no WHERE: {}",
+                    template.name,
+                    template.body
+                );
+            }
+        }
+    }
+}
+
+/// MySQL spells an upsert differently, and the template has to say so.
+#[gpui::test]
+fn the_upsert_template_follows_the_engine(_cx: &mut TestAppContext) {
+    use dbui_app::domain::Driver;
+
+    let upsert = |driver| {
+        crate::sql_scaffold::templates(driver, None)
+            .into_iter()
+            .find(|template| template.name == "INSERT or update")
+            .expect("an upsert template")
+            .body
+    };
+
+    assert!(upsert(Driver::MySql).contains("ON DUPLICATE KEY UPDATE"));
+    assert!(upsert(Driver::Postgres).contains("ON CONFLICT"));
+    assert!(upsert(Driver::Sqlite).contains("ON CONFLICT"));
 }
 
 /// Put a batch that stopped on an error onto a SQL tab.
@@ -2122,11 +2539,7 @@ fn selecting_a_statement_swaps_its_rows_into_the_grid(cx: &mut TestAppContext) {
 
     view.update(cx, |view, cx| {
         open_sql_editor(view, cx);
-        put_batch(
-            view,
-            &[("SELECT 1", Some(2)), ("SELECT 2", Some(5))],
-            cx,
-        );
+        put_batch(view, &[("SELECT 1", Some(2)), ("SELECT 2", Some(5))], cx);
 
         let rows_now = |view: &DbUi| {
             view.tabs
@@ -2152,7 +2565,11 @@ fn a_statement_with_no_rows_is_still_in_the_strip(cx: &mut TestAppContext) {
 
     view.update(cx, |view, cx| {
         open_sql_editor(view, cx);
-        put_batch(view, &[("SELECT 1", Some(1)), ("UPDATE t SET a = 1", None)], cx);
+        put_batch(
+            view,
+            &[("SELECT 1", Some(1)), ("UPDATE t SET a = 1", None)],
+            cx,
+        );
 
         view.select_statement_result(1, cx);
         assert!(
@@ -2643,6 +3060,68 @@ fn draw_at_every_size(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+/// The grid's scrollbar is a control, not a decoration: pressing its thumb
+/// and dragging moves the rows.
+///
+/// It is also the only part of the window whose geometry is worked out during
+/// paint rather than in `render`, so a test that only drew it would prove
+/// nothing about where it ended up.
+#[gpui::test]
+fn dragging_the_grid_scrollbar_scrolls_the_rows(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 400);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(800.)));
+    cx.run_until_parked();
+
+    // The list's measured bounds say how tall the track is; the pane's say
+    // where its right-hand edge is. They are not the same box -- with two
+    // narrow columns the rows stop well short of the pane.
+    let list = view.read_with(cx, |view, _| {
+        view.grid_scroll.0.borrow().base_handle.bounds()
+    });
+    assert!(list.size.height > gpui::px(0.), "the grid was laid out");
+    let pane = view.read_with(cx, |view, _| view.grid_h_scroll.bounds());
+    let x = pane.right() - gpui::px(6.);
+    let top = list.top() + gpui::px(10.);
+
+    let offset = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, _| {
+            view.grid_scroll.0.borrow().base_handle.offset().y
+        })
+    };
+    assert_eq!(offset(cx), gpui::px(0.), "starts at the top");
+
+    cx.simulate_mouse_move(gpui::point(x, top), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(
+        gpui::point(x, top),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        gpui::point(x, list.center().y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        gpui::point(x, list.center().y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let scrolled = offset(cx);
+    assert!(
+        scrolled < gpui::px(0.),
+        "dragging the thumb down scrolled the rows, got {scrolled:?}"
+    );
+
+    // And the press was the scrollbar's alone -- a row under it must not have
+    // taken the click as a selection.
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.selected_cell, None, "no cell was selected by the drag");
+    });
+}
+
 #[gpui::test]
 fn the_grid_and_detail_sidebar_draw(cx: &mut TestAppContext) {
     let (view, cx) = open_table_with_rows(cx, 40);
@@ -2790,9 +3269,26 @@ fn the_context_menu_and_confirmation_draw(cx: &mut TestAppContext) {
 
     // The row menu, and then the typed confirmation over the top of it.
     view.update(cx, |view, cx| {
-        view.open_context_menu(ContextTarget::Rows, gpui::point(gpui::px(500.), gpui::px(300.)), cx);
+        view.open_context_menu(
+            ContextTarget::Rows,
+            gpui::point(gpui::px(500.), gpui::px(300.)),
+            cx,
+        );
     });
     draw_at_every_size(&view, cx);
+
+    // The tab bar's menu, hanging off a tab near the top-left corner.
+    view.update(cx, |view, cx| {
+        view.close_context_menu(cx);
+        let id = view.tabs.items[0].id();
+        view.open_context_menu(
+            ContextTarget::Tab { id },
+            gpui::point(gpui::px(60.), gpui::px(30.)),
+            cx,
+        );
+    });
+    draw_at_every_size(&view, cx);
+    view.update(cx, |view, cx| view.close_context_menu(cx));
 
     view.update(cx, |view, cx| {
         view.open_context_menu(
@@ -3069,7 +3565,10 @@ fn a_foreign_key_can_be_followed_from_the_keyboard(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("cmd-enter");
     view.update(cx, |view, _| {
         assert_eq!(
-            view.tabs.active().and_then(|tab| tab.table_ref()).map(|t| t.qualified()),
+            view.tabs
+                .active()
+                .and_then(|tab| tab.table_ref())
+                .map(|t| t.qualified()),
             Some("public.teams".to_string())
         );
     });
@@ -3626,10 +4125,7 @@ fn testing_an_invalid_connection_reports_without_dialling(cx: &mut TestAppContex
 
         let form = view.modal.as_ref().expect("still open");
         assert!(!form.testing, "it never started dialling");
-        assert!(
-            form.has_problem(),
-            "and it says what is missing instead"
-        );
+        assert!(form.has_problem(), "and it says what is missing instead");
     });
 }
 
@@ -3732,7 +4228,10 @@ fn accepting_a_completion_replaces_what_was_typed(cx: &mut TestAppContext) {
         assert!(view.completion.is_none(), "and the popup closes");
         let text = sql_editor_text(view);
         assert!(text.starts_with("select * from "), "got: {text}");
-        assert!(!text.contains("from us "), "the partial word is gone: {text}");
+        assert!(
+            !text.contains("from us "),
+            "the partial word is gone: {text}"
+        );
     });
 }
 
@@ -4069,7 +4568,10 @@ fn cmd_d_duplicates_the_selected_rows(cx: &mut TestAppContext) {
         }
         assert_eq!(
             staged[0].values[0],
-            ("name".to_string(), dbui_app::domain::Value::Text("row 2".into())),
+            (
+                "name".to_string(),
+                dbui_app::domain::Value::Text("row 2".into())
+            ),
             "and the rest of the row is copied"
         );
     });
@@ -4164,7 +4666,8 @@ fn pasting_ignores_columns_this_table_does_not_have(cx: &mut TestAppContext) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
             "name	elsewhere
 Katherine	ignored
-".into(),
+"
+            .into(),
         ));
     });
     view.update(cx, |view, cx| {
@@ -4191,7 +4694,8 @@ fn pasting_rows_from_an_unrelated_table_is_refused(cx: &mut TestAppContext) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
             "alpha	beta
 1	2
-".into(),
+"
+            .into(),
         ));
     });
     view.update(cx, |view, cx| {
@@ -4270,7 +4774,10 @@ fn following_a_key_opens_the_target_filtered_to_that_row(cx: &mut TestAppContext
         };
         assert_eq!(table.qualified(), "public.teams");
         assert_eq!(where_clause, "\"slug\" = 'row 2'");
-        assert!(*filters_open, "and the filter is shown, not applied invisibly");
+        assert!(
+            *filters_open,
+            "and the filter is shown, not applied invisibly"
+        );
     });
 }
 
@@ -4380,7 +4887,10 @@ fn a_press_anywhere_else_commits_the_cell_editor(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Far from the grid: the tab bar at the top of the window.
-    cx.simulate_click(gpui::point(gpui::px(400.), gpui::px(30.)), gpui::Modifiers::default());
+    cx.simulate_click(
+        gpui::point(gpui::px(400.), gpui::px(30.)),
+        gpui::Modifiers::default(),
+    );
     cx.run_until_parked();
 
     view.update(cx, |view, _| {
@@ -4460,7 +4970,10 @@ fn alt_click_follows_a_foreign_key_and_a_plain_click_does_not(cx: &mut TestAppCo
 
         view.grid_pointer_down(1, Some(1), gpui::Modifiers::alt(), cx);
         assert_eq!(
-            view.tabs.active().and_then(|tab| tab.table_ref()).map(|t| t.qualified()),
+            view.tabs
+                .active()
+                .and_then(|tab| tab.table_ref())
+                .map(|t| t.qualified()),
             Some("public.teams".to_string()),
             "and ⌥ opens it"
         );
@@ -4533,9 +5046,7 @@ fn double_clicking_a_key_cell_copies_it(cx: &mut TestAppContext) {
 /// copies it and hands the sidebar the whole value, selected and ready for a
 /// second ⌘C -- rather than saying "not here" and leaving it unreachable.
 #[gpui::test]
-fn double_clicking_a_multi_line_cell_copies_it_and_opens_the_sidebar(
-    cx: &mut TestAppContext,
-) {
+fn double_clicking_a_multi_line_cell_copies_it_and_opens_the_sidebar(cx: &mut TestAppContext) {
     let (view, cx) = open_table_with_rows(cx, 2);
     let document = "{\n  \"a\": 1,\n  \"b\": 2\n}";
 
@@ -4545,7 +5056,10 @@ fn double_clicking_a_multi_line_cell_copies_it_and_opens_the_sidebar(
 
         view.begin_cell_edit(0, 1, cx);
         assert!(view.editing_cell.is_none(), "no one-line box over it");
-        assert_eq!(view.detail_input, Some(crate::components::DetailInput::Field(1)));
+        assert_eq!(
+            view.detail_input,
+            Some(crate::components::DetailInput::Field(1))
+        );
         assert!(
             describe(&view.status).contains("multi-line"),
             "got: {}",
@@ -4746,7 +5260,10 @@ fn an_uncommitted_draft_still_counts_as_a_change(cx: &mut TestAppContext) {
 
     view.update(cx, |view, cx| {
         view.select_row(0, cx);
-        let Some(WorkspaceTab::Table { draft: Some(draft), .. }) = view.tabs.active_mut() else {
+        let Some(WorkspaceTab::Table {
+            draft: Some(draft), ..
+        }) = view.tabs.active_mut()
+        else {
             panic!("selecting a row opens a draft");
         };
         draft.fields[1].1.set_text("typed, never committed");
@@ -4790,6 +5307,304 @@ fn closing_a_connection_holding_changes_asks_first(cx: &mut TestAppContext) {
 
         view.confirm_close(cx);
         assert_eq!(view.workspace.open_count(), 0);
+    });
+}
+
+// -- dragging a tab along the strip -----------------------------------------
+
+/// Dragging one tab across another puts it in that tab's slot, and the tab in
+/// hand is the one left in front.
+#[gpui::test]
+fn dragging_a_tab_moves_it_to_the_slot_it_was_dropped_on(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+
+        // Grab the first tab and pull it to the right, across both others.
+        view.begin_tab_drag(ids[0], gpui::px(40.));
+        view.drag_tab_over(1, gpui::px(140.), cx);
+        view.drag_tab_over(2, gpui::px(260.), cx);
+        view.end_tab_drag(cx);
+
+        let order: Vec<_> = view.tabs.items.iter().map(|tab| tab.id()).collect();
+        assert_eq!(order, vec![ids[1], ids[2], ids[0]]);
+        assert_eq!(view.tabs.active, 2, "the tab that was dragged is in front");
+        assert!(view.tab_drag.is_none(), "and the drag is over");
+    });
+}
+
+/// The active tab is whichever tab was active, not whichever slot it was in.
+#[gpui::test]
+fn reordering_around_the_active_tab_does_not_move_the_front(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+        view.activate_tab(1, cx);
+
+        // Drag the last tab to the front, past the active one.
+        view.begin_tab_drag(ids[2], gpui::px(260.));
+        view.drag_tab_over(1, gpui::px(140.), cx);
+        view.drag_tab_over(0, gpui::px(40.), cx);
+
+        assert_eq!(
+            view.tabs.active_id(),
+            Some(ids[1]),
+            "the tab that was in front is still in front"
+        );
+    });
+}
+
+/// A press that never travels is a click. It must not shuffle the strip on the
+/// way to activating the tab.
+#[gpui::test]
+fn a_click_on_a_tab_does_not_reorder_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+
+        view.begin_tab_drag(ids[0], gpui::px(40.));
+        // A pointer that wobbles a pixel inside the tab it was pressed on.
+        view.drag_tab_over(1, gpui::px(42.), cx);
+        view.end_tab_drag(cx);
+
+        let order: Vec<_> = view.tabs.items.iter().map(|tab| tab.id()).collect();
+        assert_eq!(order, ids, "nothing moved");
+    });
+}
+
+/// The bug this direction gate is for: a tab dropped into a neighbour's slot
+/// leaves the neighbour under the pointer, and without it the two trade places
+/// on every mouse-move for as long as the button is held.
+#[gpui::test]
+fn a_held_pointer_does_not_shuttle_two_tabs_back_and_forth(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+
+        view.begin_tab_drag(ids[0], gpui::px(40.));
+        view.drag_tab_over(1, gpui::px(140.), cx);
+
+        // The pointer has not moved since; the neighbour is now at slot 0 and
+        // keeps reporting the pointer over it.
+        for _ in 0..5 {
+            view.drag_tab_over(0, gpui::px(140.), cx);
+        }
+
+        let order: Vec<_> = view.tabs.items.iter().map(|tab| tab.id()).collect();
+        assert_eq!(
+            order,
+            vec![ids[1], ids[0], ids[2]],
+            "it settled where it was put"
+        );
+    });
+}
+
+/// Dragging a tab onto a slot that is no longer there -- the tab closed under
+/// the drag -- ends it rather than moving whatever took its place.
+#[gpui::test]
+fn a_drag_whose_tab_closed_under_it_stops(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+
+        view.begin_tab_drag(ids[0], gpui::px(40.));
+        view.close_tab_now(0, cx);
+        view.drag_tab_over(1, gpui::px(200.), cx);
+
+        assert!(view.tab_drag.is_none());
+        let order: Vec<_> = view.tabs.items.iter().map(|tab| tab.id()).collect();
+        assert_eq!(
+            order,
+            vec![ids[1], ids[2]],
+            "the survivors kept their order"
+        );
+    });
+}
+
+/// A reordered strip is the strip that comes back on the next launch.
+#[gpui::test]
+fn a_dragged_order_survives_a_restart(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    let order = view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+        view.begin_tab_drag(ids[2], gpui::px(260.));
+        view.drag_tab_over(0, gpui::px(40.), cx);
+        view.end_tab_drag(cx);
+        view.tabs
+            .items
+            .iter()
+            .map(|tab| tab.label())
+            .collect::<Vec<_>>()
+    });
+
+    let restored = view.update(cx, |view, _| {
+        let (saved, active) = view.tabs.to_saved();
+        (saved.len(), active)
+    });
+    assert_eq!(restored.0, 3);
+    assert_eq!(
+        order[0], "SQL Query",
+        "the SQL tab was dragged to the front: {order:?}"
+    );
+}
+
+// -- the tab bar's own right-click menu -------------------------------------
+
+/// Three tabs, and the id of each, left to right.
+fn open_three_tabs(view: &mut DbUi, cx: &mut gpui::Context<DbUi>) -> Vec<crate::tabs::TabId> {
+    view.open_table_tab(TableRef::new("public", "teams"), cx);
+    view.open_sql_tab(cx);
+    assert_eq!(view.tabs.items.len(), 3, "users, teams and the SQL tab");
+    view.tabs.items.iter().map(|tab| tab.id()).collect()
+}
+
+/// Right-clicking a tab and picking "Close Others" keeps the tab under the
+/// pointer -- not the one that happened to be in front.
+#[gpui::test]
+fn closing_the_other_tabs_keeps_the_one_the_menu_was_opened_on(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+        assert_eq!(view.tabs.active, 2, "the SQL tab is in front");
+
+        view.open_context_menu(
+            ContextTarget::Tab { id: ids[1] },
+            gpui::point(gpui::px(200.), gpui::px(10.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::CloseOtherTabs, cx);
+
+        assert_eq!(view.tabs.items.len(), 1);
+        assert_eq!(view.tabs.items[0].id(), ids[1], "the middle tab survived");
+        assert_eq!(view.tabs.active, 0, "and it is what the user is looking at");
+    });
+}
+
+/// "Close to the Right" takes the tail and leaves everything before it.
+#[gpui::test]
+fn closing_to_the_right_leaves_the_tabs_before_it(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+
+        view.open_context_menu(
+            ContextTarget::Tab { id: ids[0] },
+            gpui::point(gpui::px(20.), gpui::px(10.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::CloseTabsToRight, cx);
+
+        let left: Vec<_> = view.tabs.items.iter().map(|tab| tab.id()).collect();
+        assert_eq!(left, vec![ids[0]]);
+    });
+}
+
+/// "Close All" empties the strip, whichever tab it was asked from.
+#[gpui::test]
+fn closing_all_tabs_from_the_menu_empties_the_bar(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+
+        view.open_context_menu(
+            ContextTarget::Tab { id: ids[1] },
+            gpui::point(gpui::px(200.), gpui::px(10.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::CloseAllTabs, cx);
+
+        assert!(view.tabs.items.is_empty());
+        assert!(view.workspace.open_table.is_none(), "and nothing is open");
+    });
+}
+
+/// A bulk close asks once for the whole run, counting the work on every tab
+/// it is about to take -- not once per tab, and not silently.
+#[gpui::test]
+fn a_bulk_close_over_staged_work_asks_once(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        let ids = open_three_tabs(view, cx);
+
+        view.open_context_menu(
+            ContextTarget::Tab { id: ids[2] },
+            gpui::point(gpui::px(400.), gpui::px(10.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::CloseAllTabs, cx);
+
+        assert_eq!(view.tabs.items.len(), 3, "nothing has closed yet");
+        let guard = view.close_guard.as_ref().expect("it asked");
+        assert_eq!(guard.changes, 1, "the batch on the first tab is at stake");
+        assert_eq!(guard.label, "3 tabs", "and it says how many are going");
+
+        view.confirm_close(cx);
+        assert!(view.tabs.items.is_empty());
+    });
+}
+
+/// Work on the tab being *kept* is not work at risk, so "Close Others" over a
+/// clean run does not stop to ask about it.
+#[gpui::test]
+fn closing_the_others_ignores_the_batch_on_the_tab_it_keeps(cx: &mut TestAppContext) {
+    use crate::components::context_menu::{ContextTarget, MenuAction};
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        let ids = open_three_tabs(view, cx);
+
+        view.open_context_menu(
+            ContextTarget::Tab { id: ids[0] },
+            gpui::point(gpui::px(20.), gpui::px(10.)),
+            cx,
+        );
+        view.run_context_action(MenuAction::CloseOtherTabs, cx);
+
+        assert!(view.close_guard.is_none(), "nothing staged was in the way");
+        assert_eq!(view.tabs.items.len(), 1);
+        assert_eq!(
+            view.collect_batch_edits().len(),
+            1,
+            "and the batch is still on the tab that was kept"
+        );
+    });
+}
+
+/// The menu names its tab by identity, so a close it can no longer aim is a
+/// close that does nothing -- rather than one that empties the bar.
+#[gpui::test]
+fn a_tab_menu_outliving_its_tab_closes_nothing(cx: &mut TestAppContext) {
+    use crate::components::close_guard::TabScope;
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let ids = open_three_tabs(view, cx);
+        view.close_tab_now(1, cx);
+
+        view.close_tab_scope(TabScope::Others(ids[1]), cx);
+        assert_eq!(view.tabs.items.len(), 2, "the survivors are untouched");
     });
 }
 
@@ -4871,7 +5686,11 @@ fn committing_from_under_the_guard_dismisses_it(cx: &mut TestAppContext) {
     }
 
     view.update(cx, |view, cx| {
-        let rows = view.tabs.active().and_then(|t| t.result()).map(|v| v.set.rows.len());
+        let rows = view
+            .tabs
+            .active()
+            .and_then(|t| t.result())
+            .map(|v| v.set.rows.len());
         assert_eq!(rows, Some(2), "the table has to have loaded first");
         view.begin_cell_edit(0, 1, cx);
         view.cell_editor.set_text("Ada Lovelace");

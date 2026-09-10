@@ -9,6 +9,7 @@
 
 use super::{button, caption};
 use crate::root::DbUi;
+use crate::tabs::TabId;
 use crate::theme::metrics;
 use dbui_app::domain::ConnectionId;
 use gpui::{div, prelude::*, AnyElement, Context, MouseButton, SharedString};
@@ -18,7 +19,23 @@ use gpui::{div, prelude::*, AnyElement, Context, MouseButton, SharedString};
 pub enum CloseTarget {
     /// A table or SQL tab, by index in the active connection's tab list.
     Tab(usize),
+    /// Several tabs at once, from the tab bar's own menu.
+    TabGroup(TabScope),
     Connection(ConnectionId),
+}
+
+/// Which tabs one of the bulk closes is aimed at.
+///
+/// Named by [`TabId`] rather than by index: the guard can sit open while a
+/// load lands or another tab closes, and an index that shifted under it would
+/// close whatever slid into the slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabScope {
+    /// Everything but the tab the menu was opened on.
+    Others(TabId),
+    /// Everything sitting to the right of it.
+    ToRight(TabId),
+    All,
 }
 
 pub struct CloseGuard {
@@ -39,11 +56,21 @@ impl DbUi {
             "changes"
         };
         let title = format!("Discard {} staged {plural}?", guard.changes);
-        let body = format!(
-            "“{}” has work that has not been committed. Closing it throws the \
-             whole batch away.",
-            guard.label
-        );
+        // A group close is several tabs, and the singular sentence would name
+        // them as one thing the user never opened.
+        let body = if matches!(guard.target, CloseTarget::TabGroup(_)) {
+            format!(
+                "{} have work that has not been committed. Closing them throws \
+                 the whole batch away.",
+                guard.label
+            )
+        } else {
+            format!(
+                "“{}” has work that has not been committed. Closing it throws the \
+                 whole batch away.",
+                guard.label
+            )
+        };
 
         let scrim = if theme.is_light {
             gpui::rgba(0x00000033)

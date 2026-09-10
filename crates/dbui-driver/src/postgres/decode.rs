@@ -81,9 +81,9 @@ fn decode_cell(row: &PgRow, index: usize, type_name: &str) -> Value {
         }
         "BYTEA" => attempt!(row, index, Vec<u8>, Value::Bytes),
         "TIMESTAMP" => {
-            attempt!(row, index, NaiveDateTime, |v: NaiveDateTime| Value::Temporal(
-                v.format("%Y-%m-%d %H:%M:%S%.f").to_string()
-            ))
+            attempt!(row, index, NaiveDateTime, |v: NaiveDateTime| {
+                Value::Temporal(v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            })
         }
         "TIMESTAMPTZ" => {
             attempt!(row, index, DateTime<Utc>, |v: DateTime<Utc>| {
@@ -107,24 +107,29 @@ fn decode_cell(row: &PgRow, index: usize, type_name: &str) -> Value {
         // that the hard way, via a `text[]` column that decoded to Unsupported.
         "BOOL[]" => attempt!(row, index, Vec<bool>, |v: Vec<bool>| array(v, Value::Bool)),
         "INT2[]" => {
-            attempt!(row, index, Vec<i16>, |v: Vec<i16>| array(v, |n| Value::Int(
-                i64::from(n)
-            )))
+            attempt!(row, index, Vec<i16>, |v: Vec<i16>| array(
+                v,
+                |n| Value::Int(i64::from(n))
+            ))
         }
         "INT4[]" => {
-            attempt!(row, index, Vec<i32>, |v: Vec<i32>| array(v, |n| Value::Int(
-                i64::from(n)
-            )))
+            attempt!(row, index, Vec<i32>, |v: Vec<i32>| array(
+                v,
+                |n| Value::Int(i64::from(n))
+            ))
         }
         "INT8[]" => attempt!(row, index, Vec<i64>, |v: Vec<i64>| array(v, Value::Int)),
         "FLOAT4[]" => {
-            attempt!(row, index, Vec<f32>, |v: Vec<f32>| array(v, |n| Value::Float(
-                f64::from(n)
-            )))
+            attempt!(row, index, Vec<f32>, |v: Vec<f32>| array(v, |n| {
+                Value::Float(f64::from(n))
+            }))
         }
         "FLOAT8[]" => attempt!(row, index, Vec<f64>, |v: Vec<f64>| array(v, Value::Float)),
         "TEXT[]" | "VARCHAR[]" | "BPCHAR[]" | "CHAR[]" | "NAME[]" => {
-            attempt!(row, index, Vec<String>, |v: Vec<String>| array(v, Value::Text))
+            attempt!(row, index, Vec<String>, |v: Vec<String>| array(
+                v,
+                Value::Text
+            ))
         }
         "UUID[]" => {
             attempt!(row, index, Vec<Uuid>, |v: Vec<Uuid>| array(v, |u: Uuid| {

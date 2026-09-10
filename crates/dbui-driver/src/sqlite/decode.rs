@@ -19,8 +19,8 @@
 //!   `pragma_table_info` rather than from the wire.
 
 use dbui_domain::Value;
-use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use sqlx::sqlite::SqliteRow;
+use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 
 pub fn decode_row(row: &SqliteRow) -> Vec<Value> {
     (0..row.len())
@@ -86,4 +86,3 @@ fn decode_cell(row: &SqliteRow, index: usize, declared: &str) -> Value {
         },
     }
 }
-

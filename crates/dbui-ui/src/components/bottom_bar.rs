@@ -23,7 +23,11 @@ fn mode_button(
         .h(metrics::control_height())
         .rounded_md()
         .cursor_pointer()
-        .bg(if active { theme.selection } else { theme.elevated })
+        .bg(if active {
+            theme.selection
+        } else {
+            theme.elevated
+        })
         .text_color(if active { theme.text } else { theme.text_muted })
         .border_1()
         .border_color(if active { theme.accent } else { theme.border })
@@ -124,9 +128,17 @@ impl DbUi {
                     page.limit,
                 )
             }
-            WorkspaceTab::Sql { .. } => {
-                (false, TablePane::Data, false, false, false, true, true, None, 0)
-            }
+            WorkspaceTab::Sql { .. } => (
+                false,
+                TablePane::Data,
+                false,
+                false,
+                false,
+                true,
+                true,
+                None,
+                0,
+            ),
         };
 
         let page_size_focused = self.focus == Focus::PageSize && self.page_size_focus;
@@ -177,9 +189,8 @@ impl DbUi {
                     cx.listener(|this, _, _window, cx| this.toggle_columns_open(cx)),
                 ))
                 .child(
-                    button("add-row", "+ Row", theme, false).on_click(
-                        cx.listener(|this, _, _window, cx| this.add_row(cx)),
-                    ),
+                    button("add-row", "+ Row", theme, false)
+                        .on_click(cx.listener(|this, _, _window, cx| this.add_row(cx))),
                 )
             })
             .child(

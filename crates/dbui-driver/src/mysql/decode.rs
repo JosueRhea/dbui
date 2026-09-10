@@ -84,9 +84,9 @@ fn decode_cell(row: &MySqlRow, index: usize, type_name: &str) -> Value {
             ))
         }
         "DATETIME" => {
-            attempt!(row, index, NaiveDateTime, |v: NaiveDateTime| Value::Temporal(
-                v.format("%Y-%m-%d %H:%M:%S%.f").to_string()
-            ))
+            attempt!(row, index, NaiveDateTime, |v: NaiveDateTime| {
+                Value::Temporal(v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            })
         }
         // MySQL stores TIMESTAMP in UTC and converts on the way out; sqlx
         // hands it over already anchored, unlike DATETIME.

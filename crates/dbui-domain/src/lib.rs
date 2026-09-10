@@ -23,4 +23,4 @@ pub use query::{
 };
 pub use sql_split::{split_statements, statement_at};
 pub use statement::StatementInfo;
-pub use value::{Value, ValueKind};
+pub use value::{compare as compare_values, Value, ValueKind};

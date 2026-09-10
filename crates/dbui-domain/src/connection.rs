@@ -254,7 +254,10 @@ mod tests {
 
     #[test]
     fn identifiers_escape_their_own_quote() {
-        assert_eq!(Driver::Postgres.quote_identifier("we\"ird"), "\"we\"\"ird\"");
+        assert_eq!(
+            Driver::Postgres.quote_identifier("we\"ird"),
+            "\"we\"\"ird\""
+        );
         assert_eq!(Driver::MySql.quote_identifier("we`ird"), "`we``ird`");
     }
 
@@ -282,7 +285,9 @@ mod tests {
 
     #[test]
     fn a_fresh_config_is_valid() {
-        assert!(ConnectionConfig::new(Driver::Postgres).validate().is_empty());
+        assert!(ConnectionConfig::new(Driver::Postgres)
+            .validate()
+            .is_empty());
         assert!(ConnectionConfig::new(Driver::MySql).validate().is_empty());
     }
 }

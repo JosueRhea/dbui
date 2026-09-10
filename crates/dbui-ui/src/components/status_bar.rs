@@ -77,11 +77,7 @@ impl DbUi {
                     .child(SharedString::from(label))
             }))
             .when(truncated, |bar| {
-                bar.child(
-                    div()
-                        .text_color(theme.warning)
-                        .child("more rows available"),
-                )
+                bar.child(div().text_color(theme.warning).child("more rows available"))
             })
             .children(detail.map(|text| {
                 div()

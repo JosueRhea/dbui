@@ -58,7 +58,10 @@ fn tsv(columns: &[ColumnInfo], values: &[Vec<Value>]) -> String {
     );
     out.push('\n');
     for row in values {
-        let cells: Vec<String> = row.iter().map(|value| escape_cell(&cell_text(value))).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .map(|value| escape_cell(&cell_text(value)))
+            .collect();
         out.push_str(&cells.join("\t"));
         out.push('\n');
     }
@@ -94,7 +97,9 @@ fn json(columns: &[ColumnInfo], values: &[Vec<Value>]) -> String {
             for (index, column) in columns.iter().enumerate() {
                 object.insert(
                     column.name.clone(),
-                    row.get(index).map(json_value).unwrap_or(serde_json::Value::Null),
+                    row.get(index)
+                        .map(json_value)
+                        .unwrap_or(serde_json::Value::Null),
                 );
             }
             serde_json::Value::Object(object)
@@ -294,7 +299,10 @@ mod tests {
     fn a_value_containing_a_tab_or_newline_is_quoted() {
         let out = tsv(
             &columns(&["note"]),
-            &[vec![Value::Text("two\tparts".into())], vec![Value::Text("two\nlines".into())]],
+            &[
+                vec![Value::Text("two\tparts".into())],
+                vec![Value::Text("two\nlines".into())],
+            ],
         );
         assert!(out.contains("\"two\tparts\""), "got: {out:?}");
         assert!(out.contains("\"two\nlines\""), "got: {out:?}");
@@ -302,7 +310,10 @@ mod tests {
 
     #[test]
     fn a_quote_inside_a_cell_is_doubled() {
-        let out = tsv(&columns(&["note"]), &[vec![Value::Text("say \"hi\"".into())]]);
+        let out = tsv(
+            &columns(&["note"]),
+            &[vec![Value::Text("say \"hi\"".into())]],
+        );
         assert!(out.contains("\"say \"\"hi\"\"\""), "got: {out:?}");
     }
 
@@ -365,14 +376,22 @@ mod tests {
             Driver::Postgres,
             Some(&TableRef::new("s", "t")),
         );
-        assert!(out.contains("'O''Brien''); DROP TABLE t; --'"), "got: {out}");
+        assert!(
+            out.contains("'O''Brien''); DROP TABLE t; --'"),
+            "got: {out}"
+        );
     }
 
     /// A query result has no one table to name; the statement still has to be
     /// something a person can fix up rather than a syntax error.
     #[test]
     fn a_result_with_no_table_still_produces_a_statement() {
-        let out = inserts(&columns(&["a"]), &[vec![Value::Int(1)]], Driver::MySql, None);
+        let out = inserts(
+            &columns(&["a"]),
+            &[vec![Value::Int(1)]],
+            Driver::MySql,
+            None,
+        );
         assert_eq!(out, "INSERT INTO `table` (`a`) VALUES (1);\n");
     }
 
@@ -388,11 +407,7 @@ mod tests {
                 Value::Text("Ada".into()),
                 Value::Text("two\tparts".into()),
             ],
-            vec![
-                Value::Int(2),
-                Value::Null,
-                Value::Text("two\nlines".into()),
-            ],
+            vec![Value::Int(2), Value::Null, Value::Text("two\nlines".into())],
         ];
 
         let written = tsv(&columns, &values);
@@ -409,7 +424,10 @@ mod tests {
 
     #[test]
     fn a_quote_inside_a_cell_survives_the_round_trip() {
-        let written = tsv(&columns(&["note"]), &[vec![Value::Text("say \"hi\"".into())]]);
+        let written = tsv(
+            &columns(&["note"]),
+            &[vec![Value::Text("say \"hi\"".into())]],
+        );
         let read = parse_tsv(&written).expect("reads back");
         assert_eq!(read.rows[0][0], "say \"hi\"");
     }

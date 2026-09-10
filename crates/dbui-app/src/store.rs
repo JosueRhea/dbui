@@ -134,9 +134,7 @@ impl Default for Prefs {
 pub fn load_prefs(path: &Path) -> Result<Prefs, StoreError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Prefs::default())
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Prefs::default()),
         Err(error) => {
             return Err(StoreError::Read {
                 path: path.to_path_buf(),

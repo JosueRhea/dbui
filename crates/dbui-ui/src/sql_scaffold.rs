@@ -172,3 +172,130 @@ mod tests {
         assert!(sql.contains("\"t\"\"; DROP DATABASE x; --\""));
     }
 }
+
+/// One ready-made statement offered from the templates palette.
+pub struct Template {
+    /// What the palette lists it as.
+    pub name: &'static str,
+    /// One line saying what it is for, under the name.
+    pub about: &'static str,
+    /// The statement itself, ready to be typed over.
+    pub body: String,
+}
+
+/// The statements worth having a starting point for.
+///
+/// These are shapes, not answers: every one of them names a `table` and a
+/// `column` the user has to replace, because the point is the clause structure
+/// -- which side of a `LEFT JOIN` keeps its rows, where `HAVING` goes, what an
+/// upsert is called on this engine -- and not the identifiers.
+///
+/// When a table is open its name is filled in, quoted for the engine. It is
+/// the table the user was just looking at, so it is the one they are most
+/// likely to be writing about, and a wrong guess is one selection to fix.
+///
+/// `UPDATE` and `DELETE` carry their `WHERE` already written. A template that
+/// hands someone `DELETE FROM t;` and trusts them to add the clause before
+/// they press ⌘↵ is a template that eventually empties a table.
+pub fn templates(driver: Driver, table: Option<&TableRef>) -> Vec<Template> {
+    let name = table
+        .map(|table| table.quoted(driver))
+        .unwrap_or_else(|| driver.quote_identifier("table_name"));
+    let other = driver.quote_identifier("other_table");
+    let column = driver.quote_identifier("column_name");
+
+    // Postgres and SQLite spell an upsert the same way; MySQL does not.
+    let upsert = match driver {
+        Driver::MySql => format!(
+            "INSERT INTO {name} (id, {column})\nVALUES (1, 'value')\n\
+             ON DUPLICATE KEY UPDATE\n  {column} = VALUES({column});\n"
+        ),
+        _ => format!(
+            "INSERT INTO {name} (id, {column})\nVALUES (1, 'value')\n\
+             ON CONFLICT (id) DO UPDATE SET\n  {column} = EXCLUDED.{column};\n"
+        ),
+    };
+
+    vec![
+        Template {
+            name: "SELECT with WHERE",
+            about: "Filtered rows, newest first",
+            body: format!(
+                "SELECT *\nFROM {name}\nWHERE {column} = 'value'\n\
+                 ORDER BY {column} DESC\nLIMIT 100;\n"
+            ),
+        },
+        Template {
+            name: "SELECT a page",
+            about: "LIMIT and OFFSET, ordered so the page is stable",
+            body: format!("SELECT *\nFROM {name}\nORDER BY id\nLIMIT 50 OFFSET 0;\n"),
+        },
+        Template {
+            name: "COUNT rows",
+            about: "How many, with the same filter you would select by",
+            body: format!("SELECT count(*) AS total\nFROM {name}\nWHERE {column} = 'value';\n"),
+        },
+        Template {
+            name: "GROUP BY with HAVING",
+            about: "Counts per value, keeping only the groups worth seeing",
+            body: format!(
+                "SELECT {column}, count(*) AS total\nFROM {name}\n\
+                 GROUP BY {column}\nHAVING count(*) > 1\nORDER BY total DESC;\n"
+            ),
+        },
+        Template {
+            name: "DISTINCT values",
+            about: "What is actually in a column",
+            body: format!("SELECT DISTINCT {column}\nFROM {name}\nORDER BY {column};\n"),
+        },
+        Template {
+            name: "INNER JOIN",
+            about: "Rows that match on both sides",
+            body: format!(
+                "SELECT a.*, b.*\nFROM {name} AS a\n\
+                 JOIN {other} AS b ON b.id = a.{column}\nLIMIT 100;\n"
+            ),
+        },
+        Template {
+            name: "LEFT JOIN",
+            about: "Every row on the left, matched or not",
+            body: format!(
+                "SELECT a.*, b.*\nFROM {name} AS a\n\
+                 LEFT JOIN {other} AS b ON b.id = a.{column}\n\
+                 WHERE b.id IS NULL\nLIMIT 100;\n"
+            ),
+        },
+        Template {
+            name: "INSERT",
+            about: "One row, columns named",
+            body: format!("INSERT INTO {name} ({column})\nVALUES ('value');\n"),
+        },
+        Template {
+            name: "INSERT or update",
+            about: if matches!(driver, Driver::MySql) {
+                "ON DUPLICATE KEY UPDATE"
+            } else {
+                "ON CONFLICT DO UPDATE"
+            },
+            body: upsert,
+        },
+        Template {
+            name: "UPDATE with WHERE",
+            about: "The WHERE is already there, on purpose",
+            body: format!("UPDATE {name}\nSET {column} = 'value'\nWHERE id = 1;\n"),
+        },
+        Template {
+            name: "DELETE with WHERE",
+            about: "The WHERE is already there, on purpose",
+            body: format!("DELETE FROM {name}\nWHERE id = 1;\n"),
+        },
+        Template {
+            name: "WITH (common table expression)",
+            about: "Name a subquery, then select from it",
+            body: format!(
+                "WITH recent AS (\n  SELECT *\n  FROM {name}\n  \
+                 ORDER BY id DESC\n  LIMIT 100\n)\nSELECT *\nFROM recent;\n"
+            ),
+        },
+    ]
+}

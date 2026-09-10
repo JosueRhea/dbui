@@ -47,35 +47,32 @@ impl DbUi {
                     .text_size(metrics::text_size_small())
                     .child("WHERE"),
             )
+            .child(div().flex_1().min_w(px(0.)).child(text_field(
+                "where-input",
+                where_draft,
+                InputTarget::WhereDraft,
+                where_focused,
+                Some("id = 1 AND …"),
+                theme,
+                cx,
+            )))
             .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .child(text_field(
-                        "where-input",
-                        where_draft,
-                        InputTarget::WhereDraft,
-                        where_focused,
-                        Some("id = 1 AND …"),
-                        theme,
-                        cx,
-                    )),
-            )
-            .child(
-                button_with_focus("apply-filters", "Apply", theme, true, apply_focused)
-                    .on_click(cx.listener(|this, _, _window, cx| {
+                button_with_focus("apply-filters", "Apply", theme, true, apply_focused).on_click(
+                    cx.listener(|this, _, _window, cx| {
                         this.filter_focus = Some(FilterFocus::Apply);
                         this.focus = Focus::Filter;
                         this.apply_filters(cx);
-                    })),
+                    }),
+                ),
             )
             .child(
-                button_with_focus("clear-filters", "Clear", theme, false, clear_focused)
-                    .on_click(cx.listener(|this, _, _window, cx| {
+                button_with_focus("clear-filters", "Clear", theme, false, clear_focused).on_click(
+                    cx.listener(|this, _, _window, cx| {
                         this.filter_focus = Some(FilterFocus::Clear);
                         this.focus = Focus::Filter;
                         this.clear_filters(cx);
-                    })),
+                    }),
+                ),
             )
     }
 }

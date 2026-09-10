@@ -8,7 +8,6 @@ use gpui::{
     div, prelude::*, px, uniform_list, AnyElement, Context, MouseButton, MouseDownEvent,
     SharedString, Window,
 };
-use std::collections::HashSet;
 
 const CELL_CHARS: usize = 200;
 
@@ -20,17 +19,11 @@ impl DbUi {
     ) -> AnyElement {
         let active_index = self.tabs.active;
 
-        let hidden_columns = match self.tabs.items.get(active_index) {
-            Some(WorkspaceTab::Table { hidden_columns, .. }) => hidden_columns.clone(),
-            _ => HashSet::new(),
+        let Some(tab) = self.tabs.items.get(active_index) else {
+            return empty_state(&self.theme, self.workspace.active_driver().is_some())
+                .into_any_element();
         };
-
-        let Some(view) = self
-            .tabs
-            .items
-            .get(active_index)
-            .and_then(|tab| tab.result())
-        else {
+        let Some(view) = tab.result() else {
             return empty_state(&self.theme, self.workspace.active_driver().is_some())
                 .into_any_element();
         };
@@ -40,18 +33,7 @@ impl DbUi {
                 .into_any_element();
         }
 
-        let is_table_tab = matches!(
-            self.tabs.items.get(active_index),
-            Some(WorkspaceTab::Table { .. })
-        );
-
-        let visible: Vec<(usize, _)> = view
-            .set
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| !is_table_tab || !hidden_columns.contains(&column.name))
-            .collect();
+        let visible = tab.display_columns();
 
         if visible.is_empty() {
             return empty_state(&self.theme, self.workspace.active_driver().is_some())
@@ -81,10 +63,16 @@ impl DbUi {
             + f32::from(metrics::row_number_width());
 
         let sort = self.active_sort().cloned();
-        // Only a table tab can be sorted: a query's order is whatever its own
-        // ORDER BY says, and re-reading it with one bolted on would be
+        // Both kinds of tab sort, by two different means. A table tab sends
+        // the order to the server and pages through it; a query tab reorders
+        // the rows already fetched, because a query's order is whatever its
+        // own ORDER BY says and re-reading it with one bolted on would be
         // rewriting the user's SQL behind their back.
-        let header = render_header(view, &visible, &self.theme, total_width, sort, is_table_tab, cx);
+        let moving = self
+            .column_move
+            .filter(|drag| drag.moved)
+            .map(|drag| drag.column);
+        let header = render_header(view, &visible, &self.theme, total_width, sort, moving, cx);
 
         // Virtualized rows (fast). Parent H-scrolls; list only scrolls vertically.
         // `overflow_hidden` then `overflow_x_scroll` keeps Y clipped so the list
@@ -101,18 +89,7 @@ impl DbUi {
                 let Some(view) = tab.result() else {
                     return Vec::new();
                 };
-                let visible: Vec<(usize, _)> = view
-                    .set
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, column)| match tab {
-                        WorkspaceTab::Table { hidden_columns, .. } => {
-                            !hidden_columns.contains(&column.name)
-                        }
-                        WorkspaceTab::Sql { .. } => true,
-                    })
-                    .collect();
+                let visible = tab.display_columns();
                 let lead_row = tab.selected_row();
                 // The whole staged batch, resolved once per repaint rather
                 // than per cell: a cell the user has edited should show what
@@ -438,8 +415,25 @@ impl DbUi {
         .flex_1()
         .min_h(px(0.));
 
+        // The bars are siblings of the scroller, not children of it: a child
+        // would scroll away with the rows. They come after it so that their
+        // prepaint reads the sizes this frame's layout just settled.
+        let vertical_bar = super::scrollbar::vertical_scrollbar(
+            "grid-v-scrollbar",
+            self.grid_scroll.0.borrow().base_handle.clone(),
+            &self.theme,
+        )
+        // Clear of the header, which does not scroll with the rows.
+        .top(metrics::header_height());
+        let horizontal_bar = super::scrollbar::horizontal_scrollbar(
+            "grid-h-scrollbar",
+            self.grid_h_scroll.clone(),
+            &self.theme,
+        );
+
         div()
             .id("grid-scroll")
+            .relative()
             .flex_1()
             .h_full()
             .min_h(px(0.))
@@ -474,6 +468,8 @@ impl DbUi {
                             .child(body),
                     ),
             )
+            .child(vertical_bar)
+            .child(horizontal_bar)
             .into_any_element()
     }
 }
@@ -600,7 +596,9 @@ fn render_header(
     theme: &crate::theme::Theme,
     total_width: f32,
     sort: Option<dbui_app::domain::SortKey>,
-    sortable: bool,
+    // `moving` is the column being carried, once the press has travelled far
+    // enough to be a drag rather than a click on the heading.
+    moving: Option<usize>,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
     let columns: Vec<AnyElement> = visible
@@ -617,7 +615,6 @@ fn render_header(
                 .iter()
                 .any(|meta| meta.name == column.name && meta.is_primary_key);
             let sorted = sort.as_ref().filter(|key| key.column == column.name);
-            let name = column.name.clone();
 
             div()
                 .id(("header", *index))
@@ -634,18 +631,35 @@ fn render_header(
                 .border_color(theme.border)
                 .when(is_key, |header| header.text_color(theme.warning))
                 .when(sorted.is_some(), |header| header.text_color(theme.text))
-                .when(sortable, |header| {
-                    header
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.hover))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_sort(&name, cx);
-                            }),
-                        )
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover))
+                // The one in hand is lit, so a drag over a wide table still
+                // shows which column is moving.
+                .when(moving == Some(*index), |header| {
+                    header.bg(theme.selection).text_color(theme.text)
                 })
+                // A press is not a sort yet: it becomes one on release, if
+                // the pointer never travelled. Sorting on the way down would
+                // re-run the query under a column on its way somewhere else.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener({
+                        let column = *index;
+                        move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_column_move(column, event.position.x);
+                            cx.notify();
+                        }
+                    }),
+                )
+                // Crossing another heading with a column in hand is what
+                // moves it -- a slot at a time, the way the tab strip does.
+                .on_mouse_move(cx.listener({
+                    let column = *index;
+                    move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        this.drag_column_over(column, event.position.x, cx);
+                    }
+                }))
                 .child(SharedString::from(column.name.clone()))
                 .child(
                     div()

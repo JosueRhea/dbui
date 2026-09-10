@@ -1,6 +1,6 @@
 //! The center column: tab bar, filters, content, and bottom bar.
 
-use super::{button, caption};
+use super::{button, caption, scrollbar};
 use crate::highlight;
 use crate::root::{DbUi, Focus};
 use crate::sql_format;
@@ -50,11 +50,11 @@ impl DbUi {
             return div().into_any_element();
         };
 
+        // Listed as the grid draws them, hidden ones included: a checklist in
+        // one order over a grid in another is two answers to the same
+        // question.
         let rows: Vec<_> = view
-            .set
-            .columns
-            .iter()
-            .enumerate()
+            .ordered_columns()
             .map(|(index, column)| {
                 let name = column.name.clone();
                 let visible = !hidden_columns.contains(&name);
@@ -90,20 +90,30 @@ impl DbUi {
             .collect();
 
         div()
-            .id("columns-panel")
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_3()
-            .py_2()
-            .max_h(metrics::scaled(160.))
-            .overflow_y_scroll()
+            .relative()
             .flex_shrink_0()
-            .bg(theme.elevated)
-            .border_b_1()
-            .border_color(theme.border)
-            .child(caption("Columns", theme))
-            .children(rows)
+            .child(
+                div()
+                    .id("columns-panel")
+                    .track_scroll(&self.columns_scroll)
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .max_h(metrics::scaled(160.))
+                    .overflow_y_scroll()
+                    .bg(theme.elevated)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(caption("Columns", theme))
+                    .children(rows),
+            )
+            .child(scrollbar::vertical_scrollbar(
+                "columns-scrollbar",
+                self.columns_scroll.clone(),
+                theme,
+            ))
             .into_any_element()
     }
 
@@ -216,41 +226,51 @@ impl DbUi {
         });
 
         div()
-            .id("error-panel")
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_3()
-            .py_2()
+            .relative()
             .flex_shrink_0()
-            .max_h(metrics::scaled(150.))
-            .overflow_y_scroll()
-            .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.danger)
             .child(
                 div()
+                    .id("error-panel")
+                    .track_scroll(&self.error_scroll)
                     .flex()
-                    .items_start()
-                    .gap_2()
-                    .child(div().flex_shrink_0().text_color(theme.danger).child("⚠"))
-                    .children(code)
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .max_h(metrics::scaled(150.))
+                    .overflow_y_scroll()
+                    .bg(theme.panel)
+                    .border_b_1()
+                    .border_color(theme.danger)
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_color(theme.danger)
-                            .child(SharedString::from(error.message.clone())),
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(div().flex_shrink_0().text_color(theme.danger).child("⚠"))
+                            .children(code)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_color(theme.danger)
+                                    .child(SharedString::from(error.message.clone())),
+                            )
+                            .child(copy)
+                            .child(dismiss),
                     )
-                    .child(copy)
-                    .child(dismiss),
+                    .children(statement)
+                    .children(
+                        error
+                            .progress()
+                            .map(|note| caption(note, theme).flex_shrink_0()),
+                    ),
             )
-            .children(statement)
-            .children(
-                error
-                    .progress()
-                    .map(|note| caption(note, theme).flex_shrink_0()),
-            )
+            .child(scrollbar::vertical_scrollbar(
+                "error-scrollbar",
+                self.error_scroll.clone(),
+                theme,
+            ))
             .into_any_element()
     }
 
@@ -289,7 +309,11 @@ impl DbUi {
                     .rounded_md()
                     .cursor_pointer()
                     .flex_shrink_0()
-                    .bg(if selected { theme.selection } else { theme.elevated })
+                    .bg(if selected {
+                        theme.selection
+                    } else {
+                        theme.elevated
+                    })
                     .text_color(if selected {
                         theme.text
                     } else {
@@ -385,12 +409,24 @@ impl DbUi {
             .collect();
 
         div()
-            .id("structure-pane")
+            .relative()
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
-            .font_family(metrics::MONO_FONT)
-            .children(rows)
+            .child(
+                div()
+                    .id("structure-pane")
+                    .track_scroll(&self.structure_scroll)
+                    .size_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .font_family(metrics::MONO_FONT)
+                    .children(rows),
+            )
+            .child(scrollbar::vertical_scrollbar(
+                "structure-scrollbar",
+                self.structure_scroll.clone(),
+                &self.theme,
+            ))
             .into_any_element()
     }
 
@@ -429,10 +465,15 @@ impl DbUi {
         let cursor = editor.cursor();
         let input_has_selection = editor.has_selection();
         let hit_slot = editor.hit_bounds_slot();
+        let scroll_handle = editor.scroll_handle().clone();
+        let completion_scroll = self.completion_scroll.clone();
         let sql_spans = sql_format::highlight_spans(editor.text());
         let lines_owned: Vec<String> = layout.lines.iter().map(|l| (*l).to_string()).collect();
         let theme = &self.theme;
         let line_h = metrics::editor_line_height();
+        // The same box the caret-follow pans over, so the two agree on where
+        // the text ends.
+        let content_w = text_input::editor_content_size(editor.text()).width;
         let caret_color = if focused {
             theme.accent
         } else {
@@ -537,19 +578,23 @@ impl DbUi {
                     .relative()
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_y_scroll()
+                    .overflow_hidden()
                     .px_3()
                     .pb_2()
                     .font_family(metrics::MONO_FONT)
                     .text_size(metrics::editor_text_size())
                     .cursor_text()
+                    // The hit canvas measures the *viewport*, and so sits
+                    // outside the scrollport: `offset_for_mouse` adds the
+                    // scroll offset back itself, and bounds that had already
+                    // moved with the scroll would count it twice.
                     .child(
                         canvas(
                             move |bounds, _, _| {
                                 let mut bounds = bounds;
-                                bounds.origin.x += text_input::editor_gutter();
-                                bounds.size.width =
-                                    (bounds.size.width - text_input::editor_gutter()).max(px(0.));
+                                let inset = px(12. * metrics::zoom());
+                                bounds.origin.x += inset;
+                                bounds.size.width = (bounds.size.width - inset * 2.).max(px(0.));
                                 if hit_slot.get() != Some(bounds) {
                                     hit_slot.set(Some(bounds));
                                 }
@@ -557,6 +602,8 @@ impl DbUi {
                             |_, _, _, _| {},
                         )
                         .absolute()
+                        .top_0()
+                        .left_0()
                         .size_full(),
                     )
                     .on_mouse_down(
@@ -570,7 +617,7 @@ impl DbUi {
                             };
                             let offset = editor.offset_for_mouse(
                                 event.position,
-                                px(0.),
+                                text_input::editor_gutter(),
                                 metrics::editor_line_height(),
                                 text_input::char_width(),
                             );
@@ -580,6 +627,7 @@ impl DbUi {
                             } else {
                                 editor.end_selecting();
                             }
+                            editor.ensure_editor_caret_visible();
                             cx.notify();
                         }),
                     )
@@ -592,11 +640,12 @@ impl DbUi {
                         }
                         let offset = editor.offset_for_mouse(
                             event.position,
-                            px(0.),
+                            text_input::editor_gutter(),
                             metrics::editor_line_height(),
                             text_input::char_width(),
                         );
                         editor.select_to(offset);
+                        editor.ensure_editor_caret_visible();
                         cx.notify();
                     }))
                     .on_mouse_up(
@@ -617,8 +666,51 @@ impl DbUi {
                             cx.notify();
                         }),
                     )
-                    .children(lines)
-                    .children(completion.map(|popup| render_completion_popup(&popup, theme, cx))),
+                    .child(
+                        div()
+                            .relative()
+                            .size_full()
+                            .child(
+                                div()
+                                    .id("editor-scroll")
+                                    .track_scroll(&scroll_handle)
+                                    .size_full()
+                                    .overflow_x_scroll()
+                                    .overflow_y_scroll()
+                                    // Without this a vertical trackpad gesture is
+                                    // remapped onto X and pans the SQL sideways.
+                                    .map(|mut el| {
+                                        el.style().restrict_scroll_to_axis = Some(true);
+                                        el
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .flex_shrink_0()
+                                            .w(content_w)
+                                            // A line shorter than the pane still fills
+                                            // it, so the placeholder and the caret at
+                                            // the end of a short line are not clipped
+                                            // by a content box narrower than the view.
+                                            .min_w_full()
+                                            .children(lines),
+                                    ),
+                            )
+                            .child(scrollbar::vertical_scrollbar(
+                                "editor-v-scrollbar",
+                                scroll_handle.clone(),
+                                theme,
+                            ))
+                            .child(scrollbar::horizontal_scrollbar(
+                                "editor-h-scrollbar",
+                                scroll_handle.clone(),
+                                theme,
+                            )),
+                    )
+                    .children(completion.map(|popup| {
+                        render_completion_popup(&popup, &completion_scroll, theme, cx)
+                    })),
             )
             .child(editor_resize_handle(dragging, theme, cx))
             .into_any_element()
@@ -661,6 +753,7 @@ fn editor_resize_handle(
 
 fn render_completion_popup(
     popup: &crate::sql_complete::CompletionPopup,
+    scroll: &gpui::ScrollHandle,
     theme: &crate::theme::Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
@@ -709,7 +802,9 @@ fn render_completion_popup(
         .bottom(px(4.))
         .min_w(px(220.))
         .max_h(px(180.))
-        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
         .bg(theme.elevated)
         .border_1()
         .border_color(theme.border)
@@ -718,7 +813,20 @@ fn render_completion_popup(
         .py_1()
         .font_family(metrics::MONO_FONT)
         .text_size(metrics::text_size_small())
-        .children(rows)
+        .child(
+            div()
+                .id("sql-completion-rows")
+                .track_scroll(scroll)
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .children(rows),
+        )
+        .child(scrollbar::vertical_scrollbar(
+            "completion-scrollbar",
+            scroll.clone(),
+            theme,
+        ))
         .into_any_element()
 }
 

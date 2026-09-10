@@ -210,11 +210,7 @@ impl Workspace {
 
         if self.active == Some(id) {
             // `index` now names the tab that was to the right.
-            self.active = self
-                .open
-                .get(index)
-                .or_else(|| self.open.last())
-                .copied();
+            self.active = self.open.get(index).or_else(|| self.open.last()).copied();
             self.open_table = None;
         }
         self.active
@@ -287,7 +283,10 @@ impl Workspace {
 
     /// The configs worth writing to disk.
     pub fn configs(&self) -> Vec<ConnectionConfig> {
-        self.entries.iter().map(|entry| entry.config.clone()).collect()
+        self.entries
+            .iter()
+            .map(|entry| entry.config.clone())
+            .collect()
     }
 }
 
@@ -297,9 +296,7 @@ mod tests {
     use dbui_domain::Driver;
 
     fn workspace_with(count: usize) -> Workspace {
-        Workspace::from_configs(
-            (0..count).map(|_| ConnectionConfig::new(Driver::Postgres)),
-        )
+        Workspace::from_configs((0..count).map(|_| ConnectionConfig::new(Driver::Postgres)))
     }
 
     #[test]

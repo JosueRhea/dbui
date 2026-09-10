@@ -84,14 +84,10 @@ impl DbUi {
                 // A staged insert takes the sidebar over: it has no stored
                 // row behind it, so the ordinary draft path has nothing to
                 // reconcile against.
-                if let Some(insert) = self
-                    .tabs
-                    .active()
-                    .and_then(|tab| {
-                        tab.editing_insert()
-                            .and_then(|index| tab.pending_inserts().get(index))
-                    })
-                {
+                if let Some(insert) = self.tabs.active().and_then(|tab| {
+                    tab.editing_insert()
+                        .and_then(|index| tab.pending_inserts().get(index))
+                }) {
                     vec![render_insert_draft(
                         insert,
                         self.detail_input,
@@ -163,25 +159,37 @@ impl DbUi {
             )
             .child(
                 div()
-                    .id("detail-body")
+                    .relative()
                     .flex_1()
                     .min_h(px(0.))
                     .min_w(px(0.))
                     .w_full()
-                    .track_scroll(&self.detail_scroll)
-                    .overflow_x_hidden()
-                    .overflow_y_scroll()
-                    .map(|mut el| {
-                        // Horizontal trackpad over fields must not remap onto
-                        // this vertical sidebar scroll.
-                        el.style().restrict_scroll_to_axis = Some(true);
-                        el
-                    })
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(body),
+                    .child(
+                        div()
+                            .id("detail-body")
+                            .size_full()
+                            .min_h(px(0.))
+                            .min_w(px(0.))
+                            .track_scroll(&self.detail_scroll)
+                            .overflow_x_hidden()
+                            .overflow_y_scroll()
+                            .map(|mut el| {
+                                // Horizontal trackpad over fields must not remap onto
+                                // this vertical sidebar scroll.
+                                el.style().restrict_scroll_to_axis = Some(true);
+                                el
+                            })
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .children(body),
+                    )
+                    .child(super::scrollbar::vertical_scrollbar(
+                        "detail-scrollbar",
+                        self.detail_scroll.clone(),
+                        &self.theme,
+                    )),
             )
     }
 }
@@ -277,9 +285,7 @@ fn render_table_draft(
     // position: the banner, the search box, then one per visible field. Wrap
     // them in a container and every field shares its index.
     let mut body: Vec<AnyElement> = Vec::with_capacity(fields.len() + 3);
-    body.extend(
-        bulk.then(|| bulk_banner(draft.rows.len(), theme).into_any_element()),
-    );
+    body.extend(bulk.then(|| bulk_banner(draft.rows.len(), theme).into_any_element()));
     body.push(
         text_field(
             "detail-field-search",
@@ -683,11 +689,7 @@ fn read_only_field(
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
     let display = json_format::display_text(text);
-    let color = if muted {
-        theme.text_faint
-    } else {
-        theme.text
-    };
+    let color = if muted { theme.text_faint } else { theme.text };
 
     if !display.contains('\n') && !display.contains('\r') {
         return div()

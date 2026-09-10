@@ -5,6 +5,7 @@
 //! the UI as the same thing, and so the renderer has a closed set to match on.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::fmt;
 
 /// A decoded cell.
@@ -32,6 +33,77 @@ pub enum Value {
     Unsupported(String),
     /// Write-only: `SET col = DEFAULT`. Never produced by a decoder.
     Default,
+}
+
+/// Order two cells for a sort the client does itself.
+///
+/// A query's rows are ordered by its own `ORDER BY`, and the grid will not
+/// rewrite someone's SQL to change that -- so sorting a query result reorders
+/// the page already in hand, and this is the whole definition of what
+/// "ascending" means there.
+///
+/// Numbers compare as numbers, so `9` comes before `10` rather than after it,
+/// and that is the entire reason this is not `to_text().cmp()`. Exact numerics
+/// are strings on purpose (see [`Value::Decimal`]) and are read back as `f64`
+/// only to be compared; a value too wide for that falls back to comparing the
+/// digits, which is still stable and still a total order.
+///
+/// `NULL` sorts last ascending and first descending, the way Postgres orders
+/// it by default -- descending is the exact reverse of ascending, which is
+/// what makes a second click on a header mean what it looks like it means.
+///
+/// Mixed types in one column are possible (a `json` column, a union in a
+/// query) so kinds that cannot be compared to each other fall back to a fixed
+/// order between them. Two rows never compare equal by accident that way, and
+/// the sort stays a total order.
+pub fn compare(left: &Value, right: &Value) -> Ordering {
+    match (left, right) {
+        (Value::Null | Value::Default, Value::Null | Value::Default) => Ordering::Equal,
+        (Value::Null | Value::Default, _) => Ordering::Greater,
+        (_, Value::Null | Value::Default) => Ordering::Less,
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+        (Value::Array(a), Value::Array(b)) => a
+            .iter()
+            .zip(b.iter())
+            .map(|(a, b)| compare(a, b))
+            .find(|order| *order != Ordering::Equal)
+            .unwrap_or_else(|| a.len().cmp(&b.len())),
+        _ => match (as_number(left), as_number(right)) {
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            _ => match sort_rank(left).cmp(&sort_rank(right)) {
+                Ordering::Equal => left.to_text().cmp(&right.to_text()),
+                order => order,
+            },
+        },
+    }
+}
+
+/// The numeric reading of a value, for the columns where digits are the point.
+fn as_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(number) => Some(*number as f64),
+        Value::Float(number) => Some(*number),
+        Value::Decimal(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Where a variant sits relative to the others, for the columns that hold
+/// more than one. Only reached when two values cannot be compared on their
+/// own terms.
+fn sort_rank(value: &Value) -> u8 {
+    match value {
+        Value::Bool(_) => 0,
+        Value::Int(_) | Value::Float(_) | Value::Decimal(_) => 1,
+        Value::Temporal(_) => 2,
+        Value::Text(_) | Value::Uuid(_) => 3,
+        Value::Json(_) => 4,
+        Value::Array(_) => 5,
+        Value::Bytes(_) => 6,
+        Value::Unsupported(_) => 7,
+        Value::Null | Value::Default => 8,
+    }
 }
 
 impl Value {
@@ -183,7 +255,12 @@ fn format_float(f: f64) -> String {
         return "NaN".into();
     }
     if f.is_infinite() {
-        return if f.is_sign_negative() { "-Infinity" } else { "Infinity" }.into();
+        return if f.is_sign_negative() {
+            "-Infinity"
+        } else {
+            "Infinity"
+        }
+        .into();
     }
     if f == f.trunc() && f.abs() < 1e15 {
         format!("{f:.1}")
@@ -262,7 +339,14 @@ mod prototype_tests {
     /// "column is of type bigint but expression is of type text".
     #[test]
     fn integer_columns_are_recognised_in_both_engines_spellings() {
-        for name in ["bigint", "integer", "int4", "INT", "smallint", "BIGINT UNSIGNED"] {
+        for name in [
+            "bigint",
+            "integer",
+            "int4",
+            "INT",
+            "smallint",
+            "BIGINT UNSIGNED",
+        ] {
             assert_eq!(
                 Value::prototype_for(name),
                 Value::Int(0),
@@ -311,5 +395,108 @@ mod prototype_tests {
     #[test]
     fn serial_is_an_integer() {
         assert_eq!(Value::prototype_for("bigserial"), Value::Int(0));
+    }
+
+    /// The whole reason this is not `to_text().cmp()`.
+    #[test]
+    fn numbers_sort_as_numbers_not_as_digits() {
+        let mut values = vec![Value::Int(10), Value::Int(9), Value::Int(100)];
+        values.sort_by(compare);
+        assert_eq!(values, vec![Value::Int(9), Value::Int(10), Value::Int(100)]);
+    }
+
+    /// Money stays a string all the way to the screen, and still sorts.
+    #[test]
+    fn decimals_compare_by_value_and_against_ints() {
+        assert_eq!(
+            compare(
+                &Value::Decimal("9.50".into()),
+                &Value::Decimal("10.00".into())
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare(&Value::Decimal("2.5".into()), &Value::Int(2)),
+            Ordering::Greater
+        );
+    }
+
+    /// A decimal too wide for `f64` still lands somewhere, and lands there
+    /// every time.
+    #[test]
+    fn an_unparseable_decimal_falls_back_to_its_digits() {
+        let huge = Value::Decimal("not a number".into());
+        assert_eq!(compare(&huge, &huge), Ordering::Equal);
+        assert_eq!(
+            compare(&huge, &Value::Decimal("zzz".into())),
+            Ordering::Less
+        );
+    }
+
+    /// Postgres' default: last ascending, and therefore first descending,
+    /// because descending is the exact reverse.
+    #[test]
+    fn null_sorts_last_ascending() {
+        let mut values = vec![Value::Null, Value::Int(2), Value::Int(1)];
+        values.sort_by(compare);
+        assert_eq!(values, vec![Value::Int(1), Value::Int(2), Value::Null]);
+
+        values.sort_by(|a, b| compare(a, b).reverse());
+        assert_eq!(values, vec![Value::Null, Value::Int(2), Value::Int(1)]);
+    }
+
+    /// `DEFAULT` is an absence like `NULL`, and sorts with it.
+    #[test]
+    fn default_sorts_with_null() {
+        assert_eq!(compare(&Value::Default, &Value::Null), Ordering::Equal);
+        assert_eq!(compare(&Value::Default, &Value::Int(0)), Ordering::Greater);
+    }
+
+    /// Timestamps arrive already formatted, and the adapters format them so
+    /// that lexicographic order is chronological order.
+    #[test]
+    fn temporals_sort_chronologically_as_written() {
+        let mut values = vec![
+            Value::Temporal("2026-01-02 00:00:00".into()),
+            Value::Temporal("2025-12-31 23:59:59".into()),
+        ];
+        values.sort_by(compare);
+        assert_eq!(values[0], Value::Temporal("2025-12-31 23:59:59".into()));
+    }
+
+    /// A column holding more than one kind still gets a total order, so a
+    /// sort over it terminates and is repeatable.
+    #[test]
+    fn mixed_kinds_still_order_totally() {
+        let mut values = vec![
+            Value::Text("b".into()),
+            Value::Int(3),
+            Value::Bool(true),
+            Value::Null,
+            Value::Text("a".into()),
+        ];
+        values.sort_by(compare);
+        assert_eq!(
+            values,
+            vec![
+                Value::Bool(true),
+                Value::Int(3),
+                Value::Text("a".into()),
+                Value::Text("b".into()),
+                Value::Null,
+            ]
+        );
+    }
+
+    /// Arrays compare element by element, shorter first when one is a prefix.
+    #[test]
+    fn arrays_compare_element_by_element() {
+        let short = Value::Array(vec![Value::Int(1)]);
+        let long = Value::Array(vec![Value::Int(1), Value::Int(0)]);
+        assert_eq!(compare(&short, &long), Ordering::Less);
+        assert_eq!(
+            compare(&long, &Value::Array(vec![Value::Int(2)])),
+            Ordering::Less
+        );
     }
 }

@@ -80,9 +80,7 @@ pub fn default_theme() -> Theme {
 impl Theme {
     /// Clone the named theme, or Wave if unknown.
     pub fn named(id: &str) -> Self {
-        theme_by_id(id)
-            .cloned()
-            .unwrap_or_else(default_theme)
+        theme_by_id(id).cloned().unwrap_or_else(default_theme)
     }
 
     /// The colour for a decoded cell.
@@ -489,6 +487,11 @@ pub mod metrics {
     /// The gutter holding row numbers.
     pub fn row_number_width() -> Pixels {
         z(52.)
+    }
+    /// How wide a scrollbar's track is. Thin enough to sit over content
+    /// without covering a column, wide enough to grab.
+    pub fn scrollbar_thickness() -> Pixels {
+        z(12.)
     }
 
     pub fn column_min_width() -> f32 {

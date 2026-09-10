@@ -149,10 +149,7 @@ impl DbUi {
                     let items = self.sidebar_visible_items();
                     if let Some(pos) = items.iter().position(|i| i == &item) {
                         for i in (0..pos).rev() {
-                            if let SidebarItem::Schema {
-                                connection: c, ..
-                            } = &items[i]
-                            {
+                            if let SidebarItem::Schema { connection: c, .. } = &items[i] {
                                 if *c == connection {
                                     self.sidebar_cursor = Some(items[i].clone());
                                     self.reveal_sidebar_cursor();
@@ -232,21 +229,30 @@ impl DbUi {
                     .child(
                         button("refresh-catalog", "↻", theme, false)
                             .px_2()
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.refresh_catalog(cx)
-                            })),
+                            .on_click(cx.listener(|this, _, _window, cx| this.refresh_catalog(cx))),
                     ),
             )
             .child(self.render_sidebar_filter(cx))
             .child(
                 div()
-                    .id("sidebar-scroll")
-                    .track_scroll(&self.sidebar_scroll)
+                    .relative()
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .py_1()
-                    .children(self.render_sidebar_body(cx)),
+                    .child(
+                        div()
+                            .id("sidebar-scroll")
+                            .track_scroll(&self.sidebar_scroll)
+                            .size_full()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .py_1()
+                            .children(self.render_sidebar_body(cx)),
+                    )
+                    .child(super::scrollbar::vertical_scrollbar(
+                        "sidebar-scrollbar",
+                        self.sidebar_scroll.clone(),
+                        &self.theme,
+                    )),
             )
     }
 
@@ -362,7 +368,10 @@ impl DbUi {
                         .text_color(theme.text_muted)
                         .child(SharedString::from(message.to_string())),
                 )
-                .child(caption("Select the connection in the titlebar to connect.", theme))
+                .child(caption(
+                    "Select the connection in the titlebar to connect.",
+                    theme,
+                ))
                 .into_any_element()];
         }
 
@@ -391,10 +400,7 @@ impl DbUi {
                 .into_any_element()];
         }
 
-        let active_table = self
-            .tabs
-            .active()
-            .and_then(|tab| tab.table_ref().cloned());
+        let active_table = self.tabs.active().and_then(|tab| tab.table_ref().cloned());
         let query = self.sidebar_query();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut matched = 0usize;

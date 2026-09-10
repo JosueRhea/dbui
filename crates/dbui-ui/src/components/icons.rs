@@ -143,13 +143,7 @@ pub(crate) fn command_mark(color: Rgba) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .child(
-            div()
-                .w(px(8.))
-                .h(px(2.))
-                .rounded(px(1.))
-                .bg(color),
-        )
+        .child(div().w(px(8.)).h(px(2.)).rounded(px(1.)).bg(color))
 }
 
 /// Swatch for theme rows in the palette.

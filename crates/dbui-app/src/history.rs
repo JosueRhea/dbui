@@ -94,12 +94,11 @@ pub fn load(path: &Path) -> History {
 
 /// Write it out, by rename so a crash mid-write cannot leave half a file.
 pub fn save(path: &Path, history: &History) -> Result<(), crate::store::StoreError> {
-    let text = serde_json::to_string_pretty(history).map_err(|error| {
-        crate::store::StoreError::Write {
+    let text =
+        serde_json::to_string_pretty(history).map_err(|error| crate::store::StoreError::Write {
             path: path.to_path_buf(),
             message: error.to_string(),
-        }
-    })?;
+        })?;
     crate::store::write_atomic(path, &text)
 }
 

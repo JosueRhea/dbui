@@ -8,9 +8,8 @@ use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, Page, QueryOutcome,
-    ForeignKey, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey,
-    Table, TableRef,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Page, QueryOutcome,
+    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef,
     TlsMode, Value,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -220,17 +219,17 @@ impl DatabaseDriver for PostgresDriver {
                     name: row.try_get::<String, _>("column_name").ok()?,
                     data_type: row.try_get::<String, _>("data_type").ok()?,
                     nullable: row.try_get::<bool, _>("is_nullable").unwrap_or(true),
-                    default: row.try_get::<Option<String>, _>("column_default").ok().flatten(),
+                    default: row
+                        .try_get::<Option<String>, _>("column_default")
+                        .ok()
+                        .flatten(),
                     is_primary_key: row.try_get::<bool, _>("is_primary_key").unwrap_or(false),
                     ordinal: i32::from(row.try_get::<i16, _>("ordinal").unwrap_or(0)),
                     references: None,
                 })
             })
             .map(|mut column: Column| {
-                column.references = keys
-                    .iter()
-                    .find(|key| key.column == column.name)
-                    .cloned();
+                column.references = keys.iter().find(|key| key.column == column.name).cloned();
                 column
             })
             .collect())
@@ -248,9 +247,7 @@ impl DatabaseDriver for PostgresDriver {
         for value in &bound.binds {
             query = bind_value(query, value);
         }
-        query = query
-            .bind(page.probe_limit())
-            .bind(page.offset as i64);
+        query = query.bind(page.probe_limit()).bind(page.offset as i64);
 
         let rows = query
             .fetch_all(&self.pool)

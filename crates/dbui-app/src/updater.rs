@@ -390,8 +390,11 @@ pub fn install(staged: &Staged) -> Result<std::convert::Infallible, UpdateError>
 /// `spctl` is the same assessment Gatekeeper runs, so this is the check a user
 /// would get on first open -- done before the swap instead of after.
 fn verify_bundle(app: &Path) -> Result<(), UpdateError> {
-    run("/usr/bin/codesign", &["--verify", "--deep", "--strict", path(app)?])
-        .map_err(|e| UpdateError::Signature(format!("codesign rejected it: {e}")))?;
+    run(
+        "/usr/bin/codesign",
+        &["--verify", "--deep", "--strict", path(app)?],
+    )
+    .map_err(|e| UpdateError::Signature(format!("codesign rejected it: {e}")))?;
 
     run(
         "/usr/sbin/spctl",

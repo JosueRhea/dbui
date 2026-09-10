@@ -473,6 +473,16 @@ fn multiline_text_field(
                     char_w,
                 )),
         )
+        // Only when there are lines out of sight: a field showing all of its
+        // text has nothing to report, and a bar over a two-line value is just
+        // something covering the value.
+        .when(scrolls, |field| {
+            field.child(super::scrollbar::vertical_scrollbar(
+                "field-scrollbar",
+                scroll_handle.clone(),
+                theme,
+            ))
+        })
         // Matches `px_2` / `py_1`, so the measured viewport is the scrollport.
         .child(hit_canvas(
             hit_slot,

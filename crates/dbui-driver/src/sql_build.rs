@@ -545,7 +545,10 @@ mod tests {
             "INSERT INTO \"public\".\"people\" (\"name\", \"score\") \
              VALUES ($1, $2::numeric)"
         );
-        assert!(!bound.sql.contains("\"id\""), "an untouched key is left out");
+        assert!(
+            !bound.sql.contains("\"id\""),
+            "an untouched key is left out"
+        );
     }
 
     /// NULL and DEFAULT are written into the statement, not bound -- DEFAULT
@@ -562,7 +565,11 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(bound.sql.contains("VALUES (NULL, DEFAULT, $1)"), "got: {}", bound.sql);
+        assert!(
+            bound.sql.contains("VALUES (NULL, DEFAULT, $1)"),
+            "got: {}",
+            bound.sql
+        );
         assert_eq!(bound.binds, vec![Value::Int(1)]);
     }
 
@@ -601,8 +608,10 @@ mod tests {
     fn dropping_names_the_kind_of_relation() {
         let table = TableRef::new("public", "v");
         assert!(drop_sql(Driver::Postgres, &table, TableKind::View).starts_with("DROP VIEW "));
-        assert!(drop_sql(Driver::Postgres, &table, TableKind::MaterializedView)
-            .starts_with("DROP MATERIALIZED VIEW "));
+        assert!(
+            drop_sql(Driver::Postgres, &table, TableKind::MaterializedView)
+                .starts_with("DROP MATERIALIZED VIEW ")
+        );
         assert!(drop_sql(Driver::Postgres, &table, TableKind::Table).starts_with("DROP TABLE "));
     }
 

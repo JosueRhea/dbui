@@ -9,8 +9,8 @@ mod error;
 mod mysql;
 mod port;
 mod postgres;
-mod sqlite;
 mod sql_build;
+mod sqlite;
 
 pub use error::{DriverError, Result};
 pub use port::{DatabaseDriver, RowBatch, RowDelete, RowInsert, RowUpdate};

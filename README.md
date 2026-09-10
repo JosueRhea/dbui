@@ -224,8 +224,14 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘+` / `⌘-` / `⌘0` | Zoom the interface in, out, back to actual size |
 | `Esc` | Close the sheet, dismiss autocomplete, or leave the editor |
 
+Tabs drag along the strip to reorder, and the order is part of what a restart
+puts back. Right-clicking one gives it the rest: close it, close the others,
+close everything to its right, or close them all. The same four are in `⌘⇧P`,
+aimed at the tab in front.
+
 Closing a tab or a connection that is holding staged changes asks before it
-throws them away, and a tab holding some is marked with a dot.
+throws them away, and a tab holding some is marked with a dot. A close that
+takes several tabs at once asks once, for the batch.
 
 ## Layout
 

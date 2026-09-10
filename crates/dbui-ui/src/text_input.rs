@@ -9,7 +9,9 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use gpui::{div, point, px, App, Bounds, ClipboardItem, Keystroke, Pixels, Point, ScrollHandle};
+use gpui::{
+    div, point, px, size, App, Bounds, ClipboardItem, Keystroke, Pixels, Point, ScrollHandle, Size,
+};
 
 const UNDO_LIMIT: usize = 100;
 
@@ -137,6 +139,28 @@ impl TextInput {
 
     /// Keep the caret inside the visible viewport of the field.
     pub fn ensure_caret_visible(&self) {
+        let char_w = if self.multiline {
+            field_char_width()
+        } else {
+            char_width()
+        };
+        self.ensure_caret_visible_with(char_w, field_line_height(), px(0.));
+    }
+
+    /// The same, for the SQL editor: bigger type than a detail field, and a
+    /// line-number gutter that scrolls along with the text, so the caret sits
+    /// a gutter further right than its column alone would say.
+    pub fn ensure_editor_caret_visible(&self) {
+        self.ensure_caret_visible_with(
+            char_width(),
+            crate::theme::metrics::editor_line_height(),
+            editor_gutter(),
+        );
+    }
+
+    /// Pan (and scroll) so the caret is inside the viewport, given the metrics
+    /// the surface actually draws with.
+    fn ensure_caret_visible_with(&self, char_w: f32, line_height: Pixels, gutter: Pixels) {
         let Some(bounds) = self.hit_bounds.get() else {
             return;
         };
@@ -151,15 +175,15 @@ impl TextInput {
             let line = layout.lines.get(layout.caret_line).copied().unwrap_or("");
             let col = layout.caret_column.min(line.len());
             let col_chars = line[..col].chars().count() as f32;
-            let line_h = f32::from(field_line_height());
+            let line_h = f32::from(line_height);
             (
-                px(col_chars * field_char_width()),
+                gutter + px(col_chars * char_w),
                 px(layout.caret_line as f32 * line_h),
                 line_h,
             )
         } else {
             let caret_chars = self.value[..self.cursor()].chars().count() as f32;
-            (px(caret_chars * char_width()), px(0.), 0.)
+            (px(caret_chars * char_w), px(0.), 0.)
         };
 
         let viewport_w = bounds.size.width;
@@ -185,14 +209,21 @@ impl TextInput {
                     new_y = -(caret_bottom - viewport_h);
                 }
             }
-            let max = self.scroll_handle.max_offset();
-            new_x = new_x.clamp(-max.width, px(0.));
-            new_y = new_y.clamp(-max.height, px(0.));
+            // Clamped against the content this text *is*, not against the
+            // scroll range the last frame measured: text set from anywhere but
+            // a keystroke has not been laid out yet, and a stale range of zero
+            // pins the caret-follow to nothing. Overshooting is safe -- GPUI
+            // clamps the offset to the real content on the next prepaint.
+            let content = content_size(&self.value, char_w, line_height, gutter);
+            let max_x = (content.width - viewport_w).max(px(0.));
+            let max_y = (content.height - viewport_h).max(px(0.));
+            new_x = new_x.clamp(-max_x, px(0.));
+            new_y = new_y.clamp(-max_y, px(0.));
         } else {
             // No scroll container — clamp X from content width, Y always 0.
             // Use a slightly generous advance so we pan before the real caret
             // disappears off the right edge (underestimates leave it stranded).
-            let advance = char_width() * 1.05;
+            let advance = char_w * 1.05;
             let content_w = px(self.value.chars().count() as f32 * advance + 8.);
             let max_x = (content_w - viewport_w).max(px(0.));
             new_x = new_x.clamp(-max_x, px(0.));
@@ -1101,6 +1132,36 @@ pub fn field_line_height() -> Pixels {
 
 pub fn editor_gutter() -> Pixels {
     px(32. * crate::theme::metrics::zoom())
+}
+
+/// How wide and tall the laid-out text is, for a monospace surface.
+///
+/// The width carries a character of slack: the caret past the last glyph needs
+/// somewhere to sit, and an advance estimated a hair narrow than the real font
+/// would otherwise leave the tail of the longest line behind the right edge.
+/// Callers that draw the content have to size it the same way -- see the SQL
+/// editor, which scrolls exactly this box.
+pub fn content_size(text: &str, char_w: f32, line_height: Pixels, gutter: Pixels) -> Size<Pixels> {
+    let widest = text
+        .split('\n')
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines = text.split('\n').count();
+    size(
+        gutter + px(widest as f32 * char_w + char_w * 2.),
+        px(lines as f32 * f32::from(line_height)),
+    )
+}
+
+/// [`content_size`] at the SQL editor's metrics.
+pub fn editor_content_size(text: &str) -> Size<Pixels> {
+    content_size(
+        text,
+        char_width(),
+        crate::theme::metrics::editor_line_height(),
+        editor_gutter(),
+    )
 }
 
 #[cfg(test)]

@@ -286,12 +286,7 @@ impl DbUi {
                                 .overflow_hidden()
                                 .flex()
                                 .flex_col()
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_color(theme.text)
-                                        .child(name),
-                                )
+                                .child(div().truncate().text_color(theme.text).child(name))
                                 .child(caption(summary, theme).truncate()),
                         )
                         // Says which of these already have a tab, so clicking
@@ -307,14 +302,16 @@ impl DbUi {
                                     .text_color(theme.text_faint)
                                     .cursor_pointer()
                                     .hover(|s| s.text_color(theme.danger))
-                                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                        if !event.standard_click() {
-                                            return;
-                                        }
-                                        cx.stop_propagation();
-                                        this.close_connection_picker(cx);
-                                        this.disconnect(id, cx);
-                                    }))
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, _, cx| {
+                                            if !event.standard_click() {
+                                                return;
+                                            }
+                                            cx.stop_propagation();
+                                            this.close_connection_picker(cx);
+                                            this.disconnect(id, cx);
+                                        },
+                                    ))
                                     .child("⏻"),
                             )
                         })
@@ -361,12 +358,24 @@ impl DbUi {
                 }))
                 .child(
                     div()
-                        .id("connection-picker-list")
+                        .relative()
                         .flex_1()
                         .min_h(px(0.))
-                        .overflow_y_scroll()
-                        .py_1()
-                        .children(rows),
+                        .child(
+                            div()
+                                .id("connection-picker-list")
+                                .track_scroll(&self.picker_scroll)
+                                .size_full()
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .py_1()
+                                .children(rows),
+                        )
+                        .child(super::scrollbar::vertical_scrollbar(
+                            "picker-scrollbar",
+                            self.picker_scroll.clone(),
+                            theme,
+                        )),
                 )
                 .child(div().h(px(1.)).w_full().bg(theme.divider))
                 .child(

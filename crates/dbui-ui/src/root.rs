@@ -5,7 +5,7 @@
 //! blocks that only render -- they read state and attach listeners, they do not
 //! define it. When a task lands, exactly one of the methods here folds it in.
 
-use crate::components::close_guard::{CloseGuard, CloseTarget};
+use crate::components::close_guard::{CloseGuard, CloseTarget, TabScope};
 use crate::components::context_menu::{ConfirmPrompt, ContextMenu};
 use crate::components::palette::{Palette, PaletteKind};
 use crate::components::{ConnectionForm, DetailInput, FormAction};
@@ -14,13 +14,13 @@ use crate::tabs::{RowDraft, Tabs, WorkspaceTab};
 use crate::theme::{metrics, Theme};
 use dbui_app::commands;
 use dbui_app::domain::{
-    Catalog, Column, ConnectionId, Page, QueryOutcome, ResultSet, TableRef,
+    Catalog, Column, ColumnInfo, ConnectionId, Page, QueryOutcome, ResultSet, TableRef,
 };
 use dbui_app::{
     session, store, ConnectionStatus, DbRuntime, RowUpdate, SavedConnectionTab, Session, Workspace,
 };
 use gpui::{
-    div, prelude::*, point, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
+    div, point, prelude::*, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
     MouseUpEvent, Pixels, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
     Window,
 };
@@ -104,6 +104,21 @@ pub struct ResultView {
     pub summary: String,
     /// Column metadata, when the rows came from a table rather than a query.
     pub structure: Vec<Column>,
+    /// Where each row sat when the server handed it over.
+    ///
+    /// Empty until the grid sorts a query result itself, which it does by
+    /// reordering the page rather than re-running the SQL. Keeping the
+    /// original positions -- one `usize` a row, not a second copy of the rows
+    /// -- is what lets a third click on a header put the server's own order
+    /// back.
+    pub origin: Vec<usize>,
+    /// The order the columns are drawn in, as indices into `set.columns`.
+    ///
+    /// A permutation, always -- the grid walks this instead of the result's
+    /// own order, so dragging a header sideways moves a column without
+    /// touching the rows, which still store their values in the order the
+    /// server sent them.
+    pub order: Vec<usize>,
 }
 
 impl ResultView {
@@ -114,13 +129,127 @@ impl ResultView {
         structure: Vec<Column>,
     ) -> Self {
         let widths = column_widths(&set);
+        let column_count = set.columns.len();
         Self {
             set,
             widths,
             source,
             summary,
             structure,
+            origin: Vec::new(),
+            order: (0..column_count).collect(),
         }
+    }
+
+    /// The columns as they are drawn, each with its index into `set.columns`.
+    ///
+    /// Rows are indexed by the *result's* order, so the index has to travel
+    /// with the column -- everything downstream reads cells by it.
+    pub(crate) fn ordered_columns(&self) -> impl Iterator<Item = (usize, &ColumnInfo)> {
+        self.order
+            .iter()
+            .filter_map(|index| self.set.columns.get(*index).map(|info| (*index, info)))
+    }
+
+    /// Carry the column at `column` to where `target` currently sits.
+    ///
+    /// Both are indices into `set.columns`, not positions in the order: the
+    /// header hands over the column it is drawing, and where that column
+    /// happens to be drawn right now is this function's business.
+    pub(crate) fn move_column(&mut self, column: usize, target: usize) -> bool {
+        let (Some(from), Some(to)) = (
+            self.order.iter().position(|index| *index == column),
+            self.order.iter().position(|index| *index == target),
+        ) else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        let moved = self.order.remove(from);
+        self.order.insert(to, moved);
+        true
+    }
+
+    /// Put a saved order back on, naming columns rather than counting them.
+    ///
+    /// A reload that added, dropped or renamed a column leaves the rest where
+    /// the user put them: named columns come first in the saved order, and
+    /// anything unheard of keeps its natural place at the end.
+    pub(crate) fn apply_order(&mut self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = Vec::with_capacity(self.set.columns.len());
+        for name in names {
+            if let Some(index) = self.set.columns.iter().position(|info| &info.name == name) {
+                if !order.contains(&index) {
+                    order.push(index);
+                }
+            }
+        }
+        for index in 0..self.set.columns.len() {
+            if !order.contains(&index) {
+                order.push(index);
+            }
+        }
+        self.order = order;
+    }
+
+    /// The drawn order by name, which is how it is remembered across a
+    /// reload and a restart.
+    pub(crate) fn order_names(&self) -> Vec<String> {
+        self.ordered_columns()
+            .map(|(_, info)| info.name.clone())
+            .collect()
+    }
+
+    /// Reorder the page in hand by one column.
+    ///
+    /// Stable, so rows the column cannot tell apart stay in the order they
+    /// arrived in -- which is the order a second sort key would have given
+    /// them, and the only one available without re-running the query.
+    pub(crate) fn sort_rows(&mut self, column: usize, ascending: bool) {
+        if column >= self.set.columns.len() {
+            return;
+        }
+        if self.origin.is_empty() {
+            self.origin = (0..self.set.rows.len()).collect();
+        }
+
+        let mut paired: Vec<(dbui_app::domain::Row, usize)> = std::mem::take(&mut self.set.rows)
+            .into_iter()
+            .zip(self.origin.iter().copied())
+            .collect();
+        paired.sort_by(|(left, _), (right, _)| {
+            let order = match (left.get(column), right.get(column)) {
+                (Some(left), Some(right)) => dbui_app::domain::compare_values(left, right),
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, _) => std::cmp::Ordering::Greater,
+                (_, None) => std::cmp::Ordering::Less,
+            };
+            if ascending {
+                order
+            } else {
+                order.reverse()
+            }
+        });
+        let (rows, origin): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+        self.set.rows = rows;
+        self.origin = origin;
+    }
+
+    /// Put the server's own order back.
+    pub(crate) fn restore_server_order(&mut self) {
+        if self.origin.is_empty() {
+            return;
+        }
+        let mut paired: Vec<(dbui_app::domain::Row, usize)> = std::mem::take(&mut self.set.rows)
+            .into_iter()
+            .zip(std::mem::take(&mut self.origin))
+            .collect();
+        paired.sort_by_key(|(_, origin)| *origin);
+        self.set.rows = paired.into_iter().map(|(row, _)| row).collect();
     }
 }
 
@@ -275,6 +404,10 @@ pub struct DbUi {
     /// Live column resize: `(column index, pointer x, width)` as they were
     /// when the header edge was grabbed.
     pub(crate) column_drag: Option<(usize, Pixels, f32)>,
+    /// A header being carried to another position, if one is.
+    pub(crate) column_move: Option<ColumnMove>,
+    /// A tab being dragged along the strip, if one is.
+    pub(crate) tab_drag: Option<TabDrag>,
     /// Right-click menu, if one is open.
     pub(crate) context_menu: Option<ContextMenu>,
     /// A destructive action waiting on the user typing the table's name.
@@ -295,7 +428,59 @@ pub struct DbUi {
     /// Same, for the arrow-key cursor in the schema tree.
     pub(crate) sidebar_scroll: ScrollHandle,
     pub(crate) detail_scroll: ScrollHandle,
+    /// The rest of the scrollable panes. These have no keyboard cursor to
+    /// keep on screen; they are held here because a scrollbar can only read
+    /// how far a pane scrolls off a handle the pane is tracking, and an
+    /// element that tracks nothing keeps that privately.
+    pub(crate) columns_scroll: ScrollHandle,
+    pub(crate) error_scroll: ScrollHandle,
+    pub(crate) structure_scroll: ScrollHandle,
+    pub(crate) completion_scroll: ScrollHandle,
+    pub(crate) picker_scroll: ScrollHandle,
+    pub(crate) change_bubble_scroll: ScrollHandle,
 }
+
+/// A tab being dragged along the strip.
+///
+/// The tab is named by [`TabId`] because the drag is what moves it: an index
+/// grabbed on the press is stale the moment the strip reorders under it.
+pub struct TabDrag {
+    pub id: crate::tabs::TabId,
+    /// Where the press landed. A press that never leaves this point is a
+    /// click, and clicking a tab must not shuffle the strip.
+    pub start_x: Pixels,
+    /// The pointer x at the last reorder, or at the press before the first.
+    ///
+    /// A swap is only allowed in the direction the pointer has since moved.
+    /// Without that, a tab dropped into a wider neighbour's slot leaves the
+    /// neighbour still under the pointer, and the two trade places on every
+    /// mouse-move for as long as the button is held.
+    pub last_x: Pixels,
+    /// Whether the pointer has left the slop radius around the press.
+    pub moved: bool,
+}
+
+/// How far the pointer travels before a press counts as a drag.
+const TAB_DRAG_SLOP: f32 = 4.;
+
+/// A column header being carried to another position.
+///
+/// The same shape as [`TabDrag`], for the same reasons: a press that never
+/// travels is a click, and a swap is only allowed in the direction the
+/// pointer has since moved -- otherwise a narrow column dropped into a wide
+/// one's slot stays under the pointer and the two trade places on every
+/// mouse-move.
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnMove {
+    /// Index into the result's columns, not a position in the drawn order.
+    pub column: usize,
+    pub start_x: Pixels,
+    pub last_x: Pixels,
+    pub moved: bool,
+}
+
+/// Same slop as the tab strip: a header is a click target first.
+const HEADER_DRAG_SLOP: f32 = 4.;
 
 /// Starting height of the diff area, and the range the drag is allowed.
 pub(crate) const BUBBLE_HEIGHT_DEFAULT: f32 = 180.;
@@ -404,6 +589,8 @@ impl DbUi {
             editing_cell: None,
             cell_editor: crate::text_input::TextInput::new(false),
             column_drag: None,
+            column_move: None,
+            tab_drag: None,
             context_menu: None,
             confirm: None,
             close_guard: None,
@@ -411,6 +598,12 @@ impl DbUi {
             grid_h_scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
+            columns_scroll: ScrollHandle::new(),
+            error_scroll: ScrollHandle::new(),
+            structure_scroll: ScrollHandle::new(),
+            completion_scroll: ScrollHandle::new(),
+            picker_scroll: ScrollHandle::new(),
+            change_bubble_scroll: ScrollHandle::new(),
             history: dbui_app::history::history_path()
                 .map(|path| dbui_app::history::load(&path))
                 .unwrap_or_default(),
@@ -671,6 +864,84 @@ impl DbUi {
         }
         self.persist_session();
         cx.notify();
+    }
+
+    /// The tabs a bulk close is aimed at, left to right.
+    ///
+    /// An anchor that is no longer open answers with nothing: the menu was
+    /// opened on a tab that has since gone, and closing "the others" of a tab
+    /// that does not exist would be closing everything.
+    pub(crate) fn tabs_in_scope(&self, scope: TabScope) -> Vec<crate::tabs::TabId> {
+        let ids = |keep: &dyn Fn(usize) -> bool| -> Vec<crate::tabs::TabId> {
+            self.tabs
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| keep(*index))
+                .map(|(_, tab)| tab.id())
+                .collect()
+        };
+        let anchor = |id: crate::tabs::TabId| self.tabs.items.iter().position(|tab| tab.id() == id);
+        match scope {
+            TabScope::All => ids(&|_| true),
+            TabScope::Others(id) => match anchor(id) {
+                Some(keep) => ids(&|index| index != keep),
+                None => Vec::new(),
+            },
+            TabScope::ToRight(id) => match anchor(id) {
+                Some(from) => ids(&|index| index > from),
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// Close a run of tabs, asking once if any of them is holding staged work.
+    ///
+    /// One question for the batch, not one per tab: the user picked a single
+    /// menu entry, and answering the same prompt four times is not consent,
+    /// it is attrition.
+    pub(crate) fn close_tab_scope(&mut self, scope: TabScope, cx: &mut Context<Self>) {
+        // Only when the active tab is going: folding the open draft into a tab
+        // that stays would stage a value the user is still typing.
+        if self
+            .tabs
+            .active_id()
+            .is_some_and(|id| self.tabs_in_scope(scope).contains(&id))
+        {
+            self.stash_current_draft(cx);
+        }
+        let doomed = self.tabs_in_scope(scope);
+        if doomed.is_empty() {
+            return;
+        }
+        let changes: usize = self
+            .tabs
+            .items
+            .iter()
+            .filter(|tab| doomed.contains(&tab.id()))
+            .map(|tab| tab.pending_change_count())
+            .sum();
+        if changes > 0 {
+            let count = doomed.len();
+            let noun = if count == 1 { "tab" } else { "tabs" };
+            self.close_guard = Some(CloseGuard {
+                target: CloseTarget::TabGroup(scope),
+                label: SharedString::from(format!("{count} {noun}")),
+                changes,
+            });
+            cx.notify();
+            return;
+        }
+        self.close_tab_scope_now(scope, cx);
+    }
+
+    /// Close the whole run, staged work and all.
+    pub(crate) fn close_tab_scope_now(&mut self, scope: TabScope, cx: &mut Context<Self>) {
+        for id in self.tabs_in_scope(scope) {
+            if let Some(index) = self.tabs.items.iter().position(|tab| tab.id() == id) {
+                self.close_tab_now(index, cx);
+            }
+        }
     }
 
     pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
@@ -970,6 +1241,7 @@ impl DbUi {
         };
         match guard.target {
             CloseTarget::Tab(index) => self.close_tab_now(index, cx),
+            CloseTarget::TabGroup(scope) => self.close_tab_scope_now(scope, cx),
             CloseTarget::Connection(id) => self.close_connection_tab_now(id, cx),
         }
         cx.notify();
@@ -1025,8 +1297,7 @@ impl DbUi {
             self.sidebar_cursor = None;
             self.completion = None;
             self.column_cache.clear();
-            self.workspace.open_table =
-                self.tabs.active().and_then(|tab| tab.table_ref().cloned());
+            self.workspace.open_table = self.tabs.active().and_then(|tab| tab.table_ref().cloned());
             self.focus = Focus::Sidebar;
         }
 
@@ -1120,7 +1391,11 @@ impl DbUi {
 
     /// Whether a table survives the filter. Both the bare and the qualified
     /// name are matched, so `public.us` finds what `us` does.
-    pub(crate) fn table_matches_filter(&self, table: &dbui_app::domain::Table, query: &str) -> bool {
+    pub(crate) fn table_matches_filter(
+        &self,
+        table: &dbui_app::domain::Table,
+        query: &str,
+    ) -> bool {
         if query.is_empty() {
             return true;
         }
@@ -1145,12 +1420,13 @@ impl DbUi {
 
     /// Enter in the filter box: open the first table it found.
     pub(crate) fn open_first_filtered_table(&mut self, cx: &mut Context<Self>) {
-        let first = self.sidebar_visible_items().into_iter().find_map(|item| {
-            match item {
+        let first = self
+            .sidebar_visible_items()
+            .into_iter()
+            .find_map(|item| match item {
                 SidebarItem::Table { table, .. } => Some(table),
                 SidebarItem::Schema { .. } => None,
-            }
-        });
+            });
         let Some(table) = first else {
             return;
         };
@@ -1361,6 +1637,11 @@ impl DbUi {
         // before the rows underneath it move.
         self.stash_current_draft(cx);
 
+        if matches!(self.tabs.active(), Some(WorkspaceTab::Sql { .. })) {
+            self.sort_query_result(column, cx);
+            return;
+        }
+
         let Some(WorkspaceTab::Table { sort, page, .. }) = self.tabs.active_mut() else {
             return;
         };
@@ -1377,8 +1658,88 @@ impl DbUi {
         self.load_active_table(cx);
     }
 
+    /// Sort a query result without touching the query.
+    ///
+    /// The rows already fetched are reordered in place. Nothing is sent, the
+    /// statement in the editor is left exactly as written, and a third click
+    /// puts the server's own order back -- which is why the view keeps where
+    /// each row started.
+    fn sort_query_result(&mut self, column_name: &str, cx: &mut Context<Self>) {
+        let Some(column) = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|view| {
+                view.set
+                    .columns
+                    .iter()
+                    .position(|info| info.name == column_name)
+            })
+        else {
+            return;
+        };
+
+        let Some(WorkspaceTab::Sql {
+            sort,
+            result: Some(view),
+            selected_row,
+            selection,
+            draft,
+            ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+
+        let next = dbui_app::domain::SortKey::cycled(sort.as_ref(), column_name);
+        match &next {
+            Some(key) => view.sort_rows(column, key.ascending),
+            None => view.restore_server_order(),
+        }
+        *sort = next.clone();
+
+        // Every row index the rest of the window is holding refers to a
+        // position, and the positions just moved. Keeping the selection would
+        // point the sidebar at whichever row landed where the old one was.
+        *selected_row = None;
+        selection.clear();
+        *draft = None;
+        self.selected_cell = None;
+        self.copied_cell = None;
+        self.copied_field = None;
+
+        self.status = match &next {
+            Some(key) if key.ascending => Status::info(format!("Sorted by {column_name} ↑")),
+            Some(_) => Status::info(format!("Sorted by {column_name} ↓")),
+            None => Status::info("Sort cleared"),
+        };
+        cx.notify();
+    }
+
     /// Drop the sort and go back to the table's own key order.
     pub(crate) fn clear_sort(&mut self, cx: &mut Context<Self>) {
+        if let Some(WorkspaceTab::Sql {
+            sort,
+            result: Some(view),
+            selected_row,
+            selection,
+            draft,
+            ..
+        }) = self.tabs.active_mut()
+        {
+            if sort.take().is_none() {
+                return;
+            }
+            view.restore_server_order();
+            *selected_row = None;
+            selection.clear();
+            *draft = None;
+            self.selected_cell = None;
+            self.status = Status::info("Sort cleared");
+            cx.notify();
+            return;
+        }
+
         let Some(WorkspaceTab::Table { sort, page, .. }) = self.tabs.active_mut() else {
             return;
         };
@@ -1393,8 +1754,10 @@ impl DbUi {
     /// The sort the active tab is showing, for the header arrow.
     pub(crate) fn active_sort(&self) -> Option<&dbui_app::domain::SortKey> {
         match self.tabs.active() {
-            Some(WorkspaceTab::Table { sort, .. }) => sort.as_ref(),
-            _ => None,
+            Some(WorkspaceTab::Table { sort, .. }) | Some(WorkspaceTab::Sql { sort, .. }) => {
+                sort.as_ref()
+            }
+            None => None,
         }
     }
 
@@ -1480,6 +1843,34 @@ impl DbUi {
         cx.notify();
     }
 
+    /// Drop a ready-made statement into the editor at the caret.
+    ///
+    /// Inserted rather than pasted over: someone reaching for a `JOIN` in the
+    /// middle of a session has the rest of their buffer open, and a template
+    /// that replaces it costs them what they were writing. A blank editor is
+    /// the same operation either way.
+    ///
+    /// It goes in on a line of its own, so a template dropped at the end of a
+    /// half-typed statement does not silently splice itself into one.
+    pub(crate) fn insert_sql_template(&mut self, name: &str, body: &str, cx: &mut Context<Self>) {
+        self.open_sql_tab(cx);
+        if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
+            let existing = editor.text();
+            let at_line_start = existing.is_empty()
+                || existing[..editor.cursor().min(existing.len())].ends_with('\n');
+            let text = if at_line_start {
+                body.to_string()
+            } else {
+                format!("\n{body}")
+            };
+            editor.insert(&text);
+            editor.ensure_editor_caret_visible();
+        }
+        self.focus = Focus::Editor;
+        self.status = Status::info(format!("{name} — fill it in, ⌘↵ to run"));
+        cx.notify();
+    }
+
     /// Open or refresh the SQL autocomplete popup at the caret.
     pub(crate) fn trigger_completion(&mut self, cx: &mut Context<Self>) {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
@@ -1547,6 +1938,7 @@ impl DbUi {
             return;
         };
         editor.replace_range(popup.replace_range, &item.label);
+        editor.ensure_editor_caret_visible();
         cx.notify();
     }
 
@@ -1873,6 +2265,7 @@ impl DbUi {
             selected_row,
             selection,
             draft,
+            sort,
             ..
         }) = self.tabs.get_mut(tab_id)
         else {
@@ -1886,6 +2279,8 @@ impl DbUi {
         *selected_row = None;
         selection.clear();
         *draft = None;
+        // Another statement's rows arrive in the order it returned them.
+        *sort = None;
         // Moved out of the list and back rather than cloned: a result set can
         // be thousands of rows and only one is on screen at a time. Exactly
         // one of `results[active].rows` and `result` holds it; the caller
@@ -2199,8 +2594,7 @@ impl DbUi {
         if self.editing_cell.is_some() {
             return false;
         }
-        self.focus == Focus::Grid
-            || (self.focus == Focus::Detail && self.detail_input.is_none())
+        self.focus == Focus::Grid || (self.focus == Focus::Detail && self.detail_input.is_none())
     }
 
     /// Whether the active connection refuses writes.
@@ -2364,6 +2758,63 @@ impl DbUi {
         cx.notify();
     }
 
+    // -- dragging a tab along the strip -------------------------------------
+
+    pub(crate) fn begin_tab_drag(&mut self, id: crate::tabs::TabId, x: Pixels) {
+        self.tab_drag = Some(TabDrag {
+            id,
+            start_x: x,
+            last_x: x,
+            moved: false,
+        });
+    }
+
+    /// The pointer has crossed the tab at `index` with a tab in hand.
+    pub(crate) fn drag_tab_over(&mut self, index: usize, x: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag.as_mut() else {
+            return;
+        };
+        if !drag.moved {
+            if f32::from(x - drag.start_x).abs() < TAB_DRAG_SLOP {
+                return;
+            }
+            drag.moved = true;
+        }
+        let Some(from) = self.tabs.items.iter().position(|tab| tab.id() == drag.id) else {
+            self.tab_drag = None;
+            return;
+        };
+        if index == from || index >= self.tabs.items.len() {
+            return;
+        }
+        // Only ever in the direction of travel, and only on a pointer that
+        // has actually travelled; see `last_x`.
+        let forward = index > from;
+        if forward && x <= drag.last_x {
+            return;
+        }
+        if !forward && x >= drag.last_x {
+            return;
+        }
+        drag.last_x = x;
+        self.tabs.reorder(from, index);
+        self.persist_session();
+        cx.notify();
+    }
+
+    /// Let go. The tab that was dragged is the tab left in front.
+    pub(crate) fn end_tab_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag.take() else {
+            return;
+        };
+        if drag.moved {
+            if let Some(index) = self.tabs.items.iter().position(|tab| tab.id() == drag.id) {
+                self.activate_tab(index, cx);
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn end_row_drag(&mut self, cx: &mut Context<Self>) {
         if self.row_drag.take().is_none() {
             return;
@@ -2482,8 +2933,9 @@ impl DbUi {
             Ok(0) => {}
             Ok(count) => {
                 let plural = if count == 1 { "row" } else { "rows" };
-                self.status =
-                    Status::info(format!("{count} {plural} staged for deletion — ⌘S to commit"));
+                self.status = Status::info(format!(
+                    "{count} {plural} staged for deletion — ⌘S to commit"
+                ));
             }
             Err(message) => self.status = Status::error(message),
         }
@@ -2631,9 +3083,10 @@ impl DbUi {
         let field = match self.tabs.active() {
             Some(WorkspaceTab::Table {
                 draft: Some(draft), ..
-            }) => draft.fields.get(column).map(|(name, input, is_pk)| {
-                (name.clone(), input.text().to_string(), *is_pk)
-            }),
+            }) => draft
+                .fields
+                .get(column)
+                .map(|(name, input, is_pk)| (name.clone(), input.text().to_string(), *is_pk)),
             _ => None,
         };
         let Some((name, text, is_pk)) = field else {
@@ -2817,6 +3270,98 @@ impl DbUi {
         }
     }
 
+    // -- dragging a column to another position ------------------------------
+
+    /// A press landed on a header. Whether it is a sort or a move is not
+    /// known yet -- that is decided by whether the pointer travels.
+    pub(crate) fn begin_column_move(&mut self, column: usize, x: Pixels) {
+        self.column_move = Some(ColumnMove {
+            column,
+            start_x: x,
+            last_x: x,
+            moved: false,
+        });
+    }
+
+    /// The pointer has crossed the header of `target` with a column in hand.
+    pub(crate) fn drag_column_over(&mut self, target: usize, x: Pixels, cx: &mut Context<Self>) {
+        let Some(mut drag) = self.column_move else {
+            return;
+        };
+        if !drag.moved {
+            if f32::from(x - drag.start_x).abs() < HEADER_DRAG_SLOP {
+                return;
+            }
+            drag.moved = true;
+            self.column_move = Some(drag);
+            cx.notify();
+        }
+        if target == drag.column {
+            return;
+        }
+
+        let Some(view) = self.tabs.active().and_then(|tab| tab.result()) else {
+            return;
+        };
+        let position = |column: usize| view.order.iter().position(|slot| *slot == column);
+        let (Some(from), Some(to)) = (position(drag.column), position(target)) else {
+            return;
+        };
+        // Only ever in the direction of travel; see `ColumnMove`.
+        let forward = to > from;
+        if forward && x <= drag.last_x {
+            return;
+        }
+        if !forward && x >= drag.last_x {
+            return;
+        }
+        drag.last_x = x;
+        self.column_move = Some(drag);
+
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        let moved = tab
+            .result_mut()
+            .is_some_and(|view| view.move_column(drag.column, target));
+        if !moved {
+            return;
+        }
+        // Remembered by name, so the next page -- and the next launch -- open
+        // with the columns where the user left them.
+        if let WorkspaceTab::Table {
+            result: Some(view),
+            column_order,
+            ..
+        } = tab
+        {
+            *column_order = view.order_names();
+        }
+        self.persist_session();
+        cx.notify();
+    }
+
+    /// Let go of the header. A press that never travelled was a click, and a
+    /// click on a header sorts by it.
+    pub(crate) fn end_column_move(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.column_move.take() else {
+            return;
+        };
+        if !drag.moved {
+            let name = self
+                .tabs
+                .active()
+                .and_then(|tab| tab.result())
+                .and_then(|view| view.set.columns.get(drag.column))
+                .map(|info| info.name.clone());
+            if let Some(name) = name {
+                self.toggle_sort(&name, cx);
+                return;
+            }
+        }
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn reapply_column_widths_for_test(&mut self, tab_id: crate::tabs::TabId) {
         self.apply_column_widths(tab_id);
@@ -2827,6 +3372,7 @@ impl DbUi {
         let Some(WorkspaceTab::Table {
             result: Some(view),
             column_widths,
+            column_order,
             ..
         }) = self.tabs.get_mut(tab_id)
         else {
@@ -2839,6 +3385,9 @@ impl DbUi {
                 }
             }
         }
+        // Same bargain as the widths: a fresh page arrives in the server's
+        // order, and the layout the user arranged is put back over it.
+        view.apply_order(column_order);
     }
 
     // -- staged inserts -----------------------------------------------------
@@ -2958,7 +3507,8 @@ impl DbUi {
                 let mut copy =
                     crate::tabs::PendingRowInsert::blank(&view.set.columns, &view.structure);
                 for (slot, (_, input, _)) in copy.fields.iter_mut().zip(row.fields.iter()) {
-                    slot.1 = crate::text_input::TextInput::with_text(input.text().to_string(), true);
+                    slot.1 =
+                        crate::text_input::TextInput::with_text(input.text().to_string(), true);
                 }
                 copy
             }),
@@ -2971,11 +3521,7 @@ impl DbUi {
     }
 
     /// Add staged rows and open the first for editing.
-    fn stage_inserts(
-        &mut self,
-        rows: Vec<crate::tabs::PendingRowInsert>,
-        cx: &mut Context<Self>,
-    ) {
+    fn stage_inserts(&mut self, rows: Vec<crate::tabs::PendingRowInsert>, cx: &mut Context<Self>) {
         if rows.is_empty() {
             return;
         }
@@ -3055,8 +3601,7 @@ impl DbUi {
             .collect();
 
         if matched.iter().all(Option::is_none) {
-            self.status =
-                Status::error("None of those column names are in this table".to_string());
+            self.status = Status::error("None of those column names are in this table".to_string());
             cx.notify();
             return;
         }
@@ -3159,10 +3704,7 @@ impl DbUi {
         };
         pending_inserts
             .iter()
-            .map(|row| {
-                row.to_values()
-                    .map(|values| dbui_app::RowInsert { values })
-            })
+            .map(|row| row.to_values().map(|values| dbui_app::RowInsert { values }))
             .collect()
     }
 
@@ -3298,13 +3840,22 @@ impl DbUi {
         };
 
         let selected = tab.selection().ordered();
+        // Copied in the order the columns are drawn: a paste that comes back
+        // in a different order than the grid showed is a paste nobody can
+        // line up against what they selected.
+        let lay_out = |row: &dbui_app::domain::Row| -> Vec<dbui_app::domain::Value> {
+            view.order
+                .iter()
+                .filter_map(|index| row.0.get(*index).cloned())
+                .collect()
+        };
         let rows: Vec<Vec<dbui_app::domain::Value>> = if selected.is_empty() {
-            view.set.rows.iter().map(|row| row.0.clone()).collect()
+            view.set.rows.iter().map(lay_out).collect()
         } else {
             selected
                 .iter()
                 .filter_map(|index| view.set.rows.get(*index))
-                .map(|row| row.0.clone())
+                .map(lay_out)
                 .collect()
         };
 
@@ -3314,7 +3865,10 @@ impl DbUi {
             return;
         }
 
-        let columns = view.set.columns.clone();
+        let columns: Vec<dbui_app::domain::ColumnInfo> = view
+            .ordered_columns()
+            .map(|(_, info)| info.clone())
+            .collect();
         let table = tab.table_ref().cloned();
         let driver = self
             .active_driver_kind()
@@ -3459,9 +4013,9 @@ impl DbUi {
         }
 
         match where_it_is {
-            Some(label) => format!(
-                "{reason} — {count} staged on “{label}”. Switch to that tab and press ⌘S.",
-            ),
+            Some(label) => {
+                format!("{reason} — {count} staged on “{label}”. Switch to that tab and press ⌘S.",)
+            }
             None => reason.to_string(),
         }
     }
@@ -3689,22 +4243,19 @@ impl DbUi {
     /// laid out at least once, which is also the only time the arrow keys can
     /// have moved anything.
     pub(crate) fn reveal_column(&self, column: usize) {
-        let Some(view) = self.tabs.active().and_then(|tab| tab.result()) else {
+        let Some(tab) = self.tabs.active() else {
             return;
         };
-        let hidden = match self.tabs.active() {
-            Some(WorkspaceTab::Table { hidden_columns, .. }) => Some(hidden_columns),
-            _ => None,
+        let Some(view) = tab.result() else {
+            return;
         };
 
-        // Only the drawn columns take up room, so a hidden one contributes
-        // nothing to the offset of the ones after it.
+        // Walk the columns as they are drawn: a hidden one takes up no room,
+        // and a column the user dragged left is no longer where the result
+        // put it.
         let mut start = f32::from(metrics::row_number_width());
         let mut width = None;
-        for (index, info) in view.set.columns.iter().enumerate() {
-            if hidden.is_some_and(|hidden| hidden.contains(&info.name)) {
-                continue;
-            }
+        for (index, _) in tab.display_columns() {
             let w = view
                 .widths
                 .get(index)
@@ -3899,8 +4450,7 @@ impl DbUi {
                 .active_id()
                 .and_then(|next| self.stashed_tabs.remove(&next))
                 .unwrap_or_default();
-            self.workspace.open_table =
-                self.tabs.active().and_then(|tab| tab.table_ref().cloned());
+            self.workspace.open_table = self.tabs.active().and_then(|tab| tab.table_ref().cloned());
             self.selected_cell = None;
         }
 
@@ -3980,8 +4530,10 @@ impl DbUi {
             return self.workspace.active_id();
         }
 
-        self.workspace
-            .restore_open(session.tabs.iter().map(|tab| tab.connection), session.active);
+        self.workspace.restore_open(
+            session.tabs.iter().map(|tab| tab.connection),
+            session.active,
+        );
 
         let active = self.workspace.active_id();
         for saved in &session.tabs {
@@ -4195,6 +4747,12 @@ impl DbUi {
                 }
                 "r" => {
                     self.refresh_result(cx);
+                    return;
+                }
+                // ⌘E opens a query tab, ⌘⇧E offers something to write in
+                // it. The shifted arm has to come first.
+                "e" if shift => {
+                    self.open_palette(PaletteKind::Templates, cx);
                     return;
                 }
                 "e" => {
@@ -4430,6 +4988,9 @@ impl DbUi {
 
             if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
                 if editor.handle_key(keystroke, cx) {
+                    // Typing past the right edge pans the editor instead of
+                    // writing where the user cannot see.
+                    editor.ensure_editor_caret_visible();
                     let should_refresh = self.completion.is_some()
                         && !command
                         && (key.len() == 1 || key == "backspace" || key == "delete");
@@ -4737,6 +5298,8 @@ impl Render for DbUi {
                     || self.editor_drag.is_some()
                     || self.row_drag.is_some()
                     || self.column_drag.is_some()
+                    || self.column_move.is_some()
+                    || self.tab_drag.is_some()
                     || self.sidebar_drag.is_some()
                     || self.detail_drag.is_some(),
                 |root| {
@@ -4764,6 +5327,8 @@ impl Render for DbUi {
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
                             this.end_column_drag(cx);
+                            this.end_column_move(cx);
+                            this.end_tab_drag(cx);
                             this.end_sidebar_drag(cx);
                             this.end_detail_drag(cx);
                         }),
@@ -4778,6 +5343,8 @@ impl Render for DbUi {
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
                             this.end_column_drag(cx);
+                            this.end_column_move(cx);
+                            this.end_tab_drag(cx);
                             this.end_sidebar_drag(cx);
                             this.end_detail_drag(cx);
                         }),
@@ -4803,26 +5370,26 @@ impl Render for DbUi {
             .on_action(cx.listener(|this, _: &crate::CommitChanges, _window, cx| {
                 this.save_pending_edits(cx)
             }))
-            .on_action(cx.listener(|this, _: &crate::SelectAllRows, _window, cx| {
-                this.select_all_rows(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::DeleteRows, _window, cx| {
-                this.delete_selected_rows(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::SelectAllRows, _window, cx| this.select_all_rows(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::DeleteRows, _window, cx| {
+                    this.delete_selected_rows(cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::DuplicateRows, _window, cx| {
                 this.duplicate_selected_rows(cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &crate::PasteRows, _window, cx| this.paste_rows(cx)),
-            )
+            .on_action(cx.listener(|this, _: &crate::PasteRows, _window, cx| this.paste_rows(cx)))
             .on_action(cx.listener(|this, _: &crate::DiscardChanges, _window, cx| {
                 this.discard_pending_edits(cx)
             }))
             .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| this.open_sql_tab(cx)))
             .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| this.refresh_result(cx)))
-            .on_action(cx.listener(|this, _: &crate::RunQuery, _window, cx| {
-                this.run_or_follow_link(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::RunQuery, _window, cx| this.run_or_follow_link(cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &crate::RunAllQueries, _window, cx| this.run_all_queries(cx)),
             )
@@ -4831,9 +5398,11 @@ impl Render for DbUi {
             )
             .on_action(cx.listener(|this, _: &crate::NextTab, _window, cx| this.next_tab(cx)))
             .on_action(cx.listener(|this, _: &crate::PrevTab, _window, cx| this.prev_tab(cx)))
-            .on_action(cx.listener(|this, _: &crate::CloseConnection, _window, cx| {
-                this.close_active_connection_tab(cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::CloseConnection, _window, cx| {
+                    this.close_active_connection_tab(cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::NextConnection, _window, cx| {
                 this.cycle_connection_tab(true, cx)
             }))
@@ -4916,6 +5485,73 @@ impl Render for DbUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A result over `names`, in the order given and with no rows.
+    fn result_over(names: &[&str]) -> ResultView {
+        let columns = names
+            .iter()
+            .map(|name| ColumnInfo {
+                name: (*name).to_string(),
+                type_name: "text".into(),
+            })
+            .collect();
+        ResultView::new(
+            ResultSet {
+                columns,
+                rows: Vec::new(),
+                truncated: false,
+            },
+            ResultSource::Query { sql: String::new() },
+            String::new(),
+            Vec::new(),
+        )
+    }
+
+    fn drawn(view: &ResultView) -> Vec<String> {
+        view.order_names()
+    }
+
+    #[test]
+    fn a_column_lands_where_the_one_it_was_dropped_on_was() {
+        let mut view = result_over(&["id", "name", "email"]);
+        assert!(view.move_column(2, 0), "email, carried onto id");
+        assert_eq!(drawn(&view), ["email", "id", "name"]);
+        assert!(
+            view.move_column(2, 1),
+            "and then onto name, which is now last"
+        );
+        assert_eq!(drawn(&view), ["id", "name", "email"]);
+        assert!(
+            !view.move_column(1, 1),
+            "a column dropped on itself is a no-op"
+        );
+    }
+
+    /// The order is remembered by name, so a reload that changed the columns
+    /// keeps what it can and puts the rest back where the server had them.
+    #[test]
+    fn a_saved_order_survives_columns_coming_and_going() {
+        let mut view = result_over(&["id", "name", "email"]);
+        view.apply_order(&["email".into(), "id".into(), "name".into()]);
+        assert_eq!(drawn(&view), ["email", "id", "name"]);
+
+        // `name` is gone and `created` is new.
+        let mut next = result_over(&["id", "email", "created"]);
+        next.apply_order(&["email".into(), "id".into(), "name".into()]);
+        assert_eq!(
+            drawn(&next),
+            ["email", "id", "created"],
+            "the columns still there keep their places, and the new one goes last"
+        );
+
+        let mut untouched = result_over(&["id", "name"]);
+        untouched.apply_order(&[]);
+        assert_eq!(
+            drawn(&untouched),
+            ["id", "name"],
+            "no saved order, no change"
+        );
+    }
 
     #[test]
     fn dragging_the_bubble_edge_upward_makes_it_taller() {

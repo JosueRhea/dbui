@@ -106,9 +106,10 @@ impl DbUi {
                 format!("Update to {} available", update.version),
                 UpdateAction::Download,
             )),
-            UpdateState::Downloading(update) => {
-                Some((format!("Downloading {}…", update.version), UpdateAction::None))
-            }
+            UpdateState::Downloading(update) => Some((
+                format!("Downloading {}…", update.version),
+                UpdateAction::None,
+            )),
             UpdateState::Ready(staged) => Some((
                 format!("Restart to update to {}", staged.version),
                 UpdateAction::Install,
@@ -125,7 +126,13 @@ impl DbUi {
 
 /// Trim to `max` characters on a char boundary, with an ellipsis if cut.
 fn clip(text: &str, max: usize) -> String {
-    let mut out: String = text.lines().next().unwrap_or(text).chars().take(max).collect();
+    let mut out: String = text
+        .lines()
+        .next()
+        .unwrap_or(text)
+        .chars()
+        .take(max)
+        .collect();
     if out.chars().count() < text.chars().count() {
         out.push('…');
     }

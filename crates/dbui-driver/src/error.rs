@@ -84,9 +84,7 @@ impl DriverError {
 fn describe(error: &sqlx::Error) -> String {
     match error {
         sqlx::Error::Database(db) => db.message().to_string(),
-        sqlx::Error::PoolTimedOut => {
-            "Timed out waiting for a connection from the pool".to_string()
-        }
+        sqlx::Error::PoolTimedOut => "Timed out waiting for a connection from the pool".to_string(),
         sqlx::Error::PoolClosed => "The connection pool is closed".to_string(),
         sqlx::Error::RowNotFound => "No rows returned".to_string(),
         // An I/O failure's own message is usually terse ("connection refused")

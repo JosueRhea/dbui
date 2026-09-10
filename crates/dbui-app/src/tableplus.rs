@@ -57,17 +57,18 @@ impl ImportReport {
             parts.push(format!(
                 "{} unsupported driver{}",
                 self.skipped_unsupported,
-                if self.skipped_unsupported == 1 { "" } else { "s" }
+                if self.skipped_unsupported == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
         if self.skipped_ssh > 0 {
             parts.push(format!("{} over SSH (skipped)", self.skipped_ssh));
         }
         if self.missing_password > 0 {
-            parts.push(format!(
-                "{} without password",
-                self.missing_password
-            ));
+            parts.push(format!("{} without password", self.missing_password));
         }
         if parts.is_empty() {
             "No TablePlus connections to import".into()
@@ -273,7 +274,9 @@ fn load_tableplus_password(connection_id: &str) -> Option<String> {
 fn plist_string(value: Option<&PlistValue>) -> Option<String> {
     match value? {
         PlistValue::String(s) => Some(s.clone()),
-        PlistValue::Integer(i) => i.as_signed().map(|n| n.to_string())
+        PlistValue::Integer(i) => i
+            .as_signed()
+            .map(|n| n.to_string())
             .or_else(|| i.as_unsigned().map(|n| n.to_string())),
         _ => None,
     }
@@ -391,11 +394,8 @@ mod tests {
     /// against something that was never meant to be reachable.
     #[test]
     fn skips_connections_that_go_over_ssh() {
-        let dir = std::env::temp_dir().join(format!(
-            "dbui-tableplus-{}-{}",
-            std::process::id(),
-            "ssh"
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dbui-tableplus-{}-{}", std::process::id(), "ssh"));
         let path = dir.join("Connections.plist");
         write_fixture(
             &path,

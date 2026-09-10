@@ -53,7 +53,9 @@ pub fn open_table(
         let columns = driver.columns(&table).await.unwrap_or_default();
         let order = dbui_domain::order_for(sort.as_ref(), &key_columns(&columns));
 
-        let rows = driver.table_rows(&table, page, &where_clause, &order).await?;
+        let rows = driver
+            .table_rows(&table, page, &where_clause, &order)
+            .await?;
         let total_rows = driver.row_count(&table, &where_clause).await.ok();
 
         Ok(TableContents {

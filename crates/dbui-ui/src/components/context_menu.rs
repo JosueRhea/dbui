@@ -7,9 +7,11 @@
 //! of its own.
 
 use super::{button, caption};
+use crate::components::close_guard::TabScope;
 use crate::root::{DbUi, Focus, Status};
-use crate::text_input::TextInput;
 use crate::row_export::RowFormat;
+use crate::tabs::TabId;
+use crate::text_input::TextInput;
 use crate::theme::metrics;
 use dbui_app::commands;
 use dbui_app::domain::{ConnectionId, TableKind, TableRef};
@@ -21,10 +23,21 @@ use gpui::{
 /// What the pointer was over.
 #[derive(Clone)]
 pub enum ContextTarget {
-    Table { table: TableRef, kind: TableKind },
-    Schema { connection: ConnectionId, name: String },
+    Table {
+        table: TableRef,
+        kind: TableKind,
+    },
+    Schema {
+        connection: ConnectionId,
+        name: String,
+    },
     /// A row in the result grid.
     Rows,
+    /// A tab in the workspace tab bar, named by identity so the menu still
+    /// acts on the tab it was opened on after the strip has shifted.
+    Tab {
+        id: TabId,
+    },
 }
 
 /// One thing a context menu can do.
@@ -50,6 +63,10 @@ pub enum MenuAction {
     FollowForeignKey,
     DuplicateRows,
     PasteRows,
+    CloseThisTab,
+    CloseOtherTabs,
+    CloseTabsToRight,
+    CloseAllTabs,
 }
 
 impl MenuAction {
@@ -139,6 +156,25 @@ impl ConfirmPrompt {
 
 fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
     match target {
+        ContextTarget::Tab { .. } => vec![
+            MenuRow::Item {
+                action: MenuAction::CloseThisTab,
+                label: "Close".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::CloseOtherTabs,
+                label: "Close Others".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::CloseTabsToRight,
+                label: "Close to the Right".into(),
+            },
+            MenuRow::Separator,
+            MenuRow::Item {
+                action: MenuAction::CloseAllTabs,
+                label: "Close All".into(),
+            },
+        ],
         ContextTarget::Rows => vec![
             MenuRow::Item {
                 action: MenuAction::FollowForeignKey,
@@ -382,6 +418,21 @@ impl DbUi {
             }
             (_, MenuAction::DeleteRows) => self.delete_selected_rows(cx),
 
+            (ContextTarget::Tab { id }, MenuAction::CloseThisTab) => {
+                if let Some(index) = self.tabs.items.iter().position(|tab| tab.id() == *id) {
+                    self.close_tab(index, cx);
+                }
+            }
+            (ContextTarget::Tab { id }, MenuAction::CloseOtherTabs) => {
+                self.close_tab_scope(TabScope::Others(*id), cx)
+            }
+            (ContextTarget::Tab { id }, MenuAction::CloseTabsToRight) => {
+                self.close_tab_scope(TabScope::ToRight(*id), cx)
+            }
+            (ContextTarget::Tab { .. }, MenuAction::CloseAllTabs) => {
+                self.close_tab_scope(TabScope::All, cx)
+            }
+
             (ContextTarget::Table { table, .. }, MenuAction::OpenTable) => {
                 let table = table.clone();
                 self.open_table_tab(table, cx);
@@ -406,13 +457,17 @@ impl DbUi {
                 };
                 let sql = crate::sql_scaffold::select_statement(driver, &table);
                 self.open_sql_tab(cx);
-                if let Some(crate::tabs::WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
+                if let Some(crate::tabs::WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut()
+                {
                     *editor = TextInput::with_text(sql, true);
                 }
                 self.focus = Focus::Editor;
                 cx.notify();
             }
-            (ContextTarget::Table { table, .. }, MenuAction::CopyInsert | MenuAction::CopyCreate) => {
+            (
+                ContextTarget::Table { table, .. },
+                MenuAction::CopyInsert | MenuAction::CopyCreate,
+            ) => {
                 let table = table.clone();
                 self.copy_generated_sql(table, action, cx);
             }
@@ -445,12 +500,7 @@ impl DbUi {
 
     /// Copy an INSERT or CREATE scaffold, fetching the columns if they are not
     /// already cached.
-    fn copy_generated_sql(
-        &mut self,
-        table: TableRef,
-        action: MenuAction,
-        cx: &mut Context<Self>,
-    ) {
+    fn copy_generated_sql(&mut self, table: TableRef, action: MenuAction, cx: &mut Context<Self>) {
         let Some(driver_kind) = self.active_driver_kind() else {
             self.status = Status::error("Not connected");
             cx.notify();
@@ -471,20 +521,18 @@ impl DbUi {
         let task = commands::fetch_columns(&self.runtime, driver, table.clone());
         cx.spawn(async move |this, cx| {
             let landed = task.await;
-            this.update(cx, |this, cx| {
-                match landed {
-                    Some(Ok((table, columns))) => {
-                        this.column_cache
-                            .insert((table.schema.clone(), table.name.clone()), columns.clone());
-                        let sql = render_scaffold(action, driver_kind, &table, &columns);
-                        this.copy_to_clipboard(sql, "SQL copied", cx);
-                    }
-                    Some(Err(error)) => {
-                        this.status = Status::error(error.to_string());
-                        cx.notify();
-                    }
-                    None => cx.notify(),
+            this.update(cx, |this, cx| match landed {
+                Some(Ok((table, columns))) => {
+                    this.column_cache
+                        .insert((table.schema.clone(), table.name.clone()), columns.clone());
+                    let sql = render_scaffold(action, driver_kind, &table, &columns);
+                    this.copy_to_clipboard(sql, "SQL copied", cx);
                 }
+                Some(Err(error)) => {
+                    this.status = Status::error(error.to_string());
+                    cx.notify();
+                }
+                None => cx.notify(),
             })
             .ok();
         })
@@ -494,11 +542,7 @@ impl DbUi {
     // -- the confirmation ---------------------------------------------------
 
     pub(crate) fn close_confirm(&mut self, cx: &mut Context<Self>) {
-        if self
-            .confirm
-            .as_ref()
-            .is_some_and(|prompt| prompt.running)
-        {
+        if self.confirm.as_ref().is_some_and(|prompt| prompt.running) {
             return;
         }
         if self.confirm.take().is_some() {
@@ -506,7 +550,11 @@ impl DbUi {
         }
     }
 
-    pub(crate) fn handle_confirm_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+    pub(crate) fn handle_confirm_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) {
         let key = keystroke.key.as_str();
         if key == "escape" {
             self.close_confirm(cx);
@@ -661,8 +709,7 @@ impl DbUi {
             .min(f32::from(viewport.width) - MENU_WIDTH - EDGE_MARGIN)
             .max(EDGE_MARGIN);
         // Flip above the pointer rather than hang off the bottom edge.
-        let top = if f32::from(menu.position.y) + height + EDGE_MARGIN
-            > f32::from(viewport.height)
+        let top = if f32::from(menu.position.y) + height + EDGE_MARGIN > f32::from(viewport.height)
         {
             (f32::from(menu.position.y) - height).max(EDGE_MARGIN)
         } else {
@@ -826,10 +873,7 @@ impl DbUi {
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(body)),
                         )
-                        .child(caption(
-                            format!("Type “{expected}” to confirm."),
-                            theme,
-                        ))
+                        .child(caption(format!("Type “{expected}” to confirm."), theme))
                         .child(super::text_field::text_field(
                             "confirm-input",
                             input,
@@ -850,11 +894,9 @@ impl DbUi {
                                 .flex()
                                 .justify_end()
                                 .gap_2()
-                                .child(
-                                    button("confirm-cancel", "Cancel", theme, false).on_click(
-                                        cx.listener(|this, _, _window, cx| this.close_confirm(cx)),
-                                    ),
-                                )
+                                .child(button("confirm-cancel", "Cancel", theme, false).on_click(
+                                    cx.listener(|this, _, _window, cx| this.close_confirm(cx)),
+                                ))
                                 .child(confirm_button),
                         ),
                 )

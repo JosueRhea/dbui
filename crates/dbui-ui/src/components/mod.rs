@@ -16,6 +16,7 @@ mod grid;
 mod icons;
 mod main_pane;
 pub(crate) mod palette;
+pub(crate) mod scrollbar;
 mod sidebar;
 mod status_bar;
 mod tabs;

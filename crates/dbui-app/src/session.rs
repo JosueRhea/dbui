@@ -36,6 +36,10 @@ pub enum SavedTab {
         where_clause: String,
         #[serde(default)]
         hidden_columns: Vec<String>,
+        /// The order the columns were dragged into, by name. `default` so a
+        /// session written before dragging existed still loads.
+        #[serde(default)]
+        column_order: Vec<String>,
         /// Which column the grid was sorted by. `default` so a session
         /// written before sorting existed still loads.
         #[serde(default)]
@@ -173,6 +177,7 @@ mod tests {
             name: name.into(),
             where_clause: String::new(),
             hidden_columns: Vec::new(),
+            column_order: Vec::new(),
             sort: None,
         }
     }
@@ -194,6 +199,7 @@ mod tests {
                     name: "users".into(),
                     where_clause: "id > 10".into(),
                     hidden_columns: vec!["secret".into()],
+                    column_order: vec!["name".into(), "id".into()],
                     sort: None,
                 },
                 SavedTab::Sql {
@@ -276,7 +282,10 @@ mod tests {
             .map(|entry| entry.file_name())
             .filter(|name| name.to_string_lossy().contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -284,14 +293,22 @@ mod tests {
     #[test]
     fn pruning_drops_tabs_whose_connection_is_gone() {
         let mut session = Session {
-            tabs: vec![tab_with(1, vec![]), tab_with(2, vec![]), tab_with(3, vec![])],
+            tabs: vec![
+                tab_with(1, vec![]),
+                tab_with(2, vec![]),
+                tab_with(3, vec![]),
+            ],
             active: 0,
         };
 
         session.prune(&[ConnectionId(1), ConnectionId(3)]);
 
         assert_eq!(
-            session.tabs.iter().map(|t| t.connection).collect::<Vec<_>>(),
+            session
+                .tabs
+                .iter()
+                .map(|t| t.connection)
+                .collect::<Vec<_>>(),
             vec![ConnectionId(1), ConnectionId(3)]
         );
     }
@@ -301,7 +318,11 @@ mod tests {
     #[test]
     fn pruning_keeps_the_same_connection_in_front() {
         let mut session = Session {
-            tabs: vec![tab_with(1, vec![]), tab_with(2, vec![]), tab_with(3, vec![])],
+            tabs: vec![
+                tab_with(1, vec![]),
+                tab_with(2, vec![]),
+                tab_with(3, vec![]),
+            ],
             active: 2,
         };
 

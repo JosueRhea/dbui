@@ -1,5 +1,6 @@
 //! Command palette: go-to-table (⌘P) and actions (⌘⇧P).
 
+use super::close_guard::TabScope;
 use super::icons::{command_mark, table_icon, theme_mark};
 use super::text_field::{text_field, InputTarget};
 use crate::root::{DbUi, Focus, Status};
@@ -15,6 +16,8 @@ pub enum PaletteKind {
     Themes,
     /// Statements run before, newest first.
     History,
+    /// Ready-made statements to start from.
+    Templates,
 }
 
 pub struct Palette {
@@ -71,12 +74,16 @@ enum ActionId {
     ClearSql,
     ChangeTheme,
     CloseTab,
+    CloseOtherTabs,
+    CloseTabsToRight,
+    CloseAllTabs,
     NextTab,
     PrevTab,
     ZoomIn,
     ZoomOut,
     ZoomReset,
     ShowHistory,
+    SqlTemplates,
     DuplicateRows,
     PasteRows,
 }
@@ -118,6 +125,24 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::PrevTab,
         label: "Previous Tab",
         shortcut: Some("⌃⇧⇥"),
+        section: "Navigate",
+    },
+    ActionDef {
+        id: ActionId::CloseOtherTabs,
+        label: "Close Other Tabs",
+        shortcut: None,
+        section: "Navigate",
+    },
+    ActionDef {
+        id: ActionId::CloseTabsToRight,
+        label: "Close Tabs to the Right",
+        shortcut: None,
+        section: "Navigate",
+    },
+    ActionDef {
+        id: ActionId::CloseAllTabs,
+        label: "Close All Tabs",
+        shortcut: None,
         section: "Navigate",
     },
     ActionDef {
@@ -280,6 +305,12 @@ const ACTIONS: &[ActionDef] = &[
         section: "Query",
     },
     ActionDef {
+        id: ActionId::SqlTemplates,
+        label: "SQL Templates…",
+        shortcut: Some("⌘⇧E"),
+        section: "Query",
+    },
+    ActionDef {
         id: ActionId::ClearSort,
         label: "Clear Sort",
         shortcut: None,
@@ -345,7 +376,10 @@ const ACTIONS: &[ActionDef] = &[
 enum PaletteRow {
     Table(TableRef),
     /// `(sql, whether it succeeded)`
-    History { sql: String, ok: bool },
+    History {
+        sql: String,
+        ok: bool,
+    },
     Action {
         id: ActionId,
         enabled: bool,
@@ -354,6 +388,11 @@ enum PaletteRow {
         id: &'static str,
         label: &'static str,
     },
+    Template {
+        name: &'static str,
+        about: &'static str,
+        body: String,
+    },
 }
 
 impl PaletteRow {
@@ -361,6 +400,7 @@ impl PaletteRow {
         match self {
             PaletteRow::Table(_) => "Tables",
             PaletteRow::History { .. } => "History",
+            PaletteRow::Template { .. } => "Templates",
             PaletteRow::Theme { .. } => "Themes",
             PaletteRow::Action { id, .. } => ACTIONS
                 .iter()
@@ -663,6 +703,28 @@ impl DbUi {
                     ok: entry.ok,
                 })
                 .collect(),
+            PaletteKind::Templates => {
+                let driver = self
+                    .active_driver_kind()
+                    .unwrap_or(dbui_app::domain::Driver::Postgres);
+                let table = self.workspace.open_table.clone();
+                crate::sql_scaffold::templates(driver, table.as_ref())
+                    .into_iter()
+                    .filter(|template| {
+                        if query.is_empty() {
+                            return true;
+                        }
+                        let q = query.as_str();
+                        template.name.to_lowercase().contains(q)
+                            || template.about.to_lowercase().contains(q)
+                    })
+                    .map(|template| PaletteRow::Template {
+                        name: template.name,
+                        about: template.about,
+                        body: template.body,
+                    })
+                    .collect()
+            }
             PaletteKind::Themes => crate::theme::all_themes()
                 .iter()
                 .filter(|theme| {
@@ -698,6 +760,7 @@ impl DbUi {
             | ActionId::GoToTable
             | ActionId::SearchTables
             | ActionId::ShowHistory
+            | ActionId::SqlTemplates
             | ActionId::FocusSidebar
             | ActionId::ChangeTheme
             | ActionId::OpenSql
@@ -718,9 +781,7 @@ impl DbUi {
             ActionId::DisconnectActive | ActionId::RefreshCatalog => connected,
             ActionId::CloseConnection => has_active,
             // Nothing to step to with one tab open, or none.
-            ActionId::NextConnection | ActionId::PrevConnection => {
-                self.workspace.open_count() > 1
-            }
+            ActionId::NextConnection | ActionId::PrevConnection => self.workspace.open_count() > 1,
             ActionId::RefreshResult => connected && (is_table || is_sql),
             ActionId::RunQuery | ActionId::RunAllQueries | ActionId::ClearSql => is_sql,
             ActionId::ToggleFilters
@@ -764,6 +825,11 @@ impl DbUi {
                 !self.collect_batch_edits().is_empty() || !self.collect_batch_deletes().is_empty()
             }
             ActionId::ToggleDetail => true,
+            // Offered only when there is something for them to close, so the
+            // palette never lists a command that would do nothing.
+            ActionId::CloseAllTabs => !self.tabs.items.is_empty(),
+            ActionId::CloseOtherTabs => self.tabs.items.len() > 1,
+            ActionId::CloseTabsToRight => self.tabs.active + 1 < self.tabs.items.len(),
         }
     }
 
@@ -790,6 +856,11 @@ impl DbUi {
                 self.close_palette(cx);
                 self.put_sql_in_editor(&sql, cx);
             }
+            PaletteRow::Template { name, body, .. } => {
+                let (name, body) = (*name, body.clone());
+                self.close_palette(cx);
+                self.insert_sql_template(name, &body, cx);
+            }
         }
     }
 
@@ -814,6 +885,19 @@ impl DbUi {
             ActionId::RefreshResult => self.refresh_result(cx),
             ActionId::OpenSql => self.open_sql_tab(cx),
             ActionId::CloseTab => self.close_active_tab(cx),
+            // Anchored on the active tab: the palette has no pointer to have
+            // pointed at another one.
+            ActionId::CloseOtherTabs => {
+                if let Some(id) = self.tabs.active_id() {
+                    self.close_tab_scope(TabScope::Others(id), cx);
+                }
+            }
+            ActionId::CloseTabsToRight => {
+                if let Some(id) = self.tabs.active_id() {
+                    self.close_tab_scope(TabScope::ToRight(id), cx);
+                }
+            }
+            ActionId::CloseAllTabs => self.close_tab_scope(TabScope::All, cx),
             ActionId::NextTab => self.next_tab(cx),
             ActionId::PrevTab => self.prev_tab(cx),
             ActionId::RunQuery => self.run_query(cx),
@@ -826,9 +910,7 @@ impl DbUi {
             ActionId::CopyCell => {
                 self.copy_focused_cell(cx);
             }
-            ActionId::CopyRowsTsv => {
-                self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx)
-            }
+            ActionId::CopyRowsTsv => self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx),
             ActionId::CopyRowsJson => {
                 self.copy_selected_rows(crate::row_export::RowFormat::Json, cx)
             }
@@ -837,6 +919,7 @@ impl DbUi {
             }
             ActionId::ClearSort => self.clear_sort(cx),
             ActionId::ShowHistory => self.open_palette(PaletteKind::History, cx),
+            ActionId::SqlTemplates => self.open_palette(PaletteKind::Templates, cx),
             ActionId::DuplicateRows => self.duplicate_selected_rows(cx),
             ActionId::PasteRows => self.paste_rows(cx),
             ActionId::CommitChanges => self.save_pending_edits(cx),
@@ -878,6 +961,7 @@ impl DbUi {
             PaletteKind::Actions => "Type a command…",
             PaletteKind::Themes => "Search themes…",
             PaletteKind::History => "Search history…",
+            PaletteKind::Templates => "Search templates…",
         };
 
         let rows = self.palette_rows(kind);
@@ -899,6 +983,7 @@ impl DbUi {
                 }
                 PaletteKind::Actions => "No matching actions",
                 PaletteKind::History => "Nothing run yet",
+                PaletteKind::Templates => "No template matches",
                 PaletteKind::Themes => "No matching themes",
             };
             vec![div()
@@ -986,6 +1071,23 @@ impl DbUi {
                             cx.listener(move |this, _, _, cx| {
                                 this.close_palette(cx);
                                 this.put_sql_in_editor(&target, cx);
+                            }),
+                        )
+                    }
+                    PaletteRow::Template { name, about, body } => {
+                        let (label, target) = (SharedString::from(*name), (*name, body.clone()));
+                        palette_row(
+                            index,
+                            is_sel,
+                            true,
+                            command_mark(theme.text_muted).into_any_element(),
+                            label,
+                            Some(about),
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                let (name, body) = target.clone();
+                                this.close_palette(cx);
+                                this.insert_sql_template(name, &body, cx);
                             }),
                         )
                     }
@@ -1092,14 +1194,25 @@ impl DbUi {
                         .child(div().h(px(1.)).w_full().bg(theme.divider))
                         .child(
                             div()
-                                .id("palette-list")
-                                .track_scroll(&list_scroll)
+                                .relative()
                                 .flex_1()
                                 .min_h(px(0.))
                                 .max_h(metrics::scaled(360.))
-                                .overflow_y_scroll()
-                                .pb_1()
-                                .children(list),
+                                .child(
+                                    div()
+                                        .id("palette-list")
+                                        .track_scroll(&list_scroll)
+                                        .size_full()
+                                        .min_h(px(0.))
+                                        .overflow_y_scroll()
+                                        .pb_1()
+                                        .children(list),
+                                )
+                                .child(crate::components::scrollbar::vertical_scrollbar(
+                                    "palette-scrollbar",
+                                    list_scroll.clone(),
+                                    theme,
+                                )),
                         )
                         .child(div().h(px(1.)).w_full().bg(theme.divider))
                         .child(

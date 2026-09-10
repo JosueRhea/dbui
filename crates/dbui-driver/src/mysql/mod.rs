@@ -8,9 +8,8 @@ use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, Page, QueryOutcome,
-    ForeignKey, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey,
-    Table, TableRef,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Page, QueryOutcome,
+    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef,
     TlsMode, Value,
 };
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
@@ -216,7 +215,10 @@ impl DatabaseDriver for MySqlDriver {
                         .try_get::<String, _>("is_nullable")
                         .map(|flag| flag.eq_ignore_ascii_case("YES"))
                         .unwrap_or(true),
-                    default: row.try_get::<Option<String>, _>("column_default").ok().flatten(),
+                    default: row
+                        .try_get::<Option<String>, _>("column_default")
+                        .ok()
+                        .flatten(),
                     // "PRI" marks a primary-key member; "UNI" and "MUL" are
                     // other index kinds and are not what the grid highlights.
                     is_primary_key: row
@@ -231,10 +233,7 @@ impl DatabaseDriver for MySqlDriver {
                 })
             })
             .map(|mut column: Column| {
-                column.references = keys
-                    .iter()
-                    .find(|key| key.column == column.name)
-                    .cloned();
+                column.references = keys.iter().find(|key| key.column == column.name).cloned();
                 column
             })
             .collect())
@@ -252,9 +251,7 @@ impl DatabaseDriver for MySqlDriver {
         for value in &bound.binds {
             query = bind_value(query, value);
         }
-        query = query
-            .bind(page.probe_limit())
-            .bind(page.offset as i64);
+        query = query.bind(page.probe_limit()).bind(page.offset as i64);
 
         let rows = query
             .fetch_all(&self.pool)

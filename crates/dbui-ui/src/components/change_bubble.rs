@@ -23,7 +23,12 @@ impl DbUi {
         let inserts: Vec<String> = self
             .tabs
             .active()
-            .map(|tab| tab.pending_inserts().iter().map(|row| row.label()).collect())
+            .map(|tab| {
+                tab.pending_inserts()
+                    .iter()
+                    .map(|row| row.label())
+                    .collect()
+            })
             .unwrap_or_default();
         if batch.is_empty() && deletes.is_empty() && inserts.is_empty() {
             return None;
@@ -50,10 +55,7 @@ impl DbUi {
             label.push_str(&format!(" · {} new", inserts.len()));
         }
         if !deletes.is_empty() {
-            label.push_str(&format!(
-                " · {} to delete",
-                deletes.len()
-            ));
+            label.push_str(&format!(" · {} to delete", deletes.len()));
         }
 
         let mut bubble = div()
@@ -74,12 +76,15 @@ impl DbUi {
                 .opacity(0.5)
                 .cursor_default()
         } else {
-            button("discard-changes", "Discard", theme, false).on_click(cx.listener(
-                |this, _, _window, cx| this.discard_pending_edits(cx),
-            ))
+            button("discard-changes", "Discard", theme, false)
+                .on_click(cx.listener(|this, _, _window, cx| this.discard_pending_edits(cx)))
         };
 
-        let save_label = if saving { "Committing…" } else { "Commit  ⌘S" };
+        let save_label = if saving {
+            "Committing…"
+        } else {
+            "Commit  ⌘S"
+        };
         let save = if saving {
             button("save-changes", save_label, theme, true)
                 .opacity(0.7)
@@ -109,15 +114,17 @@ impl DbUi {
                         .flex_1()
                         .min_w(px(0.))
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.toggle_change_bubble(cx)
+                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_change_bubble(cx)))
+                        .child(div().text_color(theme.text_muted).child(if expanded {
+                            "▾"
+                        } else {
+                            "▸"
                         }))
                         .child(
                             div()
-                                .text_color(theme.text_muted)
-                                .child(if expanded { "▾" } else { "▸" }),
-                        )
-                        .child(div().text_color(theme.text).child(SharedString::from(label))),
+                                .text_color(theme.text)
+                                .child(SharedString::from(label)),
+                        ),
                 )
                 .child(discard)
                 .child(save),
@@ -126,21 +133,33 @@ impl DbUi {
         if expanded {
             bubble = bubble.child(
                 div()
-                    .id("change-bubble-details")
+                    .relative()
                     .w_full()
                     .min_w(px(0.))
                     .h(self.change_bubble_height)
-                    .overflow_y_scroll()
                     .border_t_1()
                     .border_color(theme.divider)
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(inserts.iter().map(|label| render_insert_row(label, theme)))
-                    .children(batch.iter().map(|edit| render_edit_group(edit, theme)))
-                    .children(deletes.iter().map(|row| render_delete_row(row, theme))),
+                    .child(
+                        div()
+                            .id("change-bubble-details")
+                            .track_scroll(&self.change_bubble_scroll)
+                            .size_full()
+                            .min_w(px(0.))
+                            .overflow_y_scroll()
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .children(inserts.iter().map(|label| render_insert_row(label, theme)))
+                            .children(batch.iter().map(|edit| render_edit_group(edit, theme)))
+                            .children(deletes.iter().map(|row| render_delete_row(row, theme))),
+                    )
+                    .child(super::scrollbar::vertical_scrollbar(
+                        "change-bubble-scrollbar",
+                        self.change_bubble_scroll.clone(),
+                        theme,
+                    )),
             );
         }
 

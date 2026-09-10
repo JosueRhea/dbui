@@ -225,7 +225,10 @@ impl ConnectionForm {
     }
 
     pub fn focus(&mut self, field: Field) {
-        if let Some(index) = Field::ORDER.iter().position(|candidate| *candidate == field) {
+        if let Some(index) = Field::ORDER
+            .iter()
+            .position(|candidate| *candidate == field)
+        {
             self.focused = index;
         }
     }
@@ -259,7 +262,10 @@ impl ConnectionForm {
     }
 
     fn set_text(&mut self, field: Field, value: impl Into<String>) {
-        if let Some(index) = Field::ORDER.iter().position(|candidate| *candidate == field) {
+        if let Some(index) = Field::ORDER
+            .iter()
+            .position(|candidate| *candidate == field)
+        {
             self.fields[index].set_text(value);
         }
     }
@@ -388,28 +394,30 @@ impl DbUi {
                                     cx.notify();
                                 }),
                             )
-                            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                                let Some(form) = this.modal.as_mut() else {
-                                    return;
-                                };
-                                if form.focused != index {
-                                    return;
-                                }
-                                let Some(input) = form.field_mut(index) else {
-                                    return;
-                                };
-                                if !input.is_selecting() {
-                                    return;
-                                }
-                                let offset = input.offset_for_mouse(
-                                    event.position,
-                                    px(0.),
-                                    px(28.),
-                                    text_input::char_width(),
-                                );
-                                input.select_to(offset);
-                                cx.notify();
-                            }))
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &MouseMoveEvent, _, cx| {
+                                    let Some(form) = this.modal.as_mut() else {
+                                        return;
+                                    };
+                                    if form.focused != index {
+                                        return;
+                                    }
+                                    let Some(input) = form.field_mut(index) else {
+                                        return;
+                                    };
+                                    if !input.is_selecting() {
+                                        return;
+                                    }
+                                    let offset = input.offset_for_mouse(
+                                        event.position,
+                                        px(0.),
+                                        px(28.),
+                                        text_input::char_width(),
+                                    );
+                                    input.select_to(offset);
+                                    cx.notify();
+                                },
+                            ))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseUpEvent, _, cx| {
@@ -447,39 +455,38 @@ impl DbUi {
                     .text_color(theme.text_muted)
                     .child("Engine"),
             )
-            .child(
+            .child(div().flex().gap_2().children(Driver::ALL.map(|driver| {
+                let active = form.driver() == driver;
                 div()
+                    .id(("driver", driver as usize))
                     .flex()
+                    .items_center()
                     .gap_2()
-                    .children(Driver::ALL.map(|driver| {
-                        let active = form.driver() == driver;
-                        div()
-                            .id(("driver", driver as usize))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_3()
-                            .h(metrics::scaled(28.))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .bg(if active { theme.accent } else { theme.background })
-                            .text_color(if active {
-                                theme.text_on_accent
-                            } else {
-                                theme.text_muted
-                            })
-                            .border_1()
-                            .border_color(if active { theme.accent } else { theme.border })
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                if let Some(form) = this.modal.as_mut() {
-                                    form.set_driver(driver);
-                                }
-                                cx.notify();
-                            }))
-                            .child(super::dot(theme.driver_color(driver)))
-                            .child(driver.label())
-                    })),
-            );
+                    .px_3()
+                    .h(metrics::scaled(28.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active {
+                        theme.accent
+                    } else {
+                        theme.background
+                    })
+                    .text_color(if active {
+                        theme.text_on_accent
+                    } else {
+                        theme.text_muted
+                    })
+                    .border_1()
+                    .border_color(if active { theme.accent } else { theme.border })
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        if let Some(form) = this.modal.as_mut() {
+                            form.set_driver(driver);
+                        }
+                        cx.notify();
+                    }))
+                    .child(super::dot(theme.driver_color(driver)))
+                    .child(driver.label())
+            })));
 
         let tls_choice = div()
             .flex()
@@ -492,34 +499,33 @@ impl DbUi {
                     .text_color(theme.text_muted)
                     .child("TLS"),
             )
-            .child(
+            .child(div().flex().gap_2().children(TlsMode::ALL.map(|mode| {
+                let active = form.tls() == mode;
                 div()
+                    .id(("tls", mode as usize))
                     .flex()
-                    .gap_2()
-                    .children(TlsMode::ALL.map(|mode| {
-                        let active = form.tls() == mode;
-                        div()
-                            .id(("tls", mode as usize))
-                            .flex()
-                            .items_center()
-                            .px_3()
-                            .h(metrics::control_height())
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_size(metrics::scaled(11.))
-                            .bg(if active { theme.elevated } else { theme.background })
-                            .text_color(if active { theme.text } else { theme.text_faint })
-                            .border_1()
-                            .border_color(if active { theme.accent } else { theme.border })
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                if let Some(form) = this.modal.as_mut() {
-                                    form.set_tls(mode);
-                                }
-                                cx.notify();
-                            }))
-                            .child(mode.label())
-                    })),
-            );
+                    .items_center()
+                    .px_3()
+                    .h(metrics::control_height())
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(metrics::scaled(11.))
+                    .bg(if active {
+                        theme.elevated
+                    } else {
+                        theme.background
+                    })
+                    .text_color(if active { theme.text } else { theme.text_faint })
+                    .border_1()
+                    .border_color(if active { theme.accent } else { theme.border })
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        if let Some(form) = this.modal.as_mut() {
+                            form.set_tls(mode);
+                        }
+                        cx.notify();
+                    }))
+                    .child(mode.label())
+            })));
 
         let read_only = form.read_only();
         let read_only_choice = div()
@@ -543,9 +549,17 @@ impl DbUi {
                     .h(metrics::control_height())
                     .rounded_md()
                     .cursor_pointer()
-                    .bg(if read_only { theme.elevated } else { theme.background })
+                    .bg(if read_only {
+                        theme.elevated
+                    } else {
+                        theme.background
+                    })
                     .border_1()
-                    .border_color(if read_only { theme.warning } else { theme.border })
+                    .border_color(if read_only {
+                        theme.warning
+                    } else {
+                        theme.border
+                    })
                     .on_click(cx.listener(|this, _, _window, cx| {
                         if let Some(form) = this.modal.as_mut() {
                             form.toggle_read_only();
@@ -568,7 +582,11 @@ impl DbUi {
                     .child(
                         div()
                             .text_size(metrics::scaled(11.))
-                            .text_color(if read_only { theme.text } else { theme.text_faint })
+                            .text_color(if read_only {
+                                theme.text
+                            } else {
+                                theme.text_faint
+                            })
                             .child("Read only — refuse every write"),
                     ),
             );
@@ -658,12 +676,14 @@ impl DbUi {
                                     false,
                                     cancel_focused,
                                 )
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    if let Some(form) = this.modal.as_mut() {
-                                        form.focus_action(FormAction::Cancel);
-                                    }
-                                    this.close_modal(cx);
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        if let Some(form) = this.modal.as_mut() {
+                                            form.focus_action(FormAction::Cancel);
+                                        }
+                                        this.close_modal(cx);
+                                    },
+                                )),
                             )
                             .child(
                                 button_with_focus(
@@ -673,12 +693,14 @@ impl DbUi {
                                     false,
                                     test_focused,
                                 )
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    if let Some(form) = this.modal.as_mut() {
-                                        form.focus_action(FormAction::Test);
-                                    }
-                                    this.test_connection(cx);
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        if let Some(form) = this.modal.as_mut() {
+                                            form.focus_action(FormAction::Test);
+                                        }
+                                        this.test_connection(cx);
+                                    },
+                                )),
                             )
                             .child(
                                 button_with_focus(
@@ -688,12 +710,14 @@ impl DbUi {
                                     true,
                                     save_focused,
                                 )
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    if let Some(form) = this.modal.as_mut() {
-                                        form.focus_action(FormAction::Save);
-                                    }
-                                    this.save_connection(cx);
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        if let Some(form) = this.modal.as_mut() {
+                                            form.focus_action(FormAction::Save);
+                                        }
+                                        this.save_connection(cx);
+                                    },
+                                )),
                             ),
                     ),
             )
@@ -702,12 +726,7 @@ impl DbUi {
 }
 
 /// Draw a field's text with the caret and selection in it.
-fn render_field_text(
-    input: &TextInput,
-    field: Field,
-    focused: bool,
-    theme: &Theme,
-) -> AnyElement {
+fn render_field_text(input: &TextInput, field: Field, focused: bool, theme: &Theme) -> AnyElement {
     let text = input.text();
     let selection = input.selection();
     let cursor = input.cursor();

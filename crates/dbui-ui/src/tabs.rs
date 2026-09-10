@@ -157,11 +157,7 @@ impl PendingRowInsert {
     /// the sequence fires and the copy gets its own identity. A key the table
     /// *cannot* generate is copied instead, so the clash is visible in the
     /// sidebar and fixable before the commit rather than after it.
-    pub fn duplicating(
-        columns: &[ColumnInfo],
-        structure: &[Column],
-        values: &[Value],
-    ) -> Self {
+    pub fn duplicating(columns: &[ColumnInfo], structure: &[Column], values: &[Value]) -> Self {
         let generated = generated_key_columns(structure);
         let mut row = Self::blank(columns, structure);
         for (index, (name, input, _)) in row.fields.iter_mut().enumerate() {
@@ -180,11 +176,7 @@ impl PendingRowInsert {
     /// An empty cell is a NULL, because that is what [`crate::row_export`]
     /// writes one as -- there is no way to say "use the default" in TSV.
     pub fn set_from_text(&mut self, column: &str, text: &str) {
-        if let Some((_, input, _)) = self
-            .fields
-            .iter_mut()
-            .find(|(name, _, _)| name == column)
-        {
+        if let Some((_, input, _)) = self.fields.iter_mut().find(|(name, _, _)| name == column) {
             let value = if text.is_empty() { "NULL" } else { text };
             *input = TextInput::with_text(value.to_string(), true);
         }
@@ -241,8 +233,8 @@ pub fn generated_key_columns(structure: &[Column]) -> Vec<String> {
                 .default
                 .as_ref()
                 .is_some_and(|value| !value.trim().is_empty());
-            let lone_integer = keys.len() == 1
-                && matches!(Value::prototype_for(&column.data_type), Value::Int(_));
+            let lone_integer =
+                keys.len() == 1 && matches!(Value::prototype_for(&column.data_type), Value::Int(_));
             has_default || lone_integer
         })
         .map(|column| column.name.clone())
@@ -250,7 +242,10 @@ pub fn generated_key_columns(structure: &[Column]) -> Vec<String> {
 }
 
 fn one_line_value(text: &str) -> String {
-    let flat: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     if flat.chars().count() > 24 {
         format!("{}…", flat.chars().take(24).collect::<String>())
     } else {
@@ -672,14 +667,13 @@ fn resolve_staged<'a>(
 fn agreed_text(staged: &[StagedRow<'_>], index: usize, name: &str) -> String {
     let mut shared: Option<String> = None;
     for (values, edit) in staged {
-        let text = match edit
-            .and_then(|edit| edit.changes.iter().find(|change| change.column == name))
-        {
-            // The buffer verbatim, not the value re-rendered: coming back to a
-            // row must not hand back a reformatted copy of what was typed.
-            Some(change) => change.edited_text.clone(),
-            None => values.get(index).map(value_editor_text).unwrap_or_default(),
-        };
+        let text =
+            match edit.and_then(|edit| edit.changes.iter().find(|change| change.column == name)) {
+                // The buffer verbatim, not the value re-rendered: coming back to a
+                // row must not hand back a reformatted copy of what was typed.
+                Some(change) => change.edited_text.clone(),
+                None => values.get(index).map(value_editor_text).unwrap_or_default(),
+            };
         match &shared {
             None => shared = Some(text),
             Some(seen) if *seen == text => {}
@@ -747,7 +741,6 @@ fn unquote_draft_literal(text: &str) -> Option<String> {
     Some(out)
 }
 
-
 pub enum WorkspaceTab {
     Table {
         id: TabId,
@@ -768,6 +761,9 @@ pub enum WorkspaceTab {
         /// Widths the user dragged, by column name. Kept by name rather than
         /// by index so they survive a reload that adds or drops a column.
         column_widths: std::collections::HashMap<String, f32>,
+        /// The order the user dragged the columns into, by name and for the
+        /// same reason as the widths. Empty means "as the server sent them".
+        column_order: Vec<String>,
         result: Option<ResultView>,
         selected_row: Option<usize>,
         /// Every selected row. `selected_row` is the one whose detail is open;
@@ -809,6 +805,14 @@ pub enum WorkspaceTab {
         /// starts, and not before: an error the user has not read yet is not
         /// an error that has been dealt with.
         error: Option<StatementError>,
+        /// The column the grid is sorting the page by.
+        ///
+        /// A table tab's sort is a clause the server runs; this one is not.
+        /// A query's order is whatever its own `ORDER BY` says, and re-reading
+        /// it with one bolted on would be rewriting the user's SQL behind
+        /// their back -- so this reorders the rows already fetched and leaves
+        /// the statement alone.
+        sort: Option<SortKey>,
     },
 }
 
@@ -825,6 +829,7 @@ impl WorkspaceTab {
             page_size_draft: TextInput::with_text(Page::DEFAULT_LIMIT.to_string(), false),
             hidden_columns: HashSet::new(),
             column_widths: std::collections::HashMap::new(),
+            column_order: Vec::new(),
             result: None,
             selected_row: None,
             selection: RowSelection::default(),
@@ -854,6 +859,7 @@ impl WorkspaceTab {
             selection: RowSelection::default(),
             draft: None,
             error: None,
+            sort: None,
         }
     }
 
@@ -902,6 +908,32 @@ impl WorkspaceTab {
         }
     }
 
+    pub fn result_mut(&mut self) -> Option<&mut ResultView> {
+        match self {
+            Self::Table { result, .. } | Self::Sql { result, .. } => result.as_mut(),
+        }
+    }
+
+    /// The columns as the grid draws them: in the order the user dragged them
+    /// into, minus the ones they hid.
+    ///
+    /// One place, because the header, the rows and the staged inserts all
+    /// have to agree -- a cell drawn under the wrong heading is worse than no
+    /// reordering at all. The index is into the *result's* columns, which is
+    /// how every row still finds its value.
+    pub fn display_columns(&self) -> Vec<(usize, &dbui_app::domain::ColumnInfo)> {
+        let Some(view) = self.result() else {
+            return Vec::new();
+        };
+        let hidden = match self {
+            Self::Table { hidden_columns, .. } => Some(hidden_columns),
+            Self::Sql { .. } => None,
+        };
+        view.ordered_columns()
+            .filter(|(_, info)| !hidden.is_some_and(|hidden| hidden.contains(&info.name)))
+            .collect()
+    }
+
     /// Why the last run or load on this tab failed, if it did.
     pub fn error(&self) -> Option<&StatementError> {
         match self {
@@ -946,9 +978,7 @@ impl WorkspaceTab {
     /// Which staged insert the sidebar is editing.
     pub fn editing_insert(&self) -> Option<usize> {
         match self {
-            Self::Table {
-                editing_insert, ..
-            } => *editing_insert,
+            Self::Table { editing_insert, .. } => *editing_insert,
             Self::Sql { .. } => None,
         }
     }
@@ -1035,6 +1065,7 @@ impl WorkspaceTab {
                 table,
                 where_clause,
                 hidden_columns,
+                column_order,
                 sort,
                 ..
             } => {
@@ -1047,6 +1078,7 @@ impl WorkspaceTab {
                     name: table.name.clone(),
                     where_clause: where_clause.clone(),
                     hidden_columns: hidden,
+                    column_order: column_order.clone(),
                     sort: sort.clone(),
                 }
             }
@@ -1063,6 +1095,7 @@ impl WorkspaceTab {
                 name,
                 where_clause,
                 hidden_columns,
+                column_order,
                 sort,
             } => {
                 let mut tab = Self::table(id, TableRef::new(schema, name));
@@ -1070,10 +1103,12 @@ impl WorkspaceTab {
                     where_clause: clause,
                     where_draft,
                     hidden_columns: hidden,
+                    column_order: order,
                     sort: tab_sort,
                     ..
                 } = &mut tab
                 {
+                    order.clone_from(column_order);
                     clause.clone_from(where_clause);
                     tab_sort.clone_from(sort);
                     // The strip opens showing the filter that is applied, not
@@ -1184,6 +1219,24 @@ impl Tabs {
             self.active = self.items.len() - 1;
         } else if index < self.active {
             self.active -= 1;
+        }
+    }
+
+    /// Move the tab at `from` into the slot at `to`, sliding the rest along.
+    ///
+    /// The active marker follows the tab it was pointing at rather than the
+    /// slot: dragging a tab past the one in front must not hand the front to
+    /// whatever slid into the index.
+    pub fn reorder(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.items.len() || to >= self.items.len() {
+            return;
+        }
+        let active = self.active_id();
+        let tab = self.items.remove(from);
+        self.items.insert(to, tab);
+        if let Some(index) = active.and_then(|id| self.items.iter().position(|tab| tab.id() == id))
+        {
+            self.active = index;
         }
     }
 
@@ -1351,9 +1404,9 @@ fn parse_typed_literal(trimmed: &str, original: &Value) -> Result<Value, String>
             &original.to_text(),
             trimmed,
         ))),
-        Value::Bytes(_) | Value::Array(_) | Value::Unsupported(_) => Err(
-            "this column type cannot be edited from the sidebar yet".into(),
-        ),
+        Value::Bytes(_) | Value::Array(_) | Value::Unsupported(_) => {
+            Err("this column type cannot be edited from the sidebar yet".into())
+        }
     }
 }
 
@@ -1390,10 +1443,7 @@ mod tests {
         let a = tabs.active_id().unwrap();
         tabs.open_table(TableRef::new("public", "b"));
         assert_ne!(tabs.active_id(), Some(a));
-        assert!(matches!(
-            tabs.get_mut(a),
-            Some(WorkspaceTab::Table { .. })
-        ));
+        assert!(matches!(tabs.get_mut(a), Some(WorkspaceTab::Table { .. })));
     }
 
     // -- surviving a restart -------------------------------------------------
@@ -1474,6 +1524,7 @@ mod tests {
                     name: "users".into(),
                     where_clause: String::new(),
                     hidden_columns: Vec::new(),
+                    column_order: Vec::new(),
                     sort: None,
                 },
             ],
@@ -1585,9 +1636,7 @@ mod tests {
                     .collect(),
                 truncated: false,
             },
-            ResultSource::Query {
-                sql: String::new(),
-            },
+            ResultSource::Query { sql: String::new() },
             String::new(),
             vec![Column {
                 name: "id".into(),
@@ -1734,9 +1783,7 @@ mod tests {
                 ],
                 truncated: false,
             },
-            ResultSource::Query {
-                sql: String::new(),
-            },
+            ResultSource::Query { sql: String::new() },
             String::new(),
             vec![Column {
                 name: "id".into(),
@@ -1859,7 +1906,10 @@ mod tests {
 
         let mut reverted = reopened;
         reverted.fields[1].1 = TextInput::with_text("Ada", true);
-        assert!(reverted.to_pending_batch(&view, &staged).unwrap().is_empty());
+        assert!(reverted
+            .to_pending_batch(&view, &staged)
+            .unwrap()
+            .is_empty());
     }
 
     /// `MIXED` is a write token like the others, so a cell whose real content
@@ -1952,7 +2002,10 @@ mod tests {
         // The write stays compact, and differs from the stored bytes only in
         // the region the edit touched.
         let written = change.new_value.to_text();
-        assert!(!written.contains('\n'), "a compact column is written compact");
+        assert!(
+            !written.contains('\n'),
+            "a compact column is written compact"
+        );
 
         let old = stored.to_text();
         let prefix = old
@@ -2005,8 +2058,7 @@ mod tests {
     #[test]
     fn discard_style_reset_leaves_json_clean() {
         let compact = Value::Json(r#"{"Hello":"World"}"#.into());
-        let (view, mut draft) =
-            one_row_draft("feature_flags", compact, r#"{"Hello":"Changed"}"#);
+        let (view, mut draft) = one_row_draft("feature_flags", compact, r#"{"Hello":"Changed"}"#);
         assert_eq!(draft.to_pending_batch(&view, &[]).unwrap().len(), 1);
 
         draft.reset(&view);
