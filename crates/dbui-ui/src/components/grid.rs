@@ -183,6 +183,7 @@ impl DbUi {
                                         .into(),
                                 };
                                 let is_selected = this.selected_cell == Some((index, column));
+                                let just_copied = this.copied_cell == Some((index, column));
                                 let editing = this.editing_cell == Some((index, column));
                                 let links = this.foreign_key_at(index, column).is_some();
 
@@ -256,6 +257,22 @@ impl DbUi {
                                     .when(is_selected || row_selected, |cell| {
                                         cell.bg(theme.selection).border_color(theme.accent)
                                     })
+                                    // A copy answers where it was asked for.
+                                    // The status bar is at the bottom of the
+                                    // window, which on a wide table is
+                                    // nowhere near the cell that was clicked.
+                                    //
+                                    // Tinted rather than outlined: a cell only
+                                    // draws its right-hand border, so a border
+                                    // colour alone is one hairline the eye
+                                    // never lands on.
+                                    .when(just_copied, |cell| {
+                                        cell.bg(gpui::Rgba {
+                                            a: 0.22,
+                                            ..theme.success
+                                        })
+                                        .border_color(theme.success)
+                                    })
                                     .when(kind.right_aligned(), |cell| cell.justify_end())
                                     .text_color(theme.value_color(kind))
                                     .when(is_null && pending.is_none(), |cell| {
@@ -291,6 +308,42 @@ impl DbUi {
                                                 index,
                                                 Some(column),
                                                 event.modifiers,
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    // The row behind this has the same handler
+                                    // minus the column, which is what a menu
+                                    // entry about *this cell* needs -- so the
+                                    // press is claimed here and the column
+                                    // carried through.
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            // Right-clicking outside the
+                                            // selection moves it; inside one,
+                                            // only the cell cursor moves, so a
+                                            // menu opened over a range still
+                                            // acts on the whole range.
+                                            let inside = this
+                                                .tabs
+                                                .active()
+                                                .is_some_and(|tab| tab.selection().contains(index));
+                                            if inside {
+                                                this.focus_cell(index, column, cx);
+                                            } else {
+                                                this.grid_pointer_down(
+                                                    index,
+                                                    Some(column),
+                                                    gpui::Modifiers::default(),
+                                                    cx,
+                                                );
+                                                this.end_row_drag(cx);
+                                            }
+                                            this.open_context_menu(
+                                                crate::components::context_menu::ContextTarget::Rows,
+                                                event.position,
                                                 cx,
                                             );
                                         }),

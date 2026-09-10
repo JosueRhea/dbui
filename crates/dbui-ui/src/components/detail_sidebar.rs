@@ -92,13 +92,13 @@ impl DbUi {
                             .and_then(|index| tab.pending_inserts().get(index))
                     })
                 {
-                    render_insert_draft(
+                    vec![render_insert_draft(
                         insert,
                         self.detail_input,
                         &self.detail_collapsed,
                         theme,
                         cx,
-                    )
+                    )]
                 } else if let Some(draft) = draft.as_ref() {
                     // The lead row only decides which write tokens are on
                     // offer; the values on screen come from the draft, which
@@ -114,17 +114,18 @@ impl DbUi {
                         originals,
                         open_menu,
                         self.detail_input,
+                        self.copied_field,
                         &self.detail_collapsed,
                         theme,
                         cx,
                     )
                 } else if selected_row.is_some() {
-                    caption("Loading row…", theme).into_any_element()
+                    vec![caption("Loading row…", theme).into_any_element()]
                 } else {
-                    empty_selection(theme)
+                    vec![empty_selection(theme)]
                 }
             }
-            None => empty_selection(theme),
+            None => vec![empty_selection(theme)],
         };
 
         div()
@@ -167,6 +168,7 @@ impl DbUi {
                     .min_h(px(0.))
                     .min_w(px(0.))
                     .w_full()
+                    .track_scroll(&self.detail_scroll)
                     .overflow_x_hidden()
                     .overflow_y_scroll()
                     .map(|mut el| {
@@ -179,7 +181,7 @@ impl DbUi {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(body),
+                    .children(body),
             )
     }
 }
@@ -200,10 +202,11 @@ fn render_table_draft(
     originals: &[Value],
     open_menu: Option<usize>,
     detail_input: Option<DetailInput>,
+    copied: Option<usize>,
     collapsed: &HashSet<String>,
     theme: &Theme,
     cx: &mut Context<DbUi>,
-) -> AnyElement {
+) -> Vec<AnyElement> {
     let search = draft.field_search.text().to_ascii_lowercase();
     let search_focused = detail_input == Some(DetailInput::Search);
     let bulk = draft.is_bulk();
@@ -217,6 +220,7 @@ fn render_table_draft(
         })
         .map(|(index, (name, input, is_pk))| {
             let focused = detail_input == Some(DetailInput::Field(index));
+            let just_copied = copied == Some(index);
             let original = originals.get(index);
             let allow_empty = original.map(allows_empty_token).unwrap_or(true);
             let height = field_height(name, collapsed);
@@ -238,12 +242,14 @@ fn render_table_draft(
                             bulk,
                         }),
                         fold: foldable(input, *is_pk).then_some(height),
+                        just_copied,
                     },
                     theme,
                     cx,
                 ))
                 .child(if *is_pk {
-                    read_only_field(input.text(), true, height, theme).into_any_element()
+                    read_only_field(index, input.text(), true, height, just_copied, theme, cx)
+                        .into_any_element()
                 } else {
                     sized_text_field(
                         ("detail-field-input", index),
@@ -267,14 +273,15 @@ fn render_table_draft(
             .child(SharedString::from(text.clone()))
     });
 
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .w_full()
-        .min_w(px(0.))
-        .children(bulk.then(|| bulk_banner(draft.rows.len(), theme)))
-        .child(text_field(
+    // Flat, because the scroll handle addresses the body's own children by
+    // position: the banner, the search box, then one per visible field. Wrap
+    // them in a container and every field shares its index.
+    let mut body: Vec<AnyElement> = Vec::with_capacity(fields.len() + 3);
+    body.extend(
+        bulk.then(|| bulk_banner(draft.rows.len(), theme).into_any_element()),
+    );
+    body.push(
+        text_field(
             "detail-field-search",
             &draft.field_search,
             InputTarget::DetailSearch,
@@ -282,10 +289,12 @@ fn render_table_draft(
             Some("Search for field…"),
             theme,
             cx,
-        ))
-        .children(fields)
-        .children(message)
-        .into_any_element()
+        )
+        .into_any_element(),
+    );
+    body.extend(fields);
+    body.extend(message.map(IntoElement::into_any_element));
+    body
 }
 
 /// The editors for a row that is not on the server yet.
@@ -323,6 +332,9 @@ fn render_insert_draft(
                         // reads DEFAULT and is typed over directly.
                         menu: None,
                         fold: foldable(input, false).then_some(height),
+                        // A staged insert has no key to copy: it has no
+                        // identity until the server gives it one.
+                        just_copied: false,
                     },
                     theme,
                     cx,
@@ -435,6 +447,8 @@ struct FieldHeader<'a> {
     /// The height toggle and the height it is currently showing, for a field
     /// with more lines than a folded box would hold.
     fold: Option<FieldHeight>,
+    /// This field's value was the last one copied.
+    just_copied: bool,
 }
 
 fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) -> AnyElement {
@@ -444,6 +458,7 @@ fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) 
         is_pk,
         menu,
         fold,
+        just_copied,
     } = header;
     let label_color = if is_pk {
         theme.warning
@@ -483,6 +498,31 @@ fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) 
                     this.toggle_detail_collapsed(&field, cx);
                 }))
                 .child(if open { "⤡" } else { "⤢" }),
+        );
+    }
+
+    // The key has no value menu -- there is nothing to set it to -- so its
+    // slot in the header carries the one thing it does offer instead.
+    if is_pk && menu.is_none() {
+        row = row.child(
+            div()
+                .id(("detail-key-copy", index))
+                .px_1()
+                .rounded_sm()
+                .text_size(metrics::text_size_small())
+                .text_color(if just_copied {
+                    theme.success
+                } else {
+                    theme.text_faint
+                })
+                .cursor_pointer()
+                .hover(|btn| btn.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.copy_detail_field(index, cx);
+                }))
+                // The button answers where it was pressed. A sidebar scrolled
+                // well past the status bar has nowhere else to say it landed.
+                .child(if just_copied { "✓ Copied" } else { "⧉" }),
         );
     }
 
@@ -628,7 +668,20 @@ fn allows_empty_token(value: &Value) -> bool {
     )
 }
 
-fn read_only_field(text: &str, muted: bool, height: FieldHeight, theme: &Theme) -> AnyElement {
+/// A value drawn rather than edited -- today, the primary key.
+///
+/// It is still clickable, and clicking copies it. A read-only box takes no
+/// caret, so selecting the text by hand is not on offer; without this the
+/// key would be the one value on the row that cannot be taken anywhere.
+fn read_only_field(
+    index: usize,
+    text: &str,
+    muted: bool,
+    height: FieldHeight,
+    just_copied: bool,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
     let display = json_format::display_text(text);
     let color = if muted {
         theme.text_faint
@@ -638,6 +691,12 @@ fn read_only_field(text: &str, muted: bool, height: FieldHeight, theme: &Theme) 
 
     if !display.contains('\n') && !display.contains('\r') {
         return div()
+            .id(("detail-readonly", index))
+            .cursor_pointer()
+            .hover(|field| field.border_color(theme.accent))
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.copy_detail_field(index, cx);
+            }))
             .w_full()
             .min_w(px(0.))
             .flex()
@@ -647,7 +706,11 @@ fn read_only_field(text: &str, muted: bool, height: FieldHeight, theme: &Theme) 
             .rounded_md()
             .bg(theme.background)
             .border_1()
-            .border_color(theme.border)
+            .border_color(if just_copied {
+                theme.success
+            } else {
+                theme.border
+            })
             .font_family(metrics::MONO_FONT)
             .overflow_hidden()
             .text_color(color)
@@ -706,6 +769,12 @@ fn read_only_field(text: &str, muted: bool, height: FieldHeight, theme: &Theme) 
         .collect();
 
     div()
+        .id(("detail-readonly", index))
+        .cursor_pointer()
+        .hover(|field| field.border_color(theme.accent))
+        .on_click(cx.listener(move |this, _, _window, cx| {
+            this.copy_detail_field(index, cx);
+        }))
         .w_full()
         .min_w(px(0.))
         .h(box_h)
@@ -714,7 +783,11 @@ fn read_only_field(text: &str, muted: bool, height: FieldHeight, theme: &Theme) 
         .rounded_md()
         .bg(theme.background)
         .border_1()
-        .border_color(theme.border)
+        .border_color(if just_copied {
+            theme.success
+        } else {
+            theme.border
+        })
         .font_family(metrics::MONO_FONT)
         .text_size(metrics::text_size_small())
         .overflow_hidden()

@@ -55,6 +55,7 @@ enum ActionId {
     SelectAllRows,
     AddRow,
     DeleteRows,
+    CopyCell,
     CopyRowsTsv,
     CopyRowsJson,
     CopyRowsInsert,
@@ -249,9 +250,15 @@ const ACTIONS: &[ActionDef] = &[
         section: "Rows",
     },
     ActionDef {
+        id: ActionId::CopyCell,
+        label: "Copy Cell",
+        shortcut: Some("⌘C"),
+        section: "Rows",
+    },
+    ActionDef {
         id: ActionId::CopyRowsTsv,
         label: "Copy Rows as TSV",
-        shortcut: Some("⌘C"),
+        shortcut: Some("⌘⇧C"),
         section: "Rows",
     },
     ActionDef {
@@ -736,6 +743,7 @@ impl DbUi {
             ActionId::AddRow => {
                 is_table && self.tabs.active().and_then(|tab| tab.result()).is_some()
             }
+            ActionId::CopyCell => self.selected_cell.is_some(),
             ActionId::CopyRowsTsv | ActionId::CopyRowsJson | ActionId::CopyRowsInsert => self
                 .tabs
                 .active()
@@ -815,6 +823,9 @@ impl DbUi {
             ActionId::SelectAllRows => self.select_all_rows(cx),
             ActionId::DeleteRows => self.delete_selected_rows(cx),
             ActionId::AddRow => self.add_row(cx),
+            ActionId::CopyCell => {
+                self.copy_focused_cell(cx);
+            }
             ActionId::CopyRowsTsv => {
                 self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx)
             }

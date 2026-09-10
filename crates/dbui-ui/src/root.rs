@@ -201,6 +201,19 @@ pub struct DbUi {
     /// a grid cell is truncated, and the whole value has to be readable
     /// somewhere.
     pub(crate) selected_cell: Option<(usize, usize)>,
+    /// The grid cell whose value was last copied.
+    ///
+    /// Same reason as [`Self::copied_field`]: the status bar is at the far
+    /// bottom of the window, and a copy answered only there reads as nothing
+    /// having happened.
+    pub(crate) copied_cell: Option<(usize, usize)>,
+    /// The detail field whose copy button was last pressed.
+    ///
+    /// The status bar is at the far bottom of the window, and a sidebar
+    /// scrolled to its fortieth field is nowhere near it -- so the
+    /// confirmation is drawn on the button that was pressed, where the user
+    /// is already looking.
+    pub(crate) copied_field: Option<usize>,
 
     pub(crate) modal: Option<ConnectionForm>,
     /// Titlebar connection switcher dropdown.
@@ -281,6 +294,7 @@ pub struct DbUi {
     pub(crate) grid_h_scroll: ScrollHandle,
     /// Same, for the arrow-key cursor in the schema tree.
     pub(crate) sidebar_scroll: ScrollHandle,
+    pub(crate) detail_scroll: ScrollHandle,
 }
 
 /// Starting height of the diff area, and the range the drag is allowed.
@@ -366,6 +380,8 @@ impl DbUi {
             status: Status::Idle,
             loads_in_flight: 0,
             selected_cell: None,
+            copied_cell: None,
+            copied_field: None,
             modal: None,
             connection_picker_open: false,
             palette: None,
@@ -394,6 +410,7 @@ impl DbUi {
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
             history: dbui_app::history::history_path()
                 .map(|path| dbui_app::history::load(&path))
                 .unwrap_or_default(),
@@ -749,6 +766,11 @@ impl DbUi {
         };
         self.detail_input = Some(targets[next]);
         self.focus = Focus::Detail;
+        // Tabbing past the bottom of the panel has to bring the next field
+        // with it, or the caret walks off-screen.
+        if let Some(DetailInput::Field(field)) = self.detail_input {
+            self.reveal_detail_field(field);
+        }
         cx.notify();
     }
 
@@ -2098,6 +2120,10 @@ impl DbUi {
         }
         self.detail_input = None;
         self.detail_value_menu = None;
+        // The marks belong to the row they were taken from; carrying one onto
+        // the next row would claim a copy that never happened.
+        self.copied_field = None;
+        self.copied_cell = None;
         cx.notify();
     }
 
@@ -2346,6 +2372,20 @@ impl DbUi {
         // crosses: a drag over a few hundred rows would otherwise rebuild the
         // whole sidebar that many times on the way there.
         self.restage_draft(cx);
+        cx.notify();
+    }
+
+    /// Move the cell cursor without touching which rows are selected.
+    ///
+    /// Right-clicking inside a range needs exactly this: the menu should be
+    /// about the cell under the pointer, and still act on every row the user
+    /// picked.
+    pub(crate) fn focus_cell(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        if self.editing_cell.is_some() && self.editing_cell != Some((row, column)) {
+            self.commit_cell_edit(cx);
+        }
+        self.selected_cell = Some((row, column));
+        self.focus = Focus::Grid;
         cx.notify();
     }
 
@@ -2600,15 +2640,38 @@ impl DbUi {
             return;
         };
 
+        // The two cells that cannot be opened in place still answer the
+        // gesture: a double-click on one puts its value on the clipboard.
+        // Landing on "you cannot edit this" and nothing else is what makes a
+        // JSON column feel unreachable -- the document is right there, and the
+        // only thing anyone wanted was to take it somewhere.
+        self.selected_cell = Some((row, column));
         if is_pk {
-            self.status = Status::info(format!("{name} is part of the primary key"));
+            self.copy_focused_cell(cx);
+            self.status = Status::info(format!(
+                "{name} is part of the primary key — copied it instead"
+            ));
             cx.notify();
             return;
         }
         if text.contains('\n') {
+            self.copy_focused_cell(cx);
+            // Selected, not just focused: the sidebar field is then a text
+            // field like any other, with the whole value ready for ⌘C.
+            if let Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            }) = self.tabs.active_mut()
+            {
+                if let Some((_, input, _)) = draft.fields.get_mut(column) {
+                    input.select_all();
+                }
+            }
             self.detail_input = Some(DetailInput::Field(column));
             self.focus = Focus::Detail;
-            self.status = Status::info(format!("{name} is multi-line — edit it in the sidebar"));
+            self.reveal_detail_field(column);
+            self.status = Status::info(format!(
+                "{name} is multi-line — copied it; edit it in the sidebar"
+            ));
             cx.notify();
             return;
         }
@@ -3101,6 +3164,119 @@ impl DbUi {
                     .map(|values| dbui_app::RowInsert { values })
             })
             .collect()
+    }
+
+    /// Bring one detail field into view.
+    ///
+    /// Sending someone to "the sidebar" is only an instruction if the sidebar
+    /// then shows the field. On a wide table the panel is scrolled twenty
+    /// fields away, and focusing something off-screen looks exactly like
+    /// nothing having happened.
+    pub(crate) fn reveal_detail_field(&self, field: usize) {
+        let Some(draft) = self.tabs.active().and_then(|tab| match tab {
+            WorkspaceTab::Table { draft, .. } | WorkspaceTab::Sql { draft, .. } => draft.as_ref(),
+        }) else {
+            return;
+        };
+
+        // The panel renders, in order: the bulk banner when there is one, the
+        // field search, then the fields the search left visible. The child
+        // index the scroll handle knows is that same count.
+        let search = draft.field_search.text().to_ascii_lowercase();
+        let lead = usize::from(draft.is_bulk()) + 1;
+        let Some(position) = draft
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _, _))| {
+                search.is_empty() || name.to_ascii_lowercase().contains(&search)
+            })
+            .position(|(index, _)| index == field)
+        else {
+            return;
+        };
+        self.detail_scroll.scroll_to_item(lead + position);
+    }
+
+    /// Copy one detail-sidebar field's value.
+    ///
+    /// The key's field is the reason this exists: it is drawn read-only,
+    /// because the row's identity is not editable, and a box you cannot put a
+    /// caret in is also a box you cannot select out of. Reaching a key by
+    /// hand -- to paste it into a query, a ticket, a message -- is one of the
+    /// most ordinary things anyone does with a row.
+    pub(crate) fn copy_detail_field(&mut self, index: usize, cx: &mut Context<Self>) {
+        let field = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            })
+            | Some(WorkspaceTab::Sql {
+                draft: Some(draft), ..
+            }) => draft
+                .fields
+                .get(index)
+                .map(|(name, input, _)| (name.clone(), input.text().to_string())),
+            _ => None,
+        };
+        let Some((name, text)) = field else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.copied_field = Some(index);
+        self.status = Status::info(format!("Copied {name}"));
+        cx.notify();
+    }
+
+    /// ⌘C over the grid: the focused cell if there is one, else the rows.
+    ///
+    /// Clicking a cell is asking about that cell, so copying after it should
+    /// hand back that cell rather than the forty columns around it. A range
+    /// of rows is a different question and still copies as rows, and ⌘⇧C
+    /// always does.
+    pub(crate) fn copy_cell_or_rows(&mut self, cx: &mut Context<Self>) {
+        let one_row = self
+            .tabs
+            .active()
+            .is_some_and(|tab| tab.selection().ordered().len() <= 1);
+        if one_row && self.copy_focused_cell(cx) {
+            return;
+        }
+        self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx);
+    }
+
+    /// Put the focused cell's value on the clipboard, and say whether there
+    /// was one.
+    ///
+    /// What is copied is what the grid shows -- a staged edit wins over the
+    /// stored value -- except that it is never truncated, and NULL copies as
+    /// nothing at all, the way it does in every other export here.
+    pub(crate) fn copy_focused_cell(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((row, column)) = self.selected_cell else {
+            return false;
+        };
+        let staged = self.collect_batch_edits();
+        let copied = self.tabs.active().and_then(|tab| {
+            let view = tab.result()?;
+            let name = view.set.columns.get(column)?.name.clone();
+            let pending = tab
+                .staged_edit_for_row(row, &staged)
+                .and_then(|edit| edit.changes.iter().find(|change| change.column == name))
+                .map(|change| change.new_text.clone());
+            let text = match pending {
+                Some(text) => text,
+                None => crate::row_export::cell_text(view.set.rows.get(row)?.get(column)?),
+            };
+            Some((name, text))
+        });
+        let Some((name, text)) = copied else {
+            return false;
+        };
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.copied_cell = Some((row, column));
+        self.status = Status::info(format!("Copied {name}"));
+        cx.notify();
+        true
     }
 
     /// Copy the selected rows to the clipboard.
@@ -3972,10 +4148,19 @@ impl DbUi {
                     self.delete_selected_rows(cx);
                     return;
                 }
-                // ⌘C / ⌘V over the grid copy and paste *rows*; inside an
-                // editor they are still the text operations they always were.
-                "c" if !self.text_undo_has_focus() => {
+                // ⌘C / ⌘V over the grid copy and paste *rows* -- or, with a
+                // cell focused, that cell. Inside an editor they are still the
+                // text operations they always were.
+                //
+                // ⌘⇧C is the way back to the rows while a cell is focused,
+                // which otherwise only the row-number gutter and the menu
+                // reach.
+                "c" if shift && !self.text_undo_has_focus() => {
                     self.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx);
+                    return;
+                }
+                "c" if !self.text_undo_has_focus() => {
+                    self.copy_cell_or_rows(cx);
                     return;
                 }
                 "v" if !self.text_undo_has_focus() => {

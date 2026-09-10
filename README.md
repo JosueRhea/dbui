@@ -138,6 +138,10 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
   primary key marked in the header and paging through the rest. Click a header
   to sort; the key trails the sort so paging stays stable. Drag a header's edge
   to widen a column. Double-click a cell — or press `↵` — to edit it in place.
+  The two that cannot be opened there, a key and a JSON document too tall for a
+  one-line box, copy themselves instead: the key lands on the clipboard, and
+  the document lands there *and* in the sidebar, selected and ready to take
+  again.
 - **New rows** — `+ Row` stages a blank row under the others. Columns left
   reading `DEFAULT` are left out of the `INSERT`, so sequences and column
   defaults still fire. It commits in the same transaction as everything else.
@@ -146,11 +150,13 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
   opens that table filtered to the row it points at. A plain click still just
   selects the cell, because a foreign-key column is an editable column like any
   other. Composite keys are not offered: one cell is not the whole key.
-- **Copy, paste and duplicate rows** — `⌘C` copies the selected rows as TSV for
-  a spreadsheet (or as JSON / `INSERT` statements from the right-click menu),
-  and `⌘V` reads that same TSV back in as new staged rows, matching columns by
-  name so rows move between tables that share them. `⌘D` duplicates the
-  selection directly, leaving keys the table can generate for it to fill in.
+- **Copy a cell, or whole rows** — `⌘C` copies the focused cell on its own,
+  because clicking a cell is asking about that cell. With a range of rows
+  selected — or with `⌘⇧C` — it copies rows as TSV for a spreadsheet instead
+  (or as JSON / `INSERT` statements from the right-click menu), and `⌘V` reads
+  that same TSV back in as new staged rows, matching columns by name so rows
+  move between tables that share them. `⌘D` duplicates the selection directly,
+  leaving keys the table can generate for it to fill in.
   All three stage rows rather than writing them, so `⌘S` still commits and
   `⌘Z` still discards.
 - **Query history** — every statement run is kept and searchable with `⌘⇧H`;
@@ -193,7 +199,8 @@ DBUI_LIVE_TESTS=1 cargo test -p dbui-driver
 | `⌘Z` | Discard the staged batch (undo, inside an editor) |
 | `⌘⇧F` | Search the schema tree |
 | `⌘⇧H` | Query history |
-| `⌘C` | Copy the selected rows as TSV |
+| `⌘C` | Copy the focused cell, or the selected rows as TSV |
+| `⌘⇧C` | Copy the selected rows as TSV |
 | `⌘V` | Paste rows from the clipboard as new rows |
 | `⌘D` | Duplicate the selected rows |
 | `↵` | Edit the selected cell in place |

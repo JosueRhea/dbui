@@ -1564,6 +1564,16 @@ fn draft_texts(view: &DbUi) -> Vec<String> {
         .collect()
 }
 
+fn type_into_field_search(view: &mut DbUi, text: &str) {
+    let draft = match view.tabs.active_mut() {
+        Some(WorkspaceTab::Table { draft, .. }) | Some(WorkspaceTab::Sql { draft, .. }) => {
+            draft.as_mut().expect("a draft is open")
+        }
+        None => panic!("no tab"),
+    };
+    draft.field_search = crate::text_input::TextInput::with_text(text, false);
+}
+
 fn type_into_draft(view: &mut DbUi, field: usize, text: &str) {
     let draft = match view.tabs.active_mut() {
         Some(WorkspaceTab::Table { draft, .. }) | Some(WorkspaceTab::Sql { draft, .. }) => {
@@ -1863,6 +1873,122 @@ fn copying_with_no_selection_takes_the_whole_page(cx: &mut TestAppContext) {
         view.clear_row_selection(cx);
         view.copy_selected_rows(crate::row_export::RowFormat::Tsv, cx);
         assert_eq!(describe(&view.status), "info: Copied 3 rows");
+    });
+}
+
+/// Clicking a cell is asking about that cell, so ⌘C after it hands back that
+/// cell rather than the whole row.
+#[gpui::test]
+fn cmd_c_copies_the_focused_cell(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, Some(1), gpui::Modifiers::default(), cx);
+        assert_eq!(view.selected_cell, Some((1, 1)));
+    });
+    cx.simulate_keystrokes("cmd-c");
+
+    view.update(cx, |view, _| {
+        assert_eq!(describe(&view.status), "info: Copied name");
+    });
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("row 2".to_string()),
+            "the value alone, with no header and no other column"
+        );
+    });
+}
+
+/// ⌘⇧C is the way back to the rows while a cell is focused.
+#[gpui::test]
+fn cmd_shift_c_copies_rows_even_with_a_cell_focused(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, Some(1), gpui::Modifiers::default(), cx);
+    });
+    cx.simulate_keystrokes("cmd-shift-c");
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("id\tname\n2\trow 2\n".to_string())
+        );
+    });
+}
+
+/// A range is a different question from a cell, so it still copies as rows
+/// even though the cell cursor is sitting inside it.
+#[gpui::test]
+fn a_selected_range_still_copies_as_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 4);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, Some(1), gpui::Modifiers::default(), cx);
+        view.grid_pointer_down(1, None, gpui::Modifiers::shift(), cx);
+        assert_eq!(view.selected_cell, Some((0, 1)), "the cell cursor stays put");
+    });
+    cx.simulate_keystrokes("cmd-c");
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("id\tname\n1\trow 1\n2\trow 2\n".to_string())
+        );
+    });
+}
+
+/// What is copied is what the grid shows: a staged edit wins over the value
+/// the server last sent.
+#[gpui::test]
+fn copying_a_cell_takes_the_staged_edit(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(1, 1, cx);
+        view.cell_editor.set_text("renamed");
+        view.commit_cell_edit(cx);
+        assert!(view.copy_focused_cell(cx));
+    });
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("renamed".to_string())
+        );
+    });
+}
+
+/// Right-clicking a cell carries the column through, so the menu entry about
+/// *this cell* has one to act on.
+#[gpui::test]
+fn copying_a_cell_from_the_menu_uses_the_cell_under_the_pointer(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.focus_cell(2, 0, cx);
+        assert!(view.copy_focused_cell(cx));
+        assert_eq!(describe(&view.status), "info: Copied id");
+    });
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("3".to_string())
+        );
+    });
+}
+
+/// No cell, nothing copied -- and the caller falls through to the rows.
+#[gpui::test]
+fn copying_a_cell_with_none_focused_does_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, None, gpui::Modifiers::default(), cx);
+        assert_eq!(view.selected_cell, None);
+        assert!(!view.copy_focused_cell(cx));
     });
 }
 
@@ -4380,6 +4506,143 @@ fn a_key_cell_cannot_be_edited_in_place(cx: &mut TestAppContext) {
             describe(&view.status).contains("primary key"),
             "got: {}",
             describe(&view.status)
+        );
+    });
+}
+
+/// A key cell cannot be opened, but the gesture still answers: the value is
+/// on the clipboard.
+#[gpui::test]
+fn double_clicking_a_key_cell_copies_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 0, cx);
+        assert!(view.editing_cell.is_none());
+    });
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("1".to_string())
+        );
+    });
+}
+
+/// A JSON document is too tall for a one-line box, so double-clicking one
+/// copies it and hands the sidebar the whole value, selected and ready for a
+/// second ⌘C -- rather than saying "not here" and leaving it unreachable.
+#[gpui::test]
+fn double_clicking_a_multi_line_cell_copies_it_and_opens_the_sidebar(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+    let document = "{\n  \"a\": 1,\n  \"b\": 2\n}";
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        type_into_draft(view, 1, document);
+
+        view.begin_cell_edit(0, 1, cx);
+        assert!(view.editing_cell.is_none(), "no one-line box over it");
+        assert_eq!(view.detail_input, Some(crate::components::DetailInput::Field(1)));
+        assert!(
+            describe(&view.status).contains("multi-line"),
+            "got: {}",
+            describe(&view.status)
+        );
+    });
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(document.to_string()),
+            "the whole document, newlines and all"
+        );
+    });
+
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.copied_cell,
+            Some((0, 1)),
+            "and the cell that was clicked says so, since the status bar is at \
+             the far bottom of the window"
+        );
+
+        // The mark belongs to the row it was taken from.
+        view.grid_pointer_down(1, None, gpui::Modifiers::default(), cx);
+        assert_eq!(view.copied_cell, None);
+    });
+}
+
+/// Sending someone to "the sidebar" is only an instruction if the sidebar
+/// then shows the field. The position handed to the scroll handle counts the
+/// search box above the fields, and the search filter can hide some of them.
+#[gpui::test]
+fn revealing_a_detail_field_counts_the_chrome_above_it(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        // Nothing here can be asserted about pixels -- the point is that both
+        // fields resolve to a position rather than being dropped, including
+        // while a filter is hiding the one above.
+        view.reveal_detail_field(0);
+        view.reveal_detail_field(1);
+
+        type_into_field_search(view, "name");
+        view.reveal_detail_field(1);
+        view.reveal_detail_field(0);
+    });
+}
+
+/// ⌘C over a key cell copies it like any other. A key cannot be *edited*,
+/// which is a different thing from cannot be read.
+#[gpui::test]
+fn cmd_c_copies_a_key_cell(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, Some(0), gpui::Modifiers::default(), cx);
+    });
+    cx.simulate_keystrokes("cmd-c");
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("2".to_string())
+        );
+    });
+}
+
+/// The key's sidebar field is drawn, not edited, so no caret can be put in
+/// it -- clicking it copies instead, or the key is the one value on the row
+/// nobody can take anywhere.
+#[gpui::test]
+fn the_key_field_in_the_sidebar_copies_itself(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(2, None, gpui::Modifiers::default(), cx);
+        view.copy_detail_field(0, cx);
+        assert_eq!(describe(&view.status), "info: Copied id");
+        assert_eq!(
+            view.copied_field,
+            Some(0),
+            "and the button that was pressed says so, since the status bar may \
+             be far below a scrolled sidebar"
+        );
+
+        // Moving to another row drops the mark: it belongs to the row it was
+        // taken from.
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        assert_eq!(view.copied_field, None);
+    });
+
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("3".to_string())
         );
     });
 }

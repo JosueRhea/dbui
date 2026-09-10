@@ -79,7 +79,7 @@ fn escape_cell(text: &str) -> String {
 
 /// NULL is the empty cell in TSV: a spreadsheet has no other way to say it,
 /// and the literal word would come back as the four-letter string.
-fn cell_text(value: &Value) -> String {
+pub(crate) fn cell_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         other => other.to_text(),

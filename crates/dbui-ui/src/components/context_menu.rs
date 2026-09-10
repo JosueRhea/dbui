@@ -41,6 +41,7 @@ pub enum MenuAction {
     ToggleSchema,
     Truncate,
     Drop,
+    CopyCell,
     CopyRowsTsv,
     CopyRowsJson,
     CopyRowsInsert,
@@ -144,6 +145,10 @@ fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
                 label: "Go to Referenced Row".into(),
             },
             MenuRow::Separator,
+            MenuRow::Item {
+                action: MenuAction::CopyCell,
+                label: "Copy Cell".into(),
+            },
             MenuRow::Item {
                 action: MenuAction::CopyRowsTsv,
                 label: RowFormat::Tsv.label().into(),
@@ -361,6 +366,9 @@ impl DbUi {
                 self.copy_to_clipboard(name.clone(), "Schema name copied", cx);
             }
             (_, MenuAction::RefreshCatalog) => self.refresh_catalog(cx),
+            (_, MenuAction::CopyCell) => {
+                self.copy_focused_cell(cx);
+            }
             (_, MenuAction::CopyRowsTsv) => self.copy_selected_rows(RowFormat::Tsv, cx),
             (_, MenuAction::CopyRowsJson) => self.copy_selected_rows(RowFormat::Json, cx),
             (_, MenuAction::CopyRowsInsert) => self.copy_selected_rows(RowFormat::Insert, cx),
