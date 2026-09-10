@@ -2286,6 +2286,13 @@ impl DbUi {
         // one of `results[active].rows` and `result` holds it; the caller
         // hands the old one back before asking for a new one.
         *result = results[index].rows.take();
+        // A result set aside while it was sorted keeps the order the user put
+        // it in, and the sort cleared above would then be a header saying
+        // nothing over rows that are plainly in some order. Put the
+        // statement's own back, so the two agree.
+        if let Some(view) = result.as_mut() {
+            view.restore_server_order();
+        }
     }
 
     /// Select a statement from the strip above the grid.
@@ -2798,7 +2805,10 @@ impl DbUi {
         }
         drag.last_x = x;
         self.tabs.reorder(from, index);
-        self.persist_session();
+        // Not persisted here: a drag crosses a slot at a time, and the
+        // session file is written whole and synchronously. The strip that
+        // matters is the one the pointer is let go over, so `end_tab_drag`
+        // writes it once.
         cx.notify();
     }
 
@@ -2811,6 +2821,10 @@ impl DbUi {
             if let Some(index) = self.tabs.items.iter().position(|tab| tab.id() == drag.id) {
                 self.activate_tab(index, cx);
             }
+            // Unconditionally, not by way of `activate_tab`: dragging the tab
+            // that was already in front leaves it there, and that early
+            // return would take the new order down with it.
+            self.persist_session();
         }
         cx.notify();
     }
@@ -3337,7 +3351,8 @@ impl DbUi {
         {
             *column_order = view.order_names();
         }
-        self.persist_session();
+        // Written once on release rather than once a heading, for the reason
+        // in `drag_tab_over`.
         cx.notify();
     }
 
@@ -3358,6 +3373,8 @@ impl DbUi {
                 self.toggle_sort(&name, cx);
                 return;
             }
+        } else {
+            self.persist_session();
         }
         cx.notify();
     }

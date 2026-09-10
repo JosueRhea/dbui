@@ -2376,6 +2376,12 @@ fn picking_another_statement_starts_unsorted(cx: &mut TestAppContext) {
         view.select_statement_result(1, cx);
         assert!(view.active_sort().is_none());
         assert_eq!(grid_column(view, 0), vec!["0", "1", "2"]);
+
+        // And coming back to the one that was sorted: the header says
+        // nothing, so the rows must not still be wearing the old order.
+        view.select_statement_result(0, cx);
+        assert!(view.active_sort().is_none());
+        assert_eq!(grid_column(view, 0), vec!["0", "1", "2"]);
     });
 }
 

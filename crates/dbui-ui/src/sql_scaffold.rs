@@ -86,93 +86,6 @@ pub fn create_table(driver: Driver, table: &TableRef, columns: &[Column]) -> Str
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn column(name: &str, data_type: &str) -> Column {
-        Column {
-            name: name.to_string(),
-            data_type: data_type.to_string(),
-            nullable: true,
-            default: None,
-            is_primary_key: false,
-            ordinal: 0,
-            references: None,
-        }
-    }
-
-    #[test]
-    fn select_quotes_per_engine() {
-        let table = TableRef::new("public", "users");
-        assert!(select_statement(Driver::Postgres, &table).contains("\"public\".\"users\""));
-        assert!(select_statement(Driver::MySql, &table).contains("`public`.`users`"));
-    }
-
-    #[test]
-    fn insert_lists_every_column() {
-        let table = TableRef::new("public", "users");
-        let sql = insert_template(
-            Driver::Postgres,
-            &table,
-            &[column("id", "bigint"), column("email", "text")],
-        );
-        assert!(sql.contains("\"id\""));
-        assert!(sql.contains("\"email\""));
-        assert_eq!(sql.matches("NULL").count(), 2);
-    }
-
-    /// A table with no readable columns still produces something legal rather
-    /// than a statement with an empty column list.
-    #[test]
-    fn insert_with_no_columns_is_still_a_statement() {
-        let sql = insert_template(Driver::MySql, &TableRef::new("s", "t"), &[]);
-        assert_eq!(sql, "INSERT INTO `s`.`t` VALUES ();\n");
-    }
-
-    #[test]
-    fn create_table_carries_nullability_defaults_and_the_key() {
-        let mut id = column("id", "bigint");
-        id.nullable = false;
-        id.is_primary_key = true;
-        let mut created = column("created_at", "timestamptz");
-        created.default = Some("now()".into());
-
-        let sql = create_table(
-            Driver::Postgres,
-            &TableRef::new("public", "users"),
-            &[id, created],
-        );
-        assert!(sql.contains("\"id\" bigint NOT NULL"));
-        assert!(sql.contains("\"created_at\" timestamptz DEFAULT now()"));
-        assert!(sql.contains("PRIMARY KEY (\"id\")"));
-        assert!(
-            sql.starts_with("-- Columns only"),
-            "the approximation has to say so"
-        );
-    }
-
-    /// A composite key is one constraint naming both columns, not two.
-    #[test]
-    fn a_composite_key_is_one_clause() {
-        let mut a = column("tenant", "int");
-        a.is_primary_key = true;
-        let mut b = column("id", "int");
-        b.is_primary_key = true;
-        let sql = create_table(Driver::MySql, &TableRef::new("s", "t"), &[a, b]);
-        assert_eq!(sql.matches("PRIMARY KEY").count(), 1);
-        assert!(sql.contains("PRIMARY KEY (`tenant`, `id`)"));
-    }
-
-    /// The table name is pasted, not bound -- so it has to be quoted.
-    #[test]
-    fn a_hostile_name_cannot_break_out() {
-        let table = TableRef::new("public", "t\"; DROP DATABASE x; --");
-        let sql = select_statement(Driver::Postgres, &table);
-        assert!(sql.contains("\"t\"\"; DROP DATABASE x; --\""));
-    }
-}
-
 /// One ready-made statement offered from the templates palette.
 pub struct Template {
     /// What the palette lists it as.
@@ -298,4 +211,91 @@ pub fn templates(driver: Driver, table: Option<&TableRef>) -> Vec<Template> {
             ),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(name: &str, data_type: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: true,
+            default: None,
+            is_primary_key: false,
+            ordinal: 0,
+            references: None,
+        }
+    }
+
+    #[test]
+    fn select_quotes_per_engine() {
+        let table = TableRef::new("public", "users");
+        assert!(select_statement(Driver::Postgres, &table).contains("\"public\".\"users\""));
+        assert!(select_statement(Driver::MySql, &table).contains("`public`.`users`"));
+    }
+
+    #[test]
+    fn insert_lists_every_column() {
+        let table = TableRef::new("public", "users");
+        let sql = insert_template(
+            Driver::Postgres,
+            &table,
+            &[column("id", "bigint"), column("email", "text")],
+        );
+        assert!(sql.contains("\"id\""));
+        assert!(sql.contains("\"email\""));
+        assert_eq!(sql.matches("NULL").count(), 2);
+    }
+
+    /// A table with no readable columns still produces something legal rather
+    /// than a statement with an empty column list.
+    #[test]
+    fn insert_with_no_columns_is_still_a_statement() {
+        let sql = insert_template(Driver::MySql, &TableRef::new("s", "t"), &[]);
+        assert_eq!(sql, "INSERT INTO `s`.`t` VALUES ();\n");
+    }
+
+    #[test]
+    fn create_table_carries_nullability_defaults_and_the_key() {
+        let mut id = column("id", "bigint");
+        id.nullable = false;
+        id.is_primary_key = true;
+        let mut created = column("created_at", "timestamptz");
+        created.default = Some("now()".into());
+
+        let sql = create_table(
+            Driver::Postgres,
+            &TableRef::new("public", "users"),
+            &[id, created],
+        );
+        assert!(sql.contains("\"id\" bigint NOT NULL"));
+        assert!(sql.contains("\"created_at\" timestamptz DEFAULT now()"));
+        assert!(sql.contains("PRIMARY KEY (\"id\")"));
+        assert!(
+            sql.starts_with("-- Columns only"),
+            "the approximation has to say so"
+        );
+    }
+
+    /// A composite key is one constraint naming both columns, not two.
+    #[test]
+    fn a_composite_key_is_one_clause() {
+        let mut a = column("tenant", "int");
+        a.is_primary_key = true;
+        let mut b = column("id", "int");
+        b.is_primary_key = true;
+        let sql = create_table(Driver::MySql, &TableRef::new("s", "t"), &[a, b]);
+        assert_eq!(sql.matches("PRIMARY KEY").count(), 1);
+        assert!(sql.contains("PRIMARY KEY (`tenant`, `id`)"));
+    }
+
+    /// The table name is pasted, not bound -- so it has to be quoted.
+    #[test]
+    fn a_hostile_name_cannot_break_out() {
+        let table = TableRef::new("public", "t\"; DROP DATABASE x; --");
+        let sql = select_statement(Driver::Postgres, &table);
+        assert!(sql.contains("\"t\"\"; DROP DATABASE x; --\""));
+    }
 }

@@ -56,12 +56,13 @@ impl DbUi {
             "changes"
         };
         let title = format!("Discard {} staged {plural}?", guard.changes);
-        // A group close is several tabs, and the singular sentence would name
-        // them as one thing the user never opened.
+        // A group close is counted rather than named, and the singular
+        // sentence would quote that count as if it were a tab the user
+        // opened. Phrased without a verb to agree, because "Close Others"
+        // over two open tabs is a group of one.
         let body = if matches!(guard.target, CloseTarget::TabGroup(_)) {
             format!(
-                "{} have work that has not been committed. Closing them throws \
-                 the whole batch away.",
+                "Closing {} throws away work that has not been committed.",
                 guard.label
             )
         } else {

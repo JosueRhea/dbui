@@ -51,6 +51,8 @@ pub enum Value {
 /// `NULL` sorts last ascending and first descending, the way Postgres orders
 /// it by default -- descending is the exact reverse of ascending, which is
 /// what makes a second click on a header mean what it looks like it means.
+/// `NaN` sorts above every other number and below `NULL`, which is also what
+/// Postgres does with it.
 ///
 /// Mixed types in one column are possible (a `json` column, a union in a
 /// query) so kinds that cannot be compared to each other fall back to a fixed
@@ -70,7 +72,14 @@ pub fn compare(left: &Value, right: &Value) -> Ordering {
             .find(|order| *order != Ordering::Equal)
             .unwrap_or_else(|| a.len().cmp(&b.len())),
         _ => match (as_number(left), as_number(right)) {
-            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            // `partial_cmp` declines only when one side is NaN, and answering
+            // "equal" there would make NaN equal to every number while the
+            // numbers stay ordered among themselves -- not a total order, and
+            // a sort over it comes out shuffled rather than sorted. Postgres
+            // ranks NaN above every other float, so do that.
+            (Some(a), Some(b)) => a
+                .partial_cmp(&b)
+                .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan())),
             _ => match sort_rank(left).cmp(&sort_rank(right)) {
                 Ordering::Equal => left.to_text().cmp(&right.to_text()),
                 order => order,
@@ -443,6 +452,31 @@ mod prototype_tests {
 
         values.sort_by(|a, b| compare(a, b).reverse());
         assert_eq!(values, vec![Value::Null, Value::Int(2), Value::Int(1)]);
+    }
+
+    /// A `float8` column can hold `'NaN'`, and a comparator that calls it
+    /// equal to every number is not a total order -- sorting one used to come
+    /// out shuffled, integers and all.
+    #[test]
+    fn nan_sorts_above_the_numbers_rather_than_equal_to_them() {
+        let mut values = vec![
+            Value::Float(2.),
+            Value::Float(f64::NAN),
+            Value::Int(1),
+            Value::Null,
+            Value::Int(3),
+        ];
+        values.sort_by(compare);
+        assert_eq!(
+            values[..3],
+            [Value::Int(1), Value::Float(2.), Value::Int(3)],
+            "the real numbers stay in order"
+        );
+        assert!(
+            matches!(values[3], Value::Float(f) if f.is_nan()),
+            "then NaN"
+        );
+        assert_eq!(values[4], Value::Null, "and NULL is still last");
     }
 
     /// `DEFAULT` is an absence like `NULL`, and sorts with it.
