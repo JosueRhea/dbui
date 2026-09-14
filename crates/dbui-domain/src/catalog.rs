@@ -163,6 +163,75 @@ mod tests {
         assert_eq!(table.quoted(Driver::MySql), "`users`");
     }
 
+    fn table(schema: &str, name: &str, kind: TableKind) -> Table {
+        Table {
+            schema: schema.into(),
+            name: name.into(),
+            kind,
+        }
+    }
+
+    fn catalog() -> Catalog {
+        Catalog {
+            schemas: vec![
+                Schema {
+                    name: "public".into(),
+                    tables: vec![
+                        table("public", "users", TableKind::Table),
+                        table("public", "active_users", TableKind::View),
+                    ],
+                },
+                Schema {
+                    name: "audit".into(),
+                    tables: vec![table("audit", "users", TableKind::Table)],
+                },
+            ],
+        }
+    }
+
+    /// A lookup is by schema *and* name: two schemas holding a table of the
+    /// same name is ordinary, and answering with the wrong one would show the
+    /// wrong rows.
+    #[test]
+    fn a_lookup_does_not_confuse_two_schemas() {
+        let catalog = catalog();
+
+        let found = catalog
+            .find(&TableRef::new("audit", "users"))
+            .expect("the audit table");
+        assert_eq!(found.schema, "audit");
+
+        assert_eq!(catalog.table_count(), 3, "views count too");
+        assert!(catalog.find(&TableRef::new("public", "missing")).is_none());
+        assert!(
+            catalog.find(&TableRef::new("nope", "users")).is_none(),
+            "an unknown schema has no tables at all"
+        );
+        assert_eq!(Catalog::default().table_count(), 0);
+    }
+
+    /// The reference a table hands out is what every query for its contents is
+    /// built from, so it has to carry the schema the table was listed under.
+    #[test]
+    fn a_table_refers_to_itself_by_schema_and_name() {
+        let table = table("audit", "users", TableKind::Table);
+        assert_eq!(table.reference(), TableRef::new("audit", "users"));
+        assert_eq!(table.reference().qualified(), "audit.users");
+    }
+
+    /// "View" here means "has no rows of its own to edit", which is what the UI
+    /// greys the row actions out on -- a materialised view is one of those.
+    #[test]
+    fn everything_but_a_table_counts_as_a_view() {
+        assert!(!TableKind::Table.is_view());
+        assert!(TableKind::View.is_view());
+        assert!(TableKind::MaterializedView.is_view());
+
+        assert_eq!(TableKind::Table.label(), "table");
+        assert_eq!(TableKind::View.label(), "view");
+        assert_eq!(TableKind::MaterializedView.label(), "materialized view");
+    }
+
     #[test]
     fn a_hostile_table_name_cannot_escape_its_quotes() {
         let table = TableRef::new("public", "users\"; DROP TABLE users; --");

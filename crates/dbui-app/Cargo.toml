@@ -37,3 +37,6 @@ keyring = { version = "3", default-features = false, features = [
 [dev-dependencies]
 # The updater's live tests drive async code directly.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The use-case tests stand a fake driver in for a server, which means
+# implementing the port's async trait.
+async-trait = { workspace = true }
