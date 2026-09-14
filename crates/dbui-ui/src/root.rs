@@ -2645,6 +2645,15 @@ impl DbUi {
                 });
                 pending_edits.retain(|edit| !keys.iter().any(|pk| edit.matches_pk(pk)));
                 pending_edits.extend(edits);
+                // A stash that worked answers whatever the last one complained
+                // about. Leaving the complaint up would strand it under a
+                // draft that has since been fixed -- and `draft_error` would
+                // go on refusing a commit on the strength of it.
+                if let Some(draft) = draft.as_mut() {
+                    if draft.message.as_ref().is_some_and(|(ok, _)| !ok) {
+                        draft.message = None;
+                    }
+                }
             }
             Err(message) => {
                 if let Some(draft) = draft.as_mut() {
@@ -2652,6 +2661,28 @@ impl DbUi {
                 }
                 cx.notify();
             }
+        }
+    }
+
+    /// What the open draft is refusing to stage, if anything.
+    ///
+    /// [`stash_current_draft`] can only report into the sidebar, which is a
+    /// small red line the eye slides off -- and on a table with no primary key
+    /// it is the *only* sign that typing into a field led nowhere. ⌘S reads it
+    /// back so the refusal is stated where the user is looking when they ask
+    /// for the commit.
+    ///
+    /// [`stash_current_draft`]: DbUi::stash_current_draft
+    fn draft_error(&self) -> Option<String> {
+        let draft = match self.tabs.active() {
+            Some(WorkspaceTab::Table { draft, .. }) | Some(WorkspaceTab::Sql { draft, .. }) => {
+                draft.as_ref()?
+            }
+            None => return None,
+        };
+        match draft.message.as_ref() {
+            Some((false, message)) => Some(message.clone()),
+            _ => None,
         }
     }
 
@@ -4132,6 +4163,12 @@ impl DbUi {
             self.tabs.active(),
             Some(WorkspaceTab::Table { saving: true, .. })
         ) {
+            // Pressing ⌘S again while the first batch is still in flight is
+            // what someone does when the first press looked like it did
+            // nothing. Saying the commit is already running is the answer to
+            // that; a second silent return is what taught them to doubt it.
+            self.status = Status::info("Already committing — one moment");
+            cx.notify();
             return;
         }
 
@@ -4141,6 +4178,17 @@ impl DbUi {
         // an edit silently goes missing.
         self.finish_cell_edit(cx);
         self.stash_current_draft(cx);
+
+        // A draft that would not stage stops the commit here, and says why.
+        // Otherwise the batch it was left out of reads as empty, and ⌘S
+        // answers "no changes to commit" to a screen full of typing -- which
+        // is how a table with no primary key came to look like a broken key
+        // rather than a table that cannot be edited.
+        if let Some(message) = self.draft_error() {
+            self.status = Status::error(format!("Cannot commit — {message}"));
+            cx.notify();
+            return;
+        }
 
         // The staged inserts are turned into values here rather than later:
         // a row that will not parse has to stop the commit before anything is
@@ -4175,7 +4223,11 @@ impl DbUi {
                 cx.notify();
                 return;
             }
-            None => return,
+            None => {
+                self.status = Status::info("No tab open to commit");
+                cx.notify();
+                return;
+            }
         };
 
         if edits.is_empty() && deletes.is_empty() && inserts.is_empty() {
