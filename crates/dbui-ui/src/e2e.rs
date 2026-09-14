@@ -8,9 +8,18 @@
 //! could have caught: the app drew perfectly and every shortcut was dead,
 //! because focus set at construction was lost before the first key arrived.
 //!
-//! Nothing here touches a database. Anything that would need a server asserts
-//! the refusal instead, which is the behaviour worth pinning anyway. For tests
-//! against real servers see `crates/dbui-driver/tests/live.rs`.
+//! Most of these touch no database: anything that would need a server asserts
+//! the refusal instead, which is the behaviour worth pinning anyway. The rest
+//! come in two kinds. `open_connected` opens a real SQLite file -- the engine
+//! is linked in and the database is a temp file the test makes and deletes --
+//! which is what reaches the surfaces gated on a live connection. And at the
+//! bottom, behind `DBUI_LIVE_TESTS=1`, the same flows run against Postgres and
+//! MySQL, because a primary key that introspects differently or a value the
+//! server plans as the wrong type reaches the user as a dead ⌘S and shows up
+//! on no SQLite run.
+//!
+//! For the engines' own behaviour, under the UI, see
+//! `crates/dbui-driver/tests/live.rs`.
 
 use crate::root::{DbUi, Focus, Status};
 use crate::tabs::WorkspaceTab;
@@ -7370,4 +7379,356 @@ fn a_whole_session_from_connect_to_commit(cx: &mut TestAppContext) {
 
     // -- and all of it still draws ------------------------------------------
     draw_at_every_size(&view, cx);
+}
+
+/// The report: filter the rows, edit one of what is left, and ⌘S does not
+/// save it.
+#[gpui::test]
+fn an_edit_under_a_filter_commits_on_cmd_s(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "filter-commit");
+    let path = db.path.clone();
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    // ⌘F opens the filter strip over the open table; Enter applies it.
+    cx.simulate_keystrokes("cmd-f");
+    view.update(cx, |view, cx| {
+        match view.tabs.active_mut() {
+            Some(WorkspaceTab::Table { where_draft, .. }) => where_draft.set_text("name = 'Grace'"),
+            _ => panic!("a table tab"),
+        }
+        cx.notify();
+    });
+    cx.simulate_keystrokes("enter");
+    settle_column(&view, cx, 1, &["Grace"]);
+
+    // Edit the one row the filter left standing.
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Grace Hopper");
+        view.finish_cell_edit(cx);
+        assert_eq!(view.collect_batch_edits().len(), 1, "the edit is staged");
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| view.collect_batch_edits().is_empty());
+
+    let after = read_back(&path, "SELECT name FROM members ORDER BY id");
+    assert_eq!(
+        after,
+        vec![vec!["Ada".to_string()], vec!["Grace Hopper".to_string()]],
+        "the commit reached the database, not just the grid"
+    );
+}
+
+/// A table dbui cannot key cannot be edited -- and ⌘S has to say so.
+///
+/// The report was "⌘S doesn't work". What happened was that every field
+/// accepted typing, nothing was staged, and the commit answered "no changes to
+/// commit" to a sidebar full of edits: `row_pk` had refused the row, and its
+/// refusal only ever reached a red line in the sidebar.
+#[gpui::test]
+fn committing_a_table_with_no_primary_key_says_why(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "keyless");
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("CREATE TABLE notes (body TEXT, team TEXT)", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|tab| tab.error()).is_none()
+    });
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("INSERT INTO notes VALUES ('one','core'), ('two','ops')", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|tab| tab.error()).is_none()
+    });
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "notes"), cx);
+    });
+    settle_rows(&view, cx);
+
+    // Filtered, because that is the state the report arrived in.
+    cx.simulate_keystrokes("cmd-f");
+    view.update(cx, |view, cx| {
+        match view.tabs.active_mut() {
+            Some(WorkspaceTab::Table { where_draft, .. }) => where_draft.set_text("team = 'core'"),
+            _ => panic!("a table tab"),
+        }
+        cx.notify();
+    });
+    cx.simulate_keystrokes("enter");
+    settle_column(&view, cx, 0, &["one"]);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 0, cx);
+        view.cell_editor.set_text("EDITED");
+        view.finish_cell_edit(cx);
+    });
+    cx.simulate_keystrokes("cmd-s");
+
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(
+            said.contains("primary key"),
+            "it names the reason the row cannot be written: {said}"
+        );
+        assert!(
+            !said.contains("No changes to commit"),
+            "and does not report the typing as nothing: {said}"
+        );
+    });
+}
+
+/// ⌘S pressed again while the first batch is still in flight used to return
+/// without a word -- which is exactly the press someone makes when the first
+/// one looked like it did nothing.
+#[gpui::test]
+fn committing_while_a_commit_is_in_flight_says_so(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        match view.tabs.active_mut() {
+            Some(WorkspaceTab::Table { saving, .. }) => *saving = true,
+            _ => panic!("a table tab"),
+        }
+        view.save_pending_edits(cx);
+
+        let said = describe(&view.status);
+        assert!(said.contains("Already committing"), "got: {said}");
+    });
+}
+
+/// The guard above must not outlive what it was complaining about: a draft
+/// that has since staged cleanly commits, rather than being refused forever on
+/// the strength of an old message.
+#[gpui::test]
+fn a_stale_draft_complaint_does_not_block_the_next_commit(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(0, None, gpui::Modifiers::default(), cx);
+        // A complaint left over from an earlier draft.
+        match view.tabs.active_mut() {
+            Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            }) => draft.message = Some((false, "something older".into())),
+            _ => panic!("a draft"),
+        }
+        type_into_draft(view, 1, "renamed");
+        view.save_pending_edits(cx);
+
+        let said = describe(&view.status);
+        assert!(
+            !said.contains("something older"),
+            "the stale complaint was cleared by a stash that worked: {said}"
+        );
+    });
+}
+
+// -- the reported flow, against real servers -------------------------------
+//
+// Everything above that needs rows uses SQLite, because SQLite is a file and
+// every checkout has one. That is also its limit: a primary key that
+// introspects differently, or a bound value the server plans as the wrong
+// type, reaches the user as "⌘S did nothing" and shows up on no SQLite run.
+// `crates/dbui-driver/tests/live.rs` proves those per engine; what it cannot
+// prove is the whole path above them -- filter strip, draft, batch, commit --
+// which is what these drive, once per server.
+//
+// Opt-in behind DBUI_LIVE_TESTS=1, like the driver's live tests: a checkout
+// with no servers stays green, and with the flag set an unreachable server
+// fails rather than quietly skipping.
+
+fn live_tests_requested() -> bool {
+    std::env::var("DBUI_LIVE_TESTS").is_ok_and(|value| !value.is_empty())
+}
+
+fn live_config(driver: Driver, name: &str) -> ConnectionConfig {
+    let prefix = match driver {
+        Driver::Postgres => "DBUI_PG",
+        Driver::MySql => "DBUI_MYSQL",
+        Driver::Sqlite => unreachable!("SQLite needs no server"),
+    };
+    let env_or = |key: &str, fallback: &str| {
+        std::env::var(format!("{prefix}_{key}")).unwrap_or_else(|_| fallback.to_string())
+    };
+    let mut config = ConnectionConfig::new(driver);
+    config.name = name.to_string();
+    config.host = env_or("HOST", "127.0.0.1");
+    // The compose file's ports, deliberately not the engines' defaults.
+    config.port = env_or(
+        "PORT",
+        match driver {
+            Driver::Postgres => "55432",
+            _ => "53306",
+        },
+    )
+    .parse()
+    .expect("a numeric port");
+    config.username = env_or(
+        "USER",
+        match driver {
+            Driver::Postgres => "postgres",
+            _ => "root",
+        },
+    );
+    config.password = env_or("PASSWORD", "dbui");
+    config.database = env_or("DATABASE", "dbui_test");
+    config.tls = dbui_app::domain::TlsMode::Disable;
+    config
+}
+
+/// Run `sql` on the live server, out of band from the window.
+fn live_exec(driver: Driver, sql: &str) -> Vec<Vec<String>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let config = live_config(driver, "out-of-band");
+    runtime.block_on(async {
+        let db = dbui_app::connect_driver(&config)
+            .await
+            .expect("the live server has to be reachable when DBUI_LIVE_TESTS is set");
+        let result = db.execute(sql).await.expect("the statement to be accepted");
+        let rows = match result.outcome {
+            dbui_app::domain::QueryOutcome::Rows(set) => set
+                .rows
+                .iter()
+                .map(|row| row.0.iter().map(|value| value.to_text()).collect())
+                .collect(),
+            _ => Vec::new(),
+        };
+        db.close().await;
+        rows
+    })
+}
+
+/// The whole reported flow: filter the rows, edit one of what is left, ⌘S --
+/// then ask the server, on a connection of its own, whether it landed.
+fn filtered_edit_commits_live(cx: &mut TestAppContext, driver: Driver) {
+    const TABLE: &str = "dbui_ui_filter_commit";
+
+    // The schema a table is addressed by: Postgres has `public`, MySQL calls
+    // the database itself the schema.
+    let schema = match driver {
+        Driver::Postgres => "public".to_string(),
+        _ => live_config(driver, "probe").database.clone(),
+    };
+    let key = match driver {
+        Driver::Postgres => "id bigserial PRIMARY KEY",
+        _ => "id BIGINT AUTO_INCREMENT PRIMARY KEY",
+    };
+
+    live_exec(driver, &format!("DROP TABLE IF EXISTS {TABLE}"));
+    live_exec(
+        driver,
+        &format!("CREATE TABLE {TABLE} ({key}, name varchar(64) NOT NULL, team varchar(64))"),
+    );
+    live_exec(
+        driver,
+        &format!(
+            "INSERT INTO {TABLE} (name, team)
+             VALUES ('Ada','core'), ('Grace','ops'), ('Linus','core')"
+        ),
+    );
+
+    let (view, cx) = open_with(
+        cx,
+        Workspace::from_configs(vec![live_config(driver, "live")]),
+    );
+    view.update(cx, |view, cx| {
+        let id = view.workspace.entries()[0].id();
+        view.connect(id, cx);
+    });
+    settle(&view, cx, |view| {
+        view.workspace
+            .active()
+            .is_some_and(|entry| entry.status.is_connected())
+    });
+    view.update(cx, |view, _| {
+        assert!(
+            view.workspace
+                .active()
+                .is_some_and(|entry| entry.status.is_connected()),
+            "the {driver} server should have connected"
+        );
+    });
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new(&schema, TABLE), cx);
+    });
+    settle_rows(&view, cx);
+
+    // ⌘F, a WHERE, Enter -- the filter the report arrived with.
+    cx.simulate_keystrokes("cmd-f");
+    view.update(cx, |view, cx| {
+        match view.tabs.active_mut() {
+            Some(WorkspaceTab::Table { where_draft, .. }) => where_draft.set_text("team = 'ops'"),
+            _ => panic!("a table tab"),
+        }
+        cx.notify();
+    });
+    cx.simulate_keystrokes("enter");
+    settle_column(&view, cx, 1, &["Grace"]);
+
+    // Edit the one row the filter left, exactly as a double-click would.
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Grace Hopper");
+        view.finish_cell_edit(cx);
+        assert_eq!(
+            view.collect_batch_edits().len(),
+            1,
+            "the edit staged against a live primary key on {driver}: {}",
+            describe(&view.status)
+        );
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| view.collect_batch_edits().is_empty());
+
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(
+            !said.contains("Cannot commit") && !said.contains("No changes"),
+            "⌘S was accepted on {driver}: {said}"
+        );
+    });
+
+    let after = live_exec(driver, &format!("SELECT name FROM {TABLE} ORDER BY id"));
+    assert_eq!(
+        after,
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Grace Hopper".to_string()],
+            vec!["Linus".to_string()],
+        ],
+        "the commit under a filter reached {driver}, not just the grid"
+    );
+
+    live_exec(driver, &format!("DROP TABLE IF EXISTS {TABLE}"));
+}
+
+#[gpui::test]
+fn an_edit_under_a_filter_commits_against_postgres(cx: &mut TestAppContext) {
+    if !live_tests_requested() {
+        return;
+    }
+    filtered_edit_commits_live(cx, Driver::Postgres);
+}
+
+#[gpui::test]
+fn an_edit_under_a_filter_commits_against_mysql(cx: &mut TestAppContext) {
+    if !live_tests_requested() {
+        return;
+    }
+    filtered_edit_commits_live(cx, Driver::MySql);
 }
