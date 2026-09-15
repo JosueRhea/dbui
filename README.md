@@ -20,13 +20,13 @@ transaction; `⌘Z` throws it away. With several rows selected, the panel on the
 edits all of them at once — `MIXED` marks a column they disagree on, and a field left
 reading `MIXED` is written to nobody.
 
-![Three rows struck through and staged for deletion beside an edited cell, with the change list open showing "status: shipped to fulfilled" and three DELETE ROW entries](docs/screenshots/changes.png)
+![Rows struck through and staged for deletion in the grid, with the staged-changes table open underneath listing each one by row, column, old value and new](docs/screenshots/changes.png)
 
 **SQL, with the catalog behind it.** `⌘↵` runs the statement under the caret, `⌘⇧↵`
 runs every statement in the buffer, and `⌃Space` completes against the schemas, tables
 and columns the connection actually has. Results land in the same typed grid, timed.
 
-![The SQL editor with a highlighted GROUP BY query above its result grid, reporting 10 rows in 5 ms](docs/screenshots/query.png)
+![The SQL editor with a highlighted GROUP BY query above its result grid, reporting the rows it returned and how long it took](docs/screenshots/query.png)
 
 ## Install
 

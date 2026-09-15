@@ -1,4 +1,7 @@
-//! The center column: tab bar, filters, content, and bottom bar.
+//! The center column: toolbar, filters, and content.
+//!
+//! The tab strip that used to head this column now lives in the titlebar;
+//! what is left starts with the toolbar that decides what the content shows.
 
 use super::{button, caption, scrollbar};
 use crate::highlight;
@@ -25,11 +28,10 @@ impl DbUi {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(self.render_tab_bar(cx))
+            .child(self.render_toolbar(cx))
             .child(self.render_filter_strip(cx))
             .child(self.render_columns_panel(cx))
             .child(self.render_tab_content(window, cx))
-            .child(self.render_bottom_bar(cx))
     }
 
     fn render_columns_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {

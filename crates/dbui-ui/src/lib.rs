@@ -4,6 +4,7 @@
 //! `dbui-app` holds, and turns clicks and keys back into use cases. GPUI stops
 //! here -- nothing underneath it knows a window exists.
 
+mod clock;
 mod components;
 mod highlight;
 mod json_format;
@@ -129,6 +130,10 @@ pub fn run() {
             })
         })
         .expect("failed to open window");
+
+        // Only now: there is no window to set it on before this.
+        #[cfg(target_os = "macos")]
+        mac_window::disable_native_window_drag();
     });
 }
 

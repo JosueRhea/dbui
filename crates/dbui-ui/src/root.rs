@@ -347,6 +347,12 @@ pub struct DbUi {
     pub(crate) modal: Option<ConnectionForm>,
     /// Titlebar connection switcher dropdown.
     pub(crate) connection_picker_open: bool,
+    /// Titlebar gear dropdown: the app's own settings.
+    pub(crate) settings_menu_open: bool,
+    /// The detail panel's overflow (`⋮`) menu.
+    pub(crate) detail_menu_open: bool,
+    /// The rows-per-page preset dropdown in the toolbar.
+    pub(crate) page_size_menu_open: bool,
     /// ⌘P / ⌘⇧P overlay; owns keys while open.
     pub(crate) palette: Option<Palette>,
     /// Arrow-key cursor in the sidebar list.
@@ -364,6 +370,15 @@ pub struct DbUi {
     /// Schema tree width, in unzoomed pixels -- so a rail the user has
     /// resized still scales with ⌘+ like everything else.
     pub(crate) sidebar_width: f32,
+    /// A press is on the titlebar's drag strip and the window is following the
+    /// pointer.
+    ///
+    /// State here rather than a cell owned by the titlebar's own element:
+    /// `render_titlebar` runs every frame and would hand each one a fresh cell,
+    /// so a flag set on mouse-down was gone by the next repaint. That went
+    /// unnoticed while the move handler only had to fire once -- it used to
+    /// hand off to AppKit, which then ran the drag itself.
+    pub(crate) titlebar_drag: bool,
     /// Live drag for the left rail: `(pointer x, width)` at the grab.
     pub(crate) sidebar_drag: Option<(Pixels, f32)>,
     /// Row detail panel width, in unzoomed pixels.
@@ -437,6 +452,10 @@ pub struct DbUi {
     pub(crate) structure_scroll: ScrollHandle,
     pub(crate) completion_scroll: ScrollHandle,
     pub(crate) picker_scroll: ScrollHandle,
+    /// The workspace tab strip. Tracked so the strip's painted bounds can be
+    /// read back -- a tab is dragged with the pointer, and where the strip
+    /// ended up is the only way to say where its tabs are.
+    pub(crate) tab_strip_scroll: ScrollHandle,
     pub(crate) change_bubble_scroll: ScrollHandle,
     /// Test-only: see `persist_session`.
     #[cfg(test)]
@@ -572,11 +591,15 @@ impl DbUi {
             copied_field: None,
             modal: None,
             connection_picker_open: false,
+            settings_menu_open: false,
+            detail_menu_open: false,
+            page_size_menu_open: false,
             palette: None,
             sidebar_cursor: None,
             theme_prev: None,
             update: crate::update::UpdateState::default(),
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
+            titlebar_drag: false,
             sidebar_drag: None,
             detail_width: DETAIL_WIDTH_DEFAULT,
             detail_drag: None,
@@ -606,6 +629,7 @@ impl DbUi {
             structure_scroll: ScrollHandle::new(),
             completion_scroll: ScrollHandle::new(),
             picker_scroll: ScrollHandle::new(),
+            tab_strip_scroll: ScrollHandle::new(),
             change_bubble_scroll: ScrollHandle::new(),
             #[cfg(test)]
             session_writes: std::cell::Cell::new(0),
@@ -2515,6 +2539,40 @@ impl DbUi {
         self.load_active_table(cx);
     }
 
+    /// Set rows-per-page from the preset dropdown.
+    ///
+    /// Writes the draft first and then goes through [`Self::apply_page_size`]
+    /// rather than setting `page.limit` directly: the field and the page have
+    /// to agree afterwards, and a preset that moved the page without moving
+    /// the number beside it would leave the box lying about what was loaded.
+    pub(crate) fn set_page_size(&mut self, limit: u32, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Table {
+            page_size_draft, ..
+        }) = self.tabs.active_mut()
+        else {
+            return;
+        };
+        *page_size_draft = crate::text_input::TextInput::with_text(limit.to_string(), false);
+        self.apply_page_size(cx);
+    }
+
+    /// `(page number, page count)` for the table on screen, both 1-based.
+    ///
+    /// `None` for a SQL result, and for a table whose total the engine would
+    /// not give up: a page number without a count is half a fact, and "Page 2
+    /// of ?" is not worth the width.
+    pub(crate) fn page_position(&self) -> Option<(u64, u64)> {
+        let view = self.tabs.active()?.result()?;
+        let ResultSource::Table {
+            page, total_rows, ..
+        } = &view.source
+        else {
+            return None;
+        };
+        let total = u64::try_from((*total_rows)?).ok()?;
+        Some(page_position_of(page.offset, page.limit, total))
+    }
+
     pub(crate) fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
         // Stash the current dirty draft into the batch before switching.
         self.stash_current_draft(cx);
@@ -2866,6 +2924,34 @@ impl DbUi {
     }
 
     // -- dragging a tab along the strip -------------------------------------
+
+    /// Start moving the window from the titlebar's drag strip.
+    ///
+    /// macOS only in effect: everywhere else the platform still owns window
+    /// movement and there is nothing for us to track. See `mac_window`.
+    pub(crate) fn begin_titlebar_drag(&mut self) {
+        self.titlebar_drag = true;
+        #[cfg(target_os = "macos")]
+        crate::mac_window::begin_window_drag();
+    }
+
+    /// The pointer has moved with the titlebar in hand.
+    ///
+    /// No `notify`: the window moves at the window-server level, and nothing
+    /// this view draws has changed.
+    pub(crate) fn drag_titlebar(&mut self) {
+        if !self.titlebar_drag {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        crate::mac_window::drag_window();
+    }
+
+    pub(crate) fn end_titlebar_drag(&mut self) {
+        self.titlebar_drag = false;
+        #[cfg(target_os = "macos")]
+        crate::mac_window::end_window_drag();
+    }
 
     pub(crate) fn begin_tab_drag(&mut self, id: crate::tabs::TabId, x: Pixels) {
         self.tab_drag = Some(TabDrag {
@@ -4497,8 +4583,65 @@ impl DbUi {
     }
 
     pub(crate) fn toggle_connection_picker(&mut self, cx: &mut Context<Self>) {
-        self.connection_picker_open = !self.connection_picker_open;
+        let open = !self.connection_picker_open;
+        self.close_chrome_menus();
+        self.connection_picker_open = open;
         cx.notify();
+    }
+
+    /// Shut every titlebar/toolbar dropdown.
+    ///
+    /// They are drawn `deferred` and dismissed on a press outside themselves,
+    /// so two open at once would both be floating over the window with only
+    /// one of them under the pointer. Opening any one therefore closes the
+    /// rest rather than trusting each to notice the other.
+    pub(crate) fn close_chrome_menus(&mut self) {
+        self.connection_picker_open = false;
+        self.settings_menu_open = false;
+        self.detail_menu_open = false;
+        self.page_size_menu_open = false;
+    }
+
+    pub(crate) fn toggle_settings_menu(&mut self, cx: &mut Context<Self>) {
+        let open = !self.settings_menu_open;
+        self.close_chrome_menus();
+        self.settings_menu_open = open;
+        cx.notify();
+    }
+
+    pub(crate) fn close_settings_menu(&mut self, cx: &mut Context<Self>) {
+        if self.settings_menu_open {
+            self.settings_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_detail_menu(&mut self, cx: &mut Context<Self>) {
+        let open = !self.detail_menu_open;
+        self.close_chrome_menus();
+        self.detail_menu_open = open;
+        cx.notify();
+    }
+
+    pub(crate) fn close_detail_menu(&mut self, cx: &mut Context<Self>) {
+        if self.detail_menu_open {
+            self.detail_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_page_size_menu(&mut self, cx: &mut Context<Self>) {
+        let open = !self.page_size_menu_open;
+        self.close_chrome_menus();
+        self.page_size_menu_open = open;
+        cx.notify();
+    }
+
+    pub(crate) fn close_page_size_menu(&mut self, cx: &mut Context<Self>) {
+        if self.page_size_menu_open {
+            self.page_size_menu_open = false;
+            cx.notify();
+        }
     }
 
     pub(crate) fn close_connection_picker(&mut self, cx: &mut Context<Self>) {
@@ -4801,9 +4944,17 @@ impl DbUi {
             return;
         }
 
-        if self.connection_picker_open {
+        // A dropdown owns the keyboard while it is up, the same way the modal
+        // above does -- otherwise Escape reaches past it and closes the tab
+        // behind the menu the user was trying to dismiss.
+        if self.connection_picker_open
+            || self.settings_menu_open
+            || self.detail_menu_open
+            || self.page_size_menu_open
+        {
             if key == "escape" {
-                self.close_connection_picker(cx);
+                self.close_chrome_menus();
+                cx.notify();
             }
             return;
         }
@@ -5309,6 +5460,45 @@ impl DbUi {
         }
     }
 
+    /// Put a computed literal into a detail field, as though it were typed.
+    ///
+    /// The calendar button's "now" and "today" need this: they are values, not
+    /// write tokens, so they go through the same path a keystroke would rather
+    /// than through [`Self::set_detail_special_value`], which exists to say
+    /// "this column has no value" in three different ways.
+    pub(crate) fn set_detail_field_text(
+        &mut self,
+        index: usize,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let applied = match self.tabs.active_mut() {
+            Some(WorkspaceTab::Table {
+                draft: Some(draft), ..
+            })
+            | Some(WorkspaceTab::Sql {
+                draft: Some(draft), ..
+            }) => match draft.fields.get_mut(index) {
+                // The key is not editable here for the same reason it has no
+                // value menu: changing it is changing which row this is.
+                Some((_, _, true)) => false,
+                Some((_, input, false)) => {
+                    input.set_text(&text);
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        };
+
+        self.detail_value_menu = None;
+        if applied {
+            self.detail_input = Some(DetailInput::Field(index));
+            self.focus = Focus::Detail;
+        }
+        cx.notify();
+    }
+
     /// Apply a special write token (`NULL` / `EMPTY` / `DEFAULT`) to a detail field.
     pub(crate) fn set_detail_special_value(
         &mut self,
@@ -5380,6 +5570,19 @@ impl DbUi {
         pending_edits.retain(|edit| !edit.changes.is_empty());
         cx.notify();
     }
+}
+
+/// `(page number, page count)` from an offset, a page size and a total.
+///
+/// Both 1-based, and the number is clamped into the count: an offset past the
+/// end -- which is what a page held open while rows were deleted under it looks
+/// like -- would otherwise report "page 4 of 3".
+fn page_position_of(offset: u64, limit: u32, total: u64) -> (u64, u64) {
+    let limit = u64::from(limit.max(1));
+    // A table with no rows still has one page: the one being looked at.
+    let pages = total.div_ceil(limit).max(1);
+    let current = (offset / limit) + 1;
+    (current.min(pages), pages)
 }
 
 fn draft_is_open(tab: &WorkspaceTab) -> bool {
@@ -5455,7 +5658,8 @@ impl Render for DbUi {
             // The pointer leaves the 5px grab strip on the first frame of a
             // drag, so the tracking lives on the root instead.
             .when(
-                self.change_bubble_drag.is_some()
+                self.titlebar_drag
+                    || self.change_bubble_drag.is_some()
                     || self.editor_drag.is_some()
                     || self.row_drag.is_some()
                     || self.column_drag.is_some()
@@ -5465,6 +5669,7 @@ impl Render for DbUi {
                     || self.detail_drag.is_some(),
                 |root| {
                     root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        this.drag_titlebar();
                         if this.change_bubble_drag.is_some() {
                             this.drag_change_bubble(event.position.y, window, cx);
                         }
@@ -5484,6 +5689,7 @@ impl Render for DbUi {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                            this.end_titlebar_drag();
                             this.end_change_bubble_drag(cx);
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
@@ -5500,6 +5706,7 @@ impl Render for DbUi {
                     .on_mouse_up_out(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                            this.end_titlebar_drag();
                             this.end_change_bubble_drag(cx);
                             this.end_editor_drag(cx);
                             this.end_row_drag(cx);
@@ -5646,6 +5853,34 @@ impl Render for DbUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status bar says "Page 2 of 3", so both halves have to survive a
+    /// total that does not divide by the page size.
+    #[test]
+    fn a_page_number_counts_from_one_and_a_partial_page_still_counts() {
+        assert_eq!(page_position_of(0, 500, 1400), (1, 3));
+        assert_eq!(page_position_of(500, 500, 1400), (2, 3));
+        assert_eq!(page_position_of(1000, 500, 1400), (3, 3));
+        assert_eq!(page_position_of(0, 500, 1000), (1, 2), "an exact fit");
+    }
+
+    /// An empty table is on page one of one, not page one of zero.
+    #[test]
+    fn an_empty_table_is_still_one_page() {
+        assert_eq!(page_position_of(0, 500, 0), (1, 1));
+    }
+
+    /// Rows deleted under a page held open leave the offset past the end.
+    #[test]
+    fn an_offset_past_the_end_reports_the_last_page_not_a_missing_one() {
+        assert_eq!(page_position_of(5_000, 500, 1400), (3, 3));
+    }
+
+    /// `limit` reaches this straight off the tab, and a zero would divide by it.
+    #[test]
+    fn a_zero_page_size_does_not_divide_by_zero() {
+        assert_eq!(page_position_of(0, 0, 10), (1, 10));
+    }
 
     /// A result over `names`, in the order given and with no rows.
     fn result_over(names: &[&str]) -> ResultView {

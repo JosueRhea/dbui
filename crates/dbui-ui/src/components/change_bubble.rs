@@ -1,4 +1,15 @@
-//! Floating batch-change bubble above the status bar.
+//! The staged-changes panel, above the status bar.
+//!
+//! Everything waiting for the next commit, as a table: one line per column
+//! that will be written, with the row it belongs to, what it says now and what
+//! it will say. The free-form diff this replaced read well for one edit and
+//! badly for forty -- the eye had nothing to run down, so checking that a bulk
+//! edit had touched only the column you meant meant reading every line. Four
+//! aligned columns make that one glance.
+//!
+//! A value that gained or lost lines still gets its line diff, drawn under the
+//! row it belongs to: "3 lines became 4" is not something a before/after pair
+//! on one line can say.
 
 use super::button;
 use crate::root::DbUi;
@@ -7,14 +18,19 @@ use crate::text_diff::{line_diff, DiffLine};
 use crate::theme::{metrics, Theme};
 use gpui::{div, prelude::*, px, AnyElement, Context, MouseButton, MouseDownEvent, SharedString};
 
-/// A one-line before/after has to fit beside its column name, and a diff line
-/// has to fit the bubble. Past this the tail is dropped -- the bubble is a
-/// summary, and the detail sidebar holds the full value.
+/// A one-line before/after has to fit its cell, and a diff line has to fit the
+/// panel. Past this the tail is dropped -- the panel is a summary, and the
+/// detail sidebar holds the full value.
 const MAX_LINE_CHARS: usize = 120;
 
-/// Enough to show a small edit in full without the bubble swallowing the
+/// Enough to show a small edit in full without the panel swallowing the
 /// window. A larger change says how much more there is.
 const MAX_DIFF_LINES: usize = 12;
+
+/// Width of the `Row` and `Column` cells. Fixed rather than proportional: they
+/// hold identifiers, which are short and roughly all the same length, while
+/// the values beside them are whatever the data is.
+const KEY_CELL_WIDTH: f32 = 150.;
 
 impl DbUi {
     pub(crate) fn render_change_bubble(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -116,13 +132,15 @@ impl DbUi {
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _window, cx| this.toggle_change_bubble(cx)))
                         .child(div().text_color(theme.text_muted).child(if expanded {
-                            "▾"
+                            "⌄"
                         } else {
-                            "▸"
+                            "›"
                         }))
+                        .child(div().text_color(theme.text).child("Staged changes"))
                         .child(
                             div()
-                                .text_color(theme.text)
+                                .text_size(metrics::text_size_small())
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(label)),
                         ),
                 )
@@ -131,35 +149,50 @@ impl DbUi {
         );
 
         if expanded {
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for label in &inserts {
+                rows.push(render_insert_row(label, theme));
+            }
+            for edit in &batch {
+                rows.extend(render_edit_rows(edit, theme));
+            }
+            for row in &deletes {
+                rows.push(render_delete_row(row, theme));
+            }
+
             bubble = bubble.child(
                 div()
                     .relative()
                     .w_full()
                     .min_w(px(0.))
+                    .flex()
+                    .flex_col()
                     .h(self.change_bubble_height)
                     .border_t_1()
                     .border_color(theme.divider)
+                    .child(table_header(theme))
                     .child(
                         div()
-                            .id("change-bubble-details")
-                            .track_scroll(&self.change_bubble_scroll)
-                            .size_full()
-                            .min_w(px(0.))
-                            .overflow_y_scroll()
-                            .px_3()
-                            .py_2()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .children(inserts.iter().map(|label| render_insert_row(label, theme)))
-                            .children(batch.iter().map(|edit| render_edit_group(edit, theme)))
-                            .children(deletes.iter().map(|row| render_delete_row(row, theme))),
-                    )
-                    .child(super::scrollbar::vertical_scrollbar(
-                        "change-bubble-scrollbar",
-                        self.change_bubble_scroll.clone(),
-                        theme,
-                    )),
+                            .relative()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(
+                                div()
+                                    .id("change-bubble-details")
+                                    .track_scroll(&self.change_bubble_scroll)
+                                    .size_full()
+                                    .min_w(px(0.))
+                                    .overflow_y_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .children(rows),
+                            )
+                            .child(super::scrollbar::vertical_scrollbar(
+                                "change-bubble-scrollbar",
+                                self.change_bubble_scroll.clone(),
+                                theme,
+                            )),
+                    ),
             );
         }
 
@@ -167,7 +200,7 @@ impl DbUi {
     }
 }
 
-/// The bubble's top edge: drag it up for more diff, down for less.
+/// The panel's top edge: drag it up for more of the batch, down for less.
 ///
 /// Only the pointer-down lives here. Once the drag starts the pointer is off
 /// this 5px strip immediately, so the root view owns the move and release.
@@ -199,127 +232,176 @@ fn resize_handle(dragging: bool, theme: &Theme, cx: &mut Context<DbUi>) -> AnyEl
         .into_any_element()
 }
 
-fn render_edit_group(edit: &PendingRowEdit, theme: &Theme) -> AnyElement {
+fn table_header(theme: &Theme) -> AnyElement {
+    let heading = |label: &'static str, fixed: bool| {
+        let cell = div().px_2().truncate();
+        if fixed {
+            cell.w(metrics::scaled(KEY_CELL_WIDTH)).flex_shrink_0()
+        } else {
+            cell.flex_1().min_w(px(0.))
+        }
+        .child(label)
+    };
+
     div()
         .flex()
-        .flex_col()
-        .gap_1()
+        .items_center()
+        .w_full()
+        .h(metrics::scaled(24.))
+        .flex_shrink_0()
+        .px_3()
+        .bg(theme.panel)
+        .border_b_1()
+        .border_color(theme.divider)
+        .text_size(metrics::text_size_small())
+        .text_color(theme.text_faint)
+        // Lines up with the status dot each row leads with.
+        .child(div().w(metrics::scaled(14.)).flex_shrink_0())
+        .child(heading("Row", true))
+        .child(heading("Column", true))
+        .child(heading("From", false))
+        .child(heading("To", false))
+        .into_any_element()
+}
+
+/// One line of the table, tinted by what it is going to do.
+struct ChangeRow<'a> {
+    tint: gpui::Rgba,
+    /// The dot at the head of the line.
+    marker: gpui::Rgba,
+    row: &'a str,
+    column: &'a str,
+    from: Option<&'a str>,
+    to: &'a str,
+    /// What `to` should be drawn in -- the success colour for a value, the
+    /// danger colour for a row on its way out.
+    to_color: gpui::Rgba,
+    strike_from: bool,
+}
+
+fn render_row(row: ChangeRow<'_>, theme: &Theme) -> AnyElement {
+    let value_cell = |text: Option<&str>, color: gpui::Rgba, strike: bool| {
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .px_2()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .text_color(color)
+            .when(strike, |cell| cell.line_through())
+            .child(SharedString::from(
+                text.map(one_line).unwrap_or_else(|| "—".to_string()),
+            ))
+    };
+
+    let key_cell = |text: &str, color: gpui::Rgba| {
+        div()
+            .w(metrics::scaled(KEY_CELL_WIDTH))
+            .flex_shrink_0()
+            .px_2()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .text_color(color)
+            .child(SharedString::from(one_line(text)))
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .w_full()
+        .min_w(px(0.))
+        .h(metrics::scaled(24.))
+        .flex_shrink_0()
+        .px_3()
+        .bg(row.tint)
+        .font_family(metrics::MONO_FONT)
+        .text_size(metrics::text_size_small())
         .child(
             div()
-                .text_size(metrics::text_size_small())
-                .text_color(theme.text_muted)
-                .child(SharedString::from(edit.label.clone())),
+                .w(metrics::scaled(14.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .child(super::dot(row.marker)),
         )
-        .children(
-            edit.changes
-                .iter()
-                .map(|change| render_change(change, theme)),
-        )
+        .child(key_cell(row.row, theme.text_muted))
+        .child(key_cell(row.column, theme.text))
+        .child(value_cell(row.from, theme.danger, row.strike_from))
+        .child(value_cell(Some(row.to), row.to_color, false))
         .into_any_element()
+}
+
+/// A tint weak enough to read through. The row's own colours carry the
+/// meaning; this only groups the line with the ones like it.
+fn tint(color: gpui::Rgba) -> gpui::Rgba {
+    gpui::Rgba { a: 0.10, ..color }
+}
+
+fn render_edit_rows(edit: &PendingRowEdit, theme: &Theme) -> Vec<AnyElement> {
+    let mut out = Vec::with_capacity(edit.changes.len());
+    for change in &edit.changes {
+        out.push(render_row(
+            ChangeRow {
+                tint: tint(theme.success),
+                marker: theme.warning,
+                row: &edit.label,
+                column: &change.column,
+                from: Some(&change.old_text),
+                to: &change.new_text,
+                to_color: theme.success,
+                strike_from: false,
+            },
+            theme,
+        ));
+        if let Some(lines) = multiline_diff(change) {
+            out.push(render_diff_lines(&lines, theme));
+        }
+    }
+    out
 }
 
 /// A staged insert: what little is known about a row that does not exist yet.
 fn render_insert_row(label: &str, theme: &Theme) -> AnyElement {
-    div()
-        .w_full()
-        .min_w(px(0.))
-        .flex()
-        .items_center()
-        .gap_2()
-        .overflow_hidden()
-        .font_family(metrics::MONO_FONT)
-        .text_size(metrics::text_size_small())
-        .text_color(theme.success)
-        .child(div().flex_shrink_0().child("+"))
-        .child(
-            div()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(SharedString::from(one_line(label))),
-        )
-        .child(div().flex_shrink_0().child("NEW ROW"))
-        .into_any_element()
+    render_row(
+        ChangeRow {
+            tint: tint(theme.success),
+            marker: theme.success,
+            row: label,
+            column: "—",
+            from: None,
+            to: "NEW ROW",
+            to_color: theme.success,
+            strike_from: false,
+        },
+        theme,
+    )
 }
 
 /// A staged deletion: the row's key, struck through, in the removal colour.
 fn render_delete_row(row: &PendingRowDelete, theme: &Theme) -> AnyElement {
-    div()
-        .w_full()
-        .min_w(px(0.))
-        .flex()
-        .items_center()
-        .gap_2()
-        .overflow_hidden()
-        .font_family(metrics::MONO_FONT)
-        .text_size(metrics::text_size_small())
-        .text_color(theme.danger)
-        .child(div().flex_shrink_0().child("−"))
-        .child(
-            div()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .text_ellipsis()
-                .line_through()
-                .child(SharedString::from(one_line(&row.label))),
-        )
-        .child(div().flex_shrink_0().child("DELETE ROW"))
-        .into_any_element()
+    render_row(
+        ChangeRow {
+            tint: tint(theme.danger),
+            marker: theme.danger,
+            row: &row.label,
+            column: "—",
+            from: Some(&row.label),
+            to: "DELETE ROW",
+            to_color: theme.danger,
+            strike_from: true,
+        },
+        theme,
+    )
 }
 
-fn render_change(change: &FieldChange, theme: &Theme) -> AnyElement {
-    let multiline = change.old_text.contains('\n') || change.new_text.contains('\n');
-    let diff = if multiline {
-        line_diff(&change.old_text, &change.new_text)
-    } else {
-        None
-    };
-
-    match diff {
-        Some(lines) if !lines.is_empty() => div()
-            .w_full()
-            .min_w(px(0.))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(column_label(&change.column, theme))
-            .child(render_diff_lines(&lines, theme))
-            .into_any_element(),
-        // A scalar, or a document too large to diff: the old inline form, but
-        // flattened onto one line so a stray newline cannot grow the row.
-        _ => div()
-            .w_full()
-            .min_w(px(0.))
-            .flex()
-            .items_center()
-            .gap_2()
-            .overflow_hidden()
-            .font_family(metrics::MONO_FONT)
-            .text_size(metrics::text_size_small())
-            .child(column_label(&change.column, theme))
-            .child(div().text_color(theme.text_faint).child(":"))
-            .child(
-                div()
-                    .text_color(theme.danger)
-                    .child(SharedString::from(one_line(&change.old_text))),
-            )
-            .child(div().text_color(theme.text_faint).child("→"))
-            .child(
-                div()
-                    .text_color(theme.success)
-                    .child(SharedString::from(one_line(&change.new_text))),
-            )
-            .into_any_element(),
+/// The line diff for a change that gained or lost lines, if there is one.
+fn multiline_diff(change: &FieldChange) -> Option<Vec<DiffLine>> {
+    if !change.old_text.contains('\n') && !change.new_text.contains('\n') {
+        return None;
     }
-}
-
-fn column_label(column: &str, theme: &Theme) -> AnyElement {
-    div()
-        .font_family(metrics::MONO_FONT)
-        .text_size(metrics::text_size_small())
-        .text_color(theme.text)
-        .child(SharedString::from(column.to_string()))
-        .into_any_element()
+    line_diff(&change.old_text, &change.new_text).filter(|lines| !lines.is_empty())
 }
 
 fn render_diff_lines(lines: &[DiffLine], theme: &Theme) -> AnyElement {
@@ -330,6 +412,12 @@ fn render_diff_lines(lines: &[DiffLine], theme: &Theme) -> AnyElement {
         .min_w(px(0.))
         .flex()
         .flex_col()
+        // Indented past the dot and the two key cells, so the diff reads as
+        // belonging to the row above it rather than as more rows.
+        .pl(metrics::scaled(KEY_CELL_WIDTH * 2. + 26.))
+        .pr_3()
+        .py_1()
+        .bg(tint(theme.accent))
         .font_family(metrics::MONO_FONT)
         .text_size(metrics::text_size_small())
         .children(lines.iter().take(MAX_DIFF_LINES).map(|line| {

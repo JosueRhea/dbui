@@ -5479,6 +5479,68 @@ fn closing_a_connection_holding_changes_asks_first(cx: &mut TestAppContext) {
 
 // -- dragging a tab along the strip -----------------------------------------
 
+/// Dragging a tab with the *pointer*, over the strip as it is actually drawn.
+///
+/// The tests below this one call `begin_tab_drag` / `drag_tab_over` directly,
+/// which proves the reordering arithmetic and nothing about whether a press on
+/// a tab ever reaches it. That distinction stopped being academic when the
+/// strip moved into the titlebar: the handlers were carried over intact, and
+/// the only thing that could still break the feature was the wiring around
+/// them. So this one goes through the window.
+#[gpui::test]
+fn dragging_a_tab_with_the_pointer_reorders_the_strip(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open_table_with_rows(cx, 2);
+    let ids = view.update(cx, open_three_tabs);
+
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(800.)));
+    cx.run_until_parked();
+
+    let strip = view.read_with(cx, |view, _| view.tab_strip_scroll.bounds());
+    assert!(
+        strip.size.width > gpui::px(0.) && strip.size.height > gpui::px(0.),
+        "the tab strip was laid out, got {strip:?}"
+    );
+
+    let y = strip.center().y;
+    let start = strip.left() + gpui::px(8.);
+    let end = strip.right() - gpui::px(8.);
+
+    cx.simulate_mouse_move(gpui::point(start, y), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(
+        gpui::point(start, y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    // Sweep right in steps rather than one jump: the strip is reordered a slot
+    // at a time, by the tab the pointer is over.
+    let steps = 24;
+    for step in 1..=steps {
+        let x = start + (end - start) * (step as f32 / steps as f32);
+        cx.simulate_mouse_move(
+            gpui::point(x, y),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+    }
+    cx.simulate_mouse_up(
+        gpui::point(end, y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    view.read_with(cx, |view, _| {
+        let order: Vec<_> = view.tabs.items.iter().map(|tab| tab.id()).collect();
+        assert_eq!(
+            order,
+            vec![ids[1], ids[2], ids[0]],
+            "the first tab was carried to the end"
+        );
+        assert!(view.tab_drag.is_none(), "and the drag is over");
+    });
+}
+
 /// Dragging one tab across another puts it in that tab's slot, and the tab in
 /// hand is the one left in front.
 #[gpui::test]
