@@ -662,19 +662,57 @@ fn render_header(
                         this.drag_column_over(column, event.position.x, cx);
                     }
                 }))
-                .child(SharedString::from(column.name.clone()))
+                // Name over type, rather than beside it. Side by side, the
+                // type was the first thing the ellipsis ate on any column
+                // narrow enough to need one -- which is every column whose
+                // type you would actually want to check.
                 .child(
                     div()
-                        .text_size(metrics::scaled(9.))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(column.type_name.to_lowercase())),
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap(px(2.))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(metrics::text_size())
+                                        // The key is underlined as well as
+                                        // tinted: on the light themes the
+                                        // warning colour alone is a hint the
+                                        // eye slides off.
+                                        .when(is_key, |name| name.underline())
+                                        .child(SharedString::from(column.name.clone())),
+                                )
+                                .children(sorted.map(|(_, ascending)| {
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(theme.accent)
+                                        .child(if ascending { "↑" } else { "↓" })
+                                })),
+                        )
+                        .child(
+                            // `w_full`, not `min_w(0)`: an ellipsis needs a
+                            // definite width to measure against, and a column
+                            // flex child that only has a minimum gets none --
+                            // which rendered every type as a bare "…".
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_size(metrics::scaled(10.))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(column.type_name.to_lowercase())),
+                        ),
                 )
-                .children(sorted.map(|(_, ascending)| {
-                    div()
-                        .flex_shrink_0()
-                        .text_color(theme.accent)
-                        .child(if ascending { "↑" } else { "↓" })
-                }))
                 // The grab strip for resizing, on the column's right edge.
                 // `absolute` so it sits over the border rather than taking
                 // width from the header it belongs to.

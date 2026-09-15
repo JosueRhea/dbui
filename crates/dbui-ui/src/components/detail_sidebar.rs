@@ -1,14 +1,16 @@
 //! Right-hand detail panel for the selected row.
 
-use super::caption;
+use super::icons::calendar_icon;
 use super::text_field::{
     sized_text_field, text_field, DetailInput, FieldHeight, InputTarget, MAX_VISIBLE_LINES,
 };
+use super::{caption, icon_button, menu_row, menu_surface, type_badge};
 use crate::json_format::{self, JsonStyle};
 use crate::root::DbUi;
+use crate::row_export::RowFormat;
 use crate::tabs::WorkspaceTab;
 use crate::theme::{metrics, Theme};
-use dbui_app::domain::Value;
+use dbui_app::domain::{ColumnInfo, Value};
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, Context, MouseButton, MouseDownEvent, SharedString,
 };
@@ -68,6 +70,14 @@ impl DbUi {
         }
 
         let open_menu = self.detail_value_menu;
+        let menu_open = self.detail_menu_open;
+        let detail_menu = self.render_detail_menu(cx);
+        let columns: &[ColumnInfo] = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .map(|view| view.set.columns.as_slice())
+            .unwrap_or(&[]);
         let body = match self.tabs.active() {
             Some(WorkspaceTab::Table {
                 draft,
@@ -90,6 +100,7 @@ impl DbUi {
                 }) {
                     vec![render_insert_draft(
                         insert,
+                        columns,
                         self.detail_input,
                         &self.detail_collapsed,
                         theme,
@@ -108,6 +119,7 @@ impl DbUi {
                     render_table_draft(
                         draft,
                         originals,
+                        columns,
                         open_menu,
                         self.detail_input,
                         self.copied_field,
@@ -145,16 +157,22 @@ impl DbUi {
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(theme.divider)
-                    .child(div().text_size(metrics::scaled(13.)).child("Details"))
+                    .child(div().text_size(metrics::scaled(13.)).child("Row details"))
                     .child(
                         div()
-                            .id("detail-collapse")
-                            .px_1()
-                            .text_color(theme.text_faint)
-                            .cursor_pointer()
-                            .hover(|icon| icon.text_color(theme.text))
-                            .on_click(cx.listener(|this, _, _window, cx| this.toggle_detail(cx)))
-                            .child("▸"),
+                            .relative()
+                            .flex_shrink_0()
+                            .child(
+                                icon_button("detail-menu-btn", "⋮", theme, menu_open)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_detail_menu(cx);
+                                        }),
+                                    ),
+                            )
+                            .children(detail_menu),
                     ),
             )
             .child(
@@ -194,6 +212,76 @@ impl DbUi {
     }
 }
 
+impl DbUi {
+    /// The panel's `⋮` menu.
+    ///
+    /// What it holds is what the panel is for and had no home: taking the row
+    /// somewhere else, and putting the panel away. Both were previously only
+    /// reachable from the grid's right-click menu or a 24px rail.
+    fn render_detail_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.detail_menu_open {
+            return None;
+        }
+        let theme = &self.theme;
+        Some(
+            deferred(
+                menu_surface("detail-menu", theme)
+                    .top_full()
+                    .right_0()
+                    .mt_1()
+                    .w(metrics::scaled(210.))
+                    .text_size(metrics::text_size_small())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_detail_menu(cx)))
+                    .child(
+                        menu_row("detail-menu-json", "Copy Row as JSON", None, theme).on_click(
+                            cx.listener(|this, _, _window, cx| {
+                                this.close_detail_menu(cx);
+                                this.copy_selected_rows(RowFormat::Json, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        menu_row("detail-menu-insert", "Copy Row as INSERT", None, theme).on_click(
+                            cx.listener(|this, _, _window, cx| {
+                                this.close_detail_menu(cx);
+                                this.copy_selected_rows(RowFormat::Insert, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .my_1()
+                            .h(px(1.))
+                            .w_full()
+                            .flex_shrink_0()
+                            .bg(theme.divider),
+                    )
+                    .child(
+                        menu_row("detail-menu-hide", "Hide Panel", None, theme).on_click(
+                            cx.listener(|this, _, _window, cx| {
+                                this.close_detail_menu(cx);
+                                this.toggle_detail(cx);
+                            }),
+                        ),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+}
+
+/// Whether the engine's name for a column is a date or a time.
+///
+/// Read off the type rather than the value: a `timestamptz` that happens to be
+/// NULL in this row is still a timestamp column, and the field has to offer
+/// the same thing either way.
+fn is_temporal_type(type_name: &str) -> bool {
+    let lower = type_name.to_ascii_lowercase();
+    ["timestamp", "datetime", "date", "time"]
+        .iter()
+        .any(|name| lower.contains(name))
+}
+
 fn empty_selection(theme: &Theme) -> AnyElement {
     div()
         .py_6()
@@ -208,6 +296,7 @@ fn empty_selection(theme: &Theme) -> AnyElement {
 fn render_table_draft(
     draft: &crate::tabs::RowDraft,
     originals: &[Value],
+    columns: &[ColumnInfo],
     open_menu: Option<usize>,
     detail_input: Option<DetailInput>,
     copied: Option<usize>,
@@ -232,6 +321,13 @@ fn render_table_draft(
             let original = originals.get(index);
             let allow_empty = original.map(allows_empty_token).unwrap_or(true);
             let height = field_height(name, collapsed);
+            let type_name = columns.get(index).map(|column| column.type_name.as_str());
+            let menu = TokenMenu {
+                open: open_menu == Some(index),
+                allow_empty,
+                bulk,
+                temporal: type_name.is_some_and(is_temporal_type),
+            };
             div()
                 .id(("detail-field", index))
                 .w_full()
@@ -244,11 +340,7 @@ fn render_table_draft(
                         index,
                         name,
                         is_pk: *is_pk,
-                        menu: (!*is_pk).then_some(TokenMenu {
-                            open: open_menu == Some(index),
-                            allow_empty,
-                            bulk,
-                        }),
+                        type_name,
                         fold: foldable(input, *is_pk).then_some(height),
                         just_copied,
                     },
@@ -259,13 +351,19 @@ fn render_table_draft(
                     read_only_field(index, input.text(), true, height, just_copied, theme, cx)
                         .into_any_element()
                 } else {
-                    sized_text_field(
-                        ("detail-field-input", index),
-                        input,
-                        InputTarget::DetailField(index),
-                        focused,
-                        None,
-                        height,
+                    value_field(
+                        sized_text_field(
+                            ("detail-field-input", index),
+                            input,
+                            InputTarget::DetailField(index),
+                            focused,
+                            None,
+                            height,
+                            theme,
+                            cx,
+                        ),
+                        index,
+                        &menu,
                         theme,
                         cx,
                     )
@@ -310,6 +408,7 @@ fn render_table_draft(
 /// own default, sequence or generated value is what lands.
 fn render_insert_draft(
     insert: &crate::tabs::PendingRowInsert,
+    columns: &[ColumnInfo],
     detail_input: Option<DetailInput>,
     collapsed: &HashSet<String>,
     theme: &Theme,
@@ -333,10 +432,7 @@ fn render_insert_draft(
                         index,
                         name,
                         is_pk: false,
-                        // An insert has no stored row behind it, so the write
-                        // tokens have nothing to say: every field already
-                        // reads DEFAULT and is typed over directly.
-                        menu: None,
+                        type_name: columns.get(index).map(|column| column.type_name.as_str()),
                         fold: foldable(input, false).then_some(height),
                         // A staged insert has no key to copy: it has no
                         // identity until the server gives it one.
@@ -441,6 +537,9 @@ struct TokenMenu {
     /// A bulk edit gets a `MIXED` entry -- the way back out of having typed
     /// over a field you meant to leave alone.
     bulk: bool,
+    /// A date or timestamp column also gets `now` and `today`, and wears a
+    /// calendar instead of a chevron.
+    temporal: bool,
 }
 
 /// The line above one field: its name, and whatever controls it earns.
@@ -448,8 +547,8 @@ struct FieldHeader<'a> {
     index: usize,
     name: &'a str,
     is_pk: bool,
-    /// The write-token dropdown, for a field that can take one.
-    menu: Option<TokenMenu>,
+    /// The engine's name for the column's type, drawn opposite the name.
+    type_name: Option<&'a str>,
     /// The height toggle and the height it is currently showing, for a field
     /// with more lines than a folded box would hold.
     fold: Option<FieldHeight>,
@@ -457,12 +556,82 @@ struct FieldHeader<'a> {
     just_copied: bool,
 }
 
+/// An editable field, plus the button that opens what can be written to it.
+///
+/// The button lives *inside* the box rather than up in the header, which is
+/// where it used to be. That is what makes a column with a short list of legal
+/// values read as a control you pick from instead of a free-text box with a
+/// caret in it -- and it puts the menu directly under the value it rewrites.
+fn value_field(
+    field: AnyElement,
+    index: usize,
+    menu: &TokenMenu,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
+    let glyph: AnyElement = if menu.temporal {
+        calendar_icon(if menu.open {
+            theme.text
+        } else {
+            theme.text_faint
+        })
+        .into_any_element()
+    } else {
+        div()
+            .text_size(metrics::text_size_small())
+            .child("⌄")
+            .into_any_element()
+    };
+
+    div()
+        .relative()
+        .w_full()
+        .min_w(px(0.))
+        .child(field)
+        .child(
+            div()
+                .id(("detail-value-menu-btn", index))
+                .absolute()
+                .top_0()
+                .right_0()
+                .h(metrics::scaled(28.))
+                .w(metrics::scaled(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_r_md()
+                .cursor_pointer()
+                .text_color(if menu.open {
+                    theme.text
+                } else {
+                    theme.text_faint
+                })
+                .hover(|btn| btn.text_color(theme.text))
+                // Down rather than click, and claimed here: the press must not
+                // also reach the editor behind it and drop a caret into the
+                // value the menu is about to replace.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_detail_value_menu(index, cx);
+                    }),
+                )
+                .child(glyph),
+        )
+        .children(
+            menu.open
+                .then(|| special_value_menu(index, menu, theme, cx)),
+        )
+        .into_any_element()
+}
+
 fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) -> AnyElement {
     let FieldHeader {
         index,
         name,
         is_pk,
-        menu,
+        type_name,
         fold,
         just_copied,
     } = header;
@@ -509,7 +678,7 @@ fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) 
 
     // The key has no value menu -- there is nothing to set it to -- so its
     // slot in the header carries the one thing it does offer instead.
-    if is_pk && menu.is_none() {
+    if is_pk {
         row = row.child(
             div()
                 .id(("detail-key-copy", index))
@@ -532,28 +701,11 @@ fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) 
         );
     }
 
-    if let Some(menu) = menu {
-        row = row.child(
-            div()
-                .id(("detail-value-menu-btn", index))
-                .px_1()
-                .rounded_sm()
-                .text_size(metrics::text_size_small())
-                .text_color(if menu.open {
-                    theme.text
-                } else {
-                    theme.text_faint
-                })
-                .cursor_pointer()
-                .hover(|btn| btn.bg(theme.hover).text_color(theme.text))
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.toggle_detail_value_menu(index, cx);
-                }))
-                .child("▾"),
-        );
-        if menu.open {
-            row = row.child(special_value_menu(index, &menu, theme, cx));
-        }
+    // What the value *is*, opposite what it is called. A row of editors with
+    // no types on it is a row of boxes: `char(3)` and `text` take the same
+    // keystrokes right up until the server refuses one of them.
+    if let Some(type_name) = type_name {
+        row = row.child(type_badge(type_name.to_lowercase(), theme));
     }
 
     row.into_any_element()
@@ -600,6 +752,61 @@ fn special_value_menu(
         // how you say "never mind, leave each row as it was".
         (crate::tabs::MIXED, "Leave each row's own", menu.bulk),
     ];
+    // A date column gets the two values anyone actually types into one. They
+    // are values rather than write tokens, so they go in above the tokens with
+    // a rule between -- "set it to this" and "there is no value here" are not
+    // the same kind of answer.
+    if menu.temporal {
+        for (item_index, &(label, date_only)) in
+            [("now", false), ("today", true)].iter().enumerate()
+        {
+            rows.push(
+                div()
+                    .id(("detail-value-menu-time", index * 8 + item_index))
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.set_detail_field_text(index, crate::clock::now_utc(date_only), cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .font_family(metrics::MONO_FONT)
+                                    .text_color(theme.text)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(metrics::text_size_small())
+                                    .text_color(theme.text_faint)
+                                    .child(if date_only {
+                                        "Today's date (UTC)"
+                                    } else {
+                                        "Current timestamp (UTC)"
+                                    }),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            div()
+                .my_1()
+                .h(px(1.))
+                .w_full()
+                .flex_shrink_0()
+                .bg(theme.divider)
+                .into_any_element(),
+        );
+    }
+
     for (item_index, &(token, hint, enabled)) in items.iter().enumerate() {
         if !enabled {
             continue;
@@ -638,21 +845,11 @@ fn special_value_menu(
     }
 
     deferred(
-        div()
-            .id(("detail-value-menu", index))
-            .absolute()
+        menu_surface(("detail-value-menu", index), theme)
             .top_full()
             .right_0()
             .mt_1()
-            .min_w(metrics::scaled(160.))
-            .flex()
-            .flex_col()
-            .py_1()
-            .rounded_md()
-            .bg(theme.elevated)
-            .border_1()
-            .border_color(theme.border)
-            .occlude()
+            .min_w(metrics::scaled(200.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.close_detail_value_menu(cx);
             }))
@@ -855,6 +1052,31 @@ fn read_only_line_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The calendar button and the `now` / `today` entries behind it are
+    /// offered on a type, so a type that is not a date must not get them --
+    /// and every type that is one must.
+    #[test]
+    fn a_date_or_time_column_is_temporal_and_nothing_else_is() {
+        for name in [
+            "timestamptz",
+            "timestamp without time zone",
+            "TIMESTAMP",
+            "date",
+            "DATETIME",
+            "time",
+            "timetz",
+        ] {
+            assert!(is_temporal_type(name), "{name} is temporal");
+        }
+        // `int` and `interval` both have to stay out: one is not a time at
+        // all, the other is a duration and has no "now".
+        for name in [
+            "int4", "integer", "text", "numeric", "char(3)", "jsonb", "bool", "uuid",
+        ] {
+            assert!(!is_temporal_type(name), "{name} is not temporal");
+        }
+    }
 
     /// The default is the whole value. Folding is the exception, and it is the
     /// user's to ask for -- nothing puts a column in the set on its own.

@@ -1,8 +1,14 @@
-//! Workspace tab bar across the top of the main pane.
+//! Workspace tab strip. Drawn in the titlebar, beside the connection chips.
+//!
+//! Tabs are pills rather than a notched strip: they share the bar with the
+//! connection chips and the search box, and one row of controls that all agree
+//! on a shape reads as one bar instead of three widgets pushed together. The
+//! front tab gets a filled surface and an accent bar along its top edge -- the
+//! bar is what survives being read out of the corner of the eye.
 
 use super::context_menu::ContextTarget;
-use super::icons::{sql_icon, table_icon};
-use super::{button, caption, dot};
+use super::icons::{plus_icon, sql_icon, table_icon};
+use super::{caption, dot};
 use crate::root::DbUi;
 use crate::tabs::WorkspaceTab;
 use crate::theme::metrics;
@@ -63,24 +69,30 @@ impl DbUi {
                     // slots, and an id that moved with them would hand the
                     // press and the release to two different elements.
                     .id(("workspace-tab", id as usize))
+                    .relative()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_2()
-                    .px_3()
-                    .h_full()
+                    .pl_2p5()
+                    .pr_1()
+                    .h(metrics::control_height())
+                    .max_w(metrics::scaled(200.))
+                    .rounded_md()
                     .cursor_pointer()
-                    .border_b_2()
+                    .border_1()
                     .border_color(if is_active {
-                        theme.accent
+                        theme.border
                     } else {
                         gpui::rgba(0x00000000)
                     })
+                    .when(is_active, |row| row.bg(theme.elevated))
                     .text_color(if is_active {
                         theme.text
                     } else {
                         theme.text_muted
                     })
-                    .hover(|row| row.bg(theme.hover))
+                    .when(!is_active, |row| row.hover(|row| row.bg(theme.hover)))
                     // The tab in hand is lifted off the strip, so it is clear
                     // which one the rest are making room for.
                     .when(dragging, |row| row.bg(theme.selection))
@@ -113,8 +125,23 @@ impl DbUi {
                             this.open_context_menu(ContextTarget::Tab { id }, event.position, cx);
                         }),
                     )
+                    // The accent edge, inside the rounded corners rather than
+                    // as a border: a 2px border on one side of a rounded box
+                    // is drawn as a wedge, and this has to read as a bar.
+                    .when(is_active, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .left(px(6.))
+                                .right(px(6.))
+                                .top_0()
+                                .h(px(2.))
+                                .rounded_b(px(1.))
+                                .bg(theme.accent),
+                        )
+                    })
                     .child(icon)
-                    .child(SharedString::from(label))
+                    .child(div().truncate().child(SharedString::from(label)))
                     // Staged work the tab is holding, marked where the user
                     // decides which tab to close.
                     .children((changes > 0).then(|| dot(theme.warning)))
@@ -135,46 +162,43 @@ impl DbUi {
             })
             .collect();
 
-        // The strip scrolls; the refresh button does not. Keeping it pinned
-        // outside the scroller is what makes it reachable no matter how many
-        // tabs are open -- a reload the user has to scroll to find is a
-        // reload they will reach for the keyboard instead.
+        // The strip scrolls; the `+` does not. Keeping it pinned outside the
+        // scroller is what makes it reachable no matter how many tabs are
+        // open -- a new-tab button you have to scroll to find is one nobody
+        // presses twice.
         let strip = if tabs.is_empty() {
             div()
                 .id("workspace-tab-bar-empty")
                 .flex()
                 .items_center()
-                .px_3()
-                .h_full()
-                .flex_1()
-                .min_w(px(0.))
+                .px_2()
+                .flex_shrink_0()
                 .child(caption("No tabs open", theme))
+                .into_any_element()
         } else {
             div()
                 .id("workspace-tab-bar")
+                .track_scroll(&self.tab_strip_scroll)
                 .flex()
                 .items_center()
-                .h_full()
-                .flex_1()
+                .gap_1()
                 .min_w(px(0.))
                 .overflow_x_scroll()
                 .children(tabs)
+                .into_any_element()
         };
 
         div()
             .flex()
             .items_center()
-            .h(metrics::toolbar_height())
-            .flex_shrink_0()
-            .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.border)
+            .gap_1()
+            .min_w(px(0.))
             .child(strip)
             .child(
-                div().flex_shrink_0().px_2().child(
-                    button("refresh-result", "\u{21bb}", theme, false)
-                        .px_2()
-                        .on_click(cx.listener(|this, _, _window, cx| this.refresh_result(cx))),
+                super::icon_button("new-tab", plus_icon(theme.text_muted), theme, false).on_click(
+                    cx.listener(|this, _, _window, cx| {
+                        this.open_sql_tab(cx);
+                    }),
                 ),
             )
     }

@@ -3,8 +3,8 @@
 //! Connections are chosen from the titlebar picker; this surface only walks
 //! the catalog of whatever is currently connected.
 
+use super::caption;
 use super::context_menu::ContextTarget;
-use super::{button, caption};
 use crate::root::{DbUi, Focus, SidebarItem};
 use crate::theme::metrics;
 use dbui_app::domain::ConnectionId;
@@ -189,13 +189,6 @@ impl DbUi {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = &self.theme;
-        let header = match self.workspace.active() {
-            Some(entry) if entry.status.is_connected() => {
-                SharedString::from(entry.config.database.clone())
-            }
-            Some(entry) => SharedString::from(entry.config.name.clone()),
-            None => SharedString::from("Database"),
-        };
 
         div()
             .w(px(self.sidebar_width * metrics::zoom()))
@@ -207,31 +200,9 @@ impl DbUi {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .h(metrics::toolbar_height())
-                    .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(theme.divider)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_size(metrics::scaled(11.))
-                            .text_color(theme.text_faint)
-                            .child(header),
-                    )
-                    .child(
-                        button("refresh-catalog", "↻", theme, false)
-                            .px_2()
-                            .on_click(cx.listener(|this, _, _window, cx| this.refresh_catalog(cx))),
-                    ),
-            )
+            // The database name and its reload used to head this rail. They
+            // are in the titlebar now, beside the connection they belong to,
+            // which is what lets the tree start at the top of the panel.
             .child(self.render_sidebar_filter(cx))
             .child(
                 div()
@@ -275,7 +246,7 @@ impl DbUi {
             .items_center()
             .gap_1()
             .px_2()
-            .py_1()
+            .py_1p5()
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.divider)
@@ -283,12 +254,13 @@ impl DbUi {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .child(super::text_field::text_field(
+                    .child(super::text_field::marked_text_field(
                         "sidebar-filter",
                         &self.sidebar_filter,
                         super::text_field::InputTarget::SidebarFilter,
                         focused,
                         Some("Search tables  ⌘⇧F"),
+                        super::icons::search_icon(theme.text_faint).into_any_element(),
                         theme,
                         cx,
                     )),
@@ -382,6 +354,11 @@ impl DbUi {
     fn render_tree(&self, id: ConnectionId, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = &self.theme;
         let cursor = self.sidebar_cursor.clone();
+        // The cursor is only drawn while the tree owns the keyboard. Left
+        // showing at all times it is a second highlight competing with the
+        // open table's, and the arrow keys it belongs to are going somewhere
+        // else entirely.
+        let cursor_shown = self.focus == Focus::Sidebar;
         let Some(entry) = self.workspace.get(id) else {
             return Vec::new();
         };
@@ -429,14 +406,15 @@ impl DbUi {
             rows.push(
                 div()
                     .id(("schema", schema_index))
+                    .relative()
                     .flex()
                     .items_center()
                     .gap_1()
                     .px_3()
                     .py_1()
                     .cursor_pointer()
-                    .when(is_cursor, |row| row.bg(theme.selection))
                     .hover(|row| row.bg(theme.hover))
+                    .children((is_cursor && cursor_shown).then(|| cursor_marker(theme)))
                     .on_click(cx.listener({
                         let name = name.clone();
                         move |this, _, _window, cx| {
@@ -500,6 +478,7 @@ impl DbUi {
                 rows.push(
                     div()
                         .id(("table", schema_index * 10_000 + table_index))
+                        .relative()
                         .flex()
                         .items_center()
                         .gap_2()
@@ -507,8 +486,9 @@ impl DbUi {
                         .pr_3()
                         .py_1()
                         .cursor_pointer()
-                        .when(is_open || is_cursor, |row| row.bg(theme.selection))
+                        .when(is_open, |row| row.bg(theme.selection))
                         .hover(|row| row.bg(theme.hover))
+                        .children((is_cursor && cursor_shown).then(|| cursor_marker(theme)))
                         .on_click(cx.listener({
                             let target = target.clone();
                             move |this, _, _window, cx| {
@@ -583,4 +563,21 @@ impl DbUi {
 
         rows
     }
+}
+
+/// Where the arrow keys are, drawn as an edge rather than a fill.
+///
+/// A fill would be a second selection: the tree already fills the row of the
+/// table on screen, and the two are different rows as soon as a tab is open.
+/// An edge marker sits alongside that instead of arguing with it -- and a row
+/// that is both reads as both.
+fn cursor_marker(theme: &crate::theme::Theme) -> AnyElement {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .bottom_0()
+        .w(px(2.))
+        .bg(theme.accent)
+        .into_any_element()
 }

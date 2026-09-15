@@ -16,6 +16,9 @@ use gpui::{
 };
 
 const SINGLE_LINE_HEIGHT: f32 = 28.;
+/// Left padding a field wears when it carries a mark: the 8px inset the mark
+/// sits at, its own width, and a gap after it.
+const MARK_GUTTER: f32 = 26.;
 /// How many lines a *folded* multiline field shows before it scrolls inside
 /// itself. Only [`FieldHeight::Capped`] uses it; a field is full height until
 /// someone asks for it back.
@@ -207,6 +210,61 @@ pub(crate) fn sized_text_field(
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
+    field_with_leading(
+        id,
+        input,
+        target,
+        focused,
+        placeholder,
+        height,
+        None,
+        theme,
+        cx,
+    )
+}
+
+/// A one-line field with a mark inside its box, ahead of the caret.
+///
+/// The mark has to be *inside*. Sat outside as a sibling it is a loose glyph
+/// pinned to the panel's edge -- it does not line up with the box, it does not
+/// line up with the rows under it, and at the window's left edge it reads as
+/// clipped rather than as part of the field it labels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn marked_text_field(
+    id: impl Into<ElementId>,
+    input: &TextInput,
+    target: InputTarget,
+    focused: bool,
+    placeholder: Option<&str>,
+    mark: AnyElement,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
+    field_with_leading(
+        id,
+        input,
+        target,
+        focused,
+        placeholder,
+        FieldHeight::Capped,
+        Some(mark),
+        theme,
+        cx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn field_with_leading(
+    id: impl Into<ElementId>,
+    input: &TextInput,
+    target: InputTarget,
+    focused: bool,
+    placeholder: Option<&str>,
+    height: FieldHeight,
+    leading: Option<AnyElement>,
+    theme: &Theme,
+    cx: &mut Context<DbUi>,
+) -> AnyElement {
     let scroll_id: ElementId = match target {
         InputTarget::WhereDraft => "where-scroll".into(),
         InputTarget::DetailSearch => "detail-search-scroll".into(),
@@ -228,6 +286,7 @@ pub(crate) fn sized_text_field(
             focused,
             placeholder,
             height,
+            leading,
             theme,
             cx,
         )
@@ -239,6 +298,7 @@ pub(crate) fn sized_text_field(
             target,
             focused,
             placeholder,
+            leading,
             theme,
             cx,
         )
@@ -254,6 +314,7 @@ fn single_line_text_field(
     target: InputTarget,
     focused: bool,
     placeholder: Option<&str>,
+    leading: Option<AnyElement>,
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
@@ -269,6 +330,7 @@ fn single_line_text_field(
     let char_w = text_input::char_width();
     // Pan with `left` — no Overflow::Scroll (that was the vertical bounce).
     let scroll_x = scroll_handle.offset().x;
+    let mark_gutter = metrics::scaled(MARK_GUTTER);
 
     // Connection-form chrome: fixed height, flex-centered glyphs, overflow clip.
     let field = div()
@@ -279,6 +341,7 @@ fn single_line_text_field(
         .relative()
         .h(line_h)
         .px_2()
+        .when(leading.is_some(), |field| field.pl(mark_gutter))
         .cursor_text()
         .overflow_hidden()
         .font_family(if borderless {
@@ -299,6 +362,16 @@ fn single_line_text_field(
     };
 
     field
+        .children(leading.map(|mark| {
+            div()
+                .absolute()
+                .left(metrics::scaled(8.))
+                .top_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(mark)
+        }))
         .child(
             div()
                 .id(scroll_id)
@@ -384,6 +457,7 @@ fn multiline_text_field(
     focused: bool,
     placeholder: Option<&str>,
     height: FieldHeight,
+    leading: Option<AnyElement>,
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> AnyElement {
@@ -426,6 +500,18 @@ fn multiline_text_field(
         .text_size(metrics::text_size_small())
         .cursor_text()
         .overflow_hidden()
+        // Centred on the first line rather than the box: a multiline field is
+        // as tall as its content, and a mark floating halfway down forty lines
+        // of JSON is not labelling anything.
+        .children(leading.map(|mark| {
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .h(port_h)
+                .mr_1p5()
+                .child(mark)
+        }))
         .child(
             div()
                 .id(scroll_id)

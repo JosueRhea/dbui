@@ -463,8 +463,10 @@ pub mod metrics {
         z(26.)
     }
 
+    /// The titlebar holds the connection chips *and* the tab strip, so it is
+    /// a row of controls rather than a caption bar.
     pub fn titlebar_height() -> Pixels {
-        z(38.)
+        z(46.)
     }
     /// macOS traffic lights need this much clear space before the first
     /// control in the titlebar.
@@ -475,14 +477,18 @@ pub mod metrics {
         z(26.)
     }
     pub fn toolbar_height() -> Pixels {
-        z(34.)
+        z(40.)
     }
 
     pub fn row_height() -> Pixels {
         z(26.)
     }
+    /// Two lines: the column's name, and under it the type the engine
+    /// reports. Reading a grid means knowing what you are about to type over,
+    /// and a type squeezed onto the name's line is the first thing an
+    /// ellipsis eats.
     pub fn header_height() -> Pixels {
-        z(28.)
+        z(44.)
     }
     /// The gutter holding row numbers.
     pub fn row_number_width() -> Pixels {

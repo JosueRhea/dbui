@@ -4,37 +4,37 @@
 //! surface rather than a chrome bar stuck on top of an app. The left inset
 //! keeps clear of the traffic lights, which are still drawn by the platform.
 //!
-//! Connection switching lives here (not in the sidebar): one tab per open
-//! connection, TablePlus-style, with a `+` that drops down the list of saved
-//! connections to open. The rest of the bar still owns native chrome — drag to
-//! move, double-click to zoom.
+//! One bar, three groups. Connection switching lives on the left: one chip per
+//! open connection, TablePlus-style, the front one carrying the chevron that
+//! drops down every connection the user has saved. The workspace tab strip
+//! follows it, so "which server" and "which table on it" are the same glance
+//! rather than two rows apart. On the right sit the two things that are about
+//! the app rather than the data: the search box and the settings menu.
 //!
-//! A tab is an open connection; the dropdown is every connection the user has
-//! saved. Closing a tab therefore does not delete anything, which is why the
+//! A chip is an open connection; the dropdown is every connection the user has
+//! saved. Closing a chip therefore does not delete anything, which is why the
 //! `×` and the picker's `✎`/`⏻` are different gestures with different reach.
 
-use super::{caption, dot};
+use super::icons::{database_icon, search_icon, settings_icon};
+use super::{caption, dot, icon_button, menu_row, menu_surface};
+use crate::components::palette::PaletteKind;
 use crate::root::DbUi;
 use crate::theme::{metrics, Theme};
 use dbui_app::ConnectionStatus;
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, ClickEvent, Context, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, SharedString, Window, WindowControlArea,
+    MouseUpEvent, SharedString, Window, WindowControlArea,
 };
-use std::cell::Cell;
-use std::rc::Rc;
 
 impl DbUi {
     pub(crate) fn render_titlebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let picker_open = self.connection_picker_open;
-        let tabs = self.render_connection_tabs(cx);
+        // Everything holding `&self` is built before the theme borrow, which
+        // is what lets the bar be assembled in one expression below.
+        let connections = self.render_connection_chips(cx);
+        let tab_strip = self.render_tab_bar(cx);
+        let settings = self.render_settings_menu(cx);
+        let settings_open = self.settings_menu_open;
         let theme = &self.theme;
-
-        let should_move = Rc::new(Cell::new(false));
-        let should_move_down = should_move.clone();
-        let should_move_up = should_move.clone();
-        let should_move_out = should_move.clone();
-        let should_move_move = should_move.clone();
 
         div()
             .id("titlebar")
@@ -44,14 +44,14 @@ impl DbUi {
             .h(metrics::titlebar_height())
             .flex_shrink_0()
             .pl(metrics::traffic_light_inset())
-            .pr_3()
+            .pr_2()
             .gap_2()
             .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
             .text_color(theme.text_muted)
             .text_size(metrics::text_size_small())
-            .child(tabs)
+            .child(connections)
             // A read-only connection says so where the user is already
             // looking to tell which server they are on.
             .children(self.is_read_only().then(|| {
@@ -67,91 +67,169 @@ impl DbUi {
                     .text_size(metrics::scaled(10.))
                     .child("READ ONLY")
             }))
+            // Which side of the bar a control belongs to is the only thing
+            // separating two strips of tabs from one long one.
             .child(
-                // The `+` is the only way to reach a connection that is not
-                // already a tab, so it stays put rather than scrolling away
-                // with the strip when the bar is full.
                 div()
-                    .id("connection-picker")
-                    .relative()
-                    .flex()
+                    .w(px(1.))
+                    .h(metrics::scaled(18.))
                     .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .w(metrics::scaled(24.))
-                    .h(metrics::scaled(22.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .text_color(theme.text_muted)
-                    .hover(|s| s.bg(theme.hover).text_color(theme.text))
-                    .when(picker_open, |s| s.bg(theme.selection))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_connection_picker(cx);
-                        }),
-                    )
-                    .child("+")
-                    .children(picker_open.then(|| self.render_connection_picker(cx))),
+                    .bg(theme.divider),
             )
+            .child(tab_strip)
+            // The leftover width, and the only part of the bar that moves the
+            // window. It was tried as a layer behind the whole titlebar, to
+            // win back the strips above and below the tabs -- but a layer is a
+            // sibling of the controls, not an ancestor, so it saw their
+            // presses too and a tab drag moved the window again. A gap that
+            // overlaps nothing cannot have that problem.
             .child(
                 div()
                     .id("titlebar-drag")
                     .flex_1()
+                    .min_w(metrics::scaled(16.))
                     .h_full()
                     .window_control_area(WindowControlArea::Drag)
+                    // Press here; move and release on the root view. The
+                    // pointer leaves this strip on the first frame of a drag,
+                    // the same way every other handle in the window works.
                     .on_mouse_down(
                         MouseButton::Left,
-                        move |_event: &MouseDownEvent, _window: &mut Window, _cx| {
-                            should_move_down.set(true);
-                        },
+                        cx.listener(|this, _: &MouseDownEvent, _window, _cx| {
+                            this.begin_titlebar_drag();
+                        }),
                     )
                     .on_mouse_up(
                         MouseButton::Left,
-                        move |_event: &MouseUpEvent, _window: &mut Window, _cx| {
-                            should_move_up.set(false);
-                        },
+                        cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
+                            this.end_titlebar_drag();
+                        }),
                     )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        move |_event: &MouseUpEvent, _window: &mut Window, _cx| {
-                            should_move_out.set(false);
-                        },
-                    )
-                    .on_mouse_move(move |_event: &MouseMoveEvent, window: &mut Window, _cx| {
-                        if should_move_move.get() {
-                            should_move_move.set(false);
-                            start_titlebar_drag(window);
-                        }
-                    })
                     .on_click(move |event: &ClickEvent, window: &mut Window, _cx| {
                         if event.click_count() == 2 {
                             window.titlebar_double_click();
                         }
                     }),
             )
+            .child(self.render_titlebar_search(cx))
+            // Reloading the catalog is about the connection, not the result,
+            // so it sits with the other controls that are about the app rather
+            // than about the rows -- and next to the box you would have gone
+            // looking for a missing table in.
+            .child(
+                icon_button("refresh-catalog", "↻", theme, false)
+                    .on_click(cx.listener(|this, _, _window, cx| this.refresh_catalog(cx))),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .child(
+                        icon_button(
+                            "titlebar-settings",
+                            settings_icon(if settings_open {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }),
+                            theme,
+                            settings_open,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_settings_menu(cx);
+                            }),
+                        ),
+                    )
+                    .children(settings),
+            )
     }
 
-    /// One tab per open connection, in tab order.
+    /// The search box, which is a button wearing a text field's clothes.
     ///
-    /// The strip is the only thing here allowed to grow, and it scrolls rather
-    /// than pushing the `+` and the drag area off the end of the bar.
-    fn render_connection_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Nothing is typed here: pressing it opens the palette, which is where
+    /// the query actually lives. Drawing it as a field is what makes the
+    /// shortcut discoverable to someone who has never pressed it.
+    fn render_titlebar_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        div()
+            .id("titlebar-search")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .h(metrics::control_height())
+            .w(metrics::scaled(220.))
+            .flex_shrink_0()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(theme.elevated)
+            .border_1()
+            .border_color(theme.border)
+            .hover(|field| field.border_color(theme.accent))
+            .on_click(
+                cx.listener(|this, _, _window, cx| this.open_palette(PaletteKind::GoToTable, cx)),
+            )
+            .child(search_icon(theme.text_faint))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(theme.text_faint)
+                    .child("Search…"),
+            )
+            // The real binding, not the one the mock drew: a shortcut printed
+            // on a button has to be the one that works.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(metrics::scaled(10.))
+                    .text_color(theme.text_faint)
+                    .child("⌘P"),
+            )
+    }
+
+    /// One chip per open connection, in tab order.
+    ///
+    /// The strip is allowed to shrink and scroll rather than push the tab
+    /// strip and the drag area off the end of the bar.
+    fn render_connection_chips(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let active = self.workspace.active_id();
+        let picker_open = self.connection_picker_open;
 
         if self.workspace.open_count() == 0 {
             return div()
+                .id("connection-chips-empty")
+                .relative()
                 .flex()
                 .items_center()
+                .gap_1()
                 .px_2()
+                .h(metrics::control_height())
                 .flex_shrink_0()
+                .rounded_md()
+                .cursor_pointer()
+                .border_1()
+                .border_color(theme.border)
+                .hover(|chip| chip.bg(theme.hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_connection_picker(cx);
+                    }),
+                )
                 .child(caption("No connection open", theme))
+                .child(div().text_color(theme.text_faint).child("⌄"))
+                .children(picker_open.then(|| self.render_connection_picker(cx)))
                 .into_any_element();
         }
 
-        let tabs: Vec<AnyElement> = self
+        let chips: Vec<AnyElement> = self
             .workspace
             .open_entries()
             .map(|entry| {
@@ -160,6 +238,7 @@ impl DbUi {
                 let is_active = active == Some(id);
                 let light = status_color(&entry.status, theme);
                 let name = SharedString::from(entry.config.name.clone());
+                let driver = entry.config.driver;
                 // Staged work anywhere under this connection, including the
                 // tabs that are not in front -- ⌘⇧W closes all of them.
                 let changes: usize = self
@@ -173,43 +252,70 @@ impl DbUi {
                     .unwrap_or(0);
 
                 div()
-                    .id(("connection-tab", key))
+                    .id(("connection-chip", key))
+                    .relative()
                     .flex()
                     .flex_shrink_0()
                     .items_center()
                     .gap_2()
-                    .pl_2()
-                    .pr_1()
-                    .py_1()
-                    .max_w(metrics::scaled(200.))
-                    .rounded(px(6.))
+                    .px_2()
+                    .h(metrics::control_height())
+                    .max_w(metrics::scaled(220.))
+                    .rounded_md()
                     .cursor_pointer()
-                    .when(is_active, |tab| tab.bg(theme.selection))
-                    .when(!is_active, |tab| tab.hover(|s| s.bg(theme.hover)))
+                    .border_1()
+                    .border_color(if is_active {
+                        theme.border
+                    } else {
+                        gpui::rgba(0x00000000)
+                    })
+                    .when(is_active, |chip| chip.bg(theme.elevated))
+                    .when(!is_active, |chip| chip.hover(|s| s.bg(theme.hover)))
                     .text_color(if is_active {
                         theme.text
                     } else {
                         theme.text_muted
                     })
+                    // The front chip is the picker's button; the rest just
+                    // switch. Both are one press, which is why neither waits
+                    // for the release.
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            this.open_connection_tab(id, cx);
+                            if is_active {
+                                this.toggle_connection_picker(cx);
+                            } else {
+                                this.open_connection_tab(id, cx);
+                            }
                         }),
                     )
-                    .child(dot(light))
+                    // The engine's own colour on the mark, and the connection
+                    // state on the dot beside it: one says what this is, the
+                    // other whether it is reachable.
+                    .child(database_icon(theme.driver_color(driver)))
                     .child(div().truncate().child(name))
                     .children((changes > 0).then(|| dot(theme.warning)))
+                    .child(dot(light))
+                    .when(is_active, |chip| {
+                        chip.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(metrics::scaled(10.))
+                                .text_color(theme.text_faint)
+                                .child("⌄"),
+                        )
+                    })
                     .child(
                         div()
-                            .id(("connection-tab-close", key))
+                            .id(("connection-chip-close", key))
                             .px_1()
+                            .flex_shrink_0()
                             .text_color(theme.text_faint)
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme.danger))
-                            // Mouse-down rather than click, to match the tab
-                            // itself -- otherwise the tab activates on the way
+                            // Mouse-down rather than click, to match the chip
+                            // itself -- otherwise the chip activates on the way
                             // down and only then closes on the way up.
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -220,18 +326,19 @@ impl DbUi {
                             )
                             .child("×"),
                     )
+                    .children((is_active && picker_open).then(|| self.render_connection_picker(cx)))
                     .into_any_element()
             })
             .collect();
 
         div()
-            .id("connection-tabs")
+            .id("connection-chips")
             .flex()
             .items_center()
             .gap_1()
             .min_w(px(0.))
             .overflow_x_scroll()
-            .children(tabs)
+            .children(chips)
             .into_any_element()
     }
 
@@ -337,22 +444,14 @@ impl DbUi {
         }
 
         deferred(
-            div()
-                .id("connection-picker-menu")
-                .absolute()
+            menu_surface("connection-picker-menu", theme)
                 .top_full()
                 .left_0()
                 .mt_1()
-                .w(metrics::scaled(320.))
+                .w(metrics::scaled(340.))
                 .max_h(metrics::scaled(360.))
-                .flex()
-                .flex_col()
-                .rounded(px(10.))
-                .bg(theme.elevated)
-                .border_1()
-                .border_color(theme.border)
+                .py_0()
                 .overflow_hidden()
-                .occlude()
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_connection_picker(cx);
                 }))
@@ -395,6 +494,96 @@ impl DbUi {
         )
         .into_any_element()
     }
+
+    /// The gear menu: the app's own settings, as opposed to the data's.
+    ///
+    /// Everything here is also an action with a shortcut. The menu exists so
+    /// that none of them is *only* a shortcut -- the theme picker in
+    /// particular was previously reachable by ⌘⇧T and nothing else.
+    fn render_settings_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.settings_menu_open {
+            return None;
+        }
+        let theme = &self.theme;
+        let zoom = metrics::zoom_pct();
+
+        let separator = || {
+            div()
+                .my_1()
+                .h(px(1.))
+                .w_full()
+                .flex_shrink_0()
+                .bg(theme.divider)
+        };
+
+        Some(
+            deferred(
+                menu_surface("settings-menu", theme)
+                    .top_full()
+                    .right_0()
+                    .mt_1()
+                    .w(metrics::scaled(240.))
+                    .text_size(metrics::text_size_small())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.close_settings_menu(cx);
+                    }))
+                    .child(
+                        menu_row("settings-theme", "Change Theme…", Some("⌘⇧T"), theme).on_click(
+                            cx.listener(|this, _, _window, cx| {
+                                this.close_settings_menu(cx);
+                                this.open_palette(PaletteKind::Themes, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        menu_row("settings-commands", "Command Palette…", Some("⌘⇧P"), theme)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.close_settings_menu(cx);
+                                this.open_palette(PaletteKind::Actions, cx);
+                            })),
+                    )
+                    .child(separator())
+                    .child(
+                        menu_row(
+                            "settings-new-connection",
+                            "New Connection…",
+                            Some("⌘N"),
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.close_settings_menu(cx);
+                            this.open_new_connection(cx);
+                        })),
+                    )
+                    .child(
+                        menu_row("settings-refresh-catalog", "Refresh Catalog", None, theme)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.close_settings_menu(cx);
+                                this.refresh_catalog(cx);
+                            })),
+                    )
+                    .child(separator())
+                    .child(
+                        menu_row("settings-zoom-in", "Zoom In", Some("⌘+"), theme)
+                            .on_click(cx.listener(|this, _, _window, cx| this.zoom_delta(1, cx))),
+                    )
+                    .child(
+                        menu_row("settings-zoom-out", "Zoom Out", Some("⌘−"), theme)
+                            .on_click(cx.listener(|this, _, _window, cx| this.zoom_delta(-1, cx))),
+                    )
+                    .child(
+                        menu_row(
+                            "settings-zoom-reset",
+                            SharedString::from(format!("Actual Size  ({zoom}%)")),
+                            Some("⌘0"),
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _window, cx| this.zoom_delta(0, cx))),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
 }
 
 fn status_color(status: &ConnectionStatus, theme: &Theme) -> gpui::Rgba {
@@ -403,17 +592,5 @@ fn status_color(status: &ConnectionStatus, theme: &Theme) -> gpui::Rgba {
         ConnectionStatus::Connecting => theme.warning,
         ConnectionStatus::Failed(_) => theme.danger,
         ConnectionStatus::Disconnected => theme.text_faint,
-    }
-}
-
-fn start_titlebar_drag(window: &mut Window) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = window;
-        crate::mac_window::perform_window_drag();
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        window.start_window_move();
     }
 }
