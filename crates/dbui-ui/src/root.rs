@@ -279,7 +279,10 @@ fn column_widths(set: &ResultSet) -> Vec<f32> {
 }
 
 /// A message for the status bar.
-#[derive(Clone)]
+///
+/// Compared as well as shown: a commit that lands late writes over the line it
+/// put up itself, and over nothing else.
+#[derive(Clone, PartialEq)]
 pub enum Status {
     Idle,
     Busy(SharedString),
@@ -326,6 +329,14 @@ pub struct DbUi {
     /// In-flight table/SQL loads. Lets status clear when background tabs finish
     /// without stomping a newer busy message on the active tab.
     pub(crate) loads_in_flight: u32,
+    /// Why the reload now in flight could not keep the open draft.
+    ///
+    /// `stash_current_draft` can only complain into the sidebar, and the load
+    /// it was folded for takes the sidebar away with the draft -- so on a
+    /// table with no primary key the typed value went, and the only word about
+    /// it went too. Held until the load lands, which is when there is a status
+    /// bar free to say it.
+    pub(crate) refused_draft: Option<String>,
     /// The cell the user last clicked, shown in full in the status bar --
     /// a grid cell is truncated, and the whole value has to be readable
     /// somewhere.
@@ -429,6 +440,9 @@ pub struct DbUi {
     pub(crate) confirm: Option<ConfirmPrompt>,
     /// A close waiting on the user deciding what to do about staged changes.
     pub(crate) close_guard: Option<CloseGuard>,
+    /// Bumped each time a commit puts its "Committing…" line up, so the one
+    /// that lands can tell whether the line on screen is still its own.
+    pub(crate) commit_stamp: u64,
     /// Every statement run, newest first. Loaded once at launch.
     pub(crate) history: dbui_app::History,
 
@@ -586,6 +600,7 @@ impl DbUi {
             page_size_focus: false,
             status: Status::Idle,
             loads_in_flight: 0,
+            refused_draft: None,
             selected_cell: None,
             copied_cell: None,
             copied_field: None,
@@ -620,6 +635,7 @@ impl DbUi {
             context_menu: None,
             confirm: None,
             close_guard: None,
+            commit_stamp: 0,
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
@@ -823,11 +839,34 @@ impl DbUi {
 
     // -- tabs ---------------------------------------------------------------
 
+    /// Fold what is still being typed into the tab it was typed into, before
+    /// anything else becomes the one in front.
+    ///
+    /// The order is the whole of it: the cell editor writes into the draft and
+    /// the stash folds the draft into `pending_edits`, so stashing first
+    /// stages the row as it stood before the last keystroke and drops the
+    /// cell. `editing_cell` hangs off the window rather than off the tab, so
+    /// an editor left open across a switch is an edit lost with nothing said
+    /// -- or, when the row indices happen to line up, one committed into the
+    /// table that was switched to.
+    ///
+    /// Both halves are idempotent, which is what lets `close_tab` call this
+    /// and then hand off to `close_tab_now`, which calls it again: the second
+    /// `finish_cell_edit` has no editor left to commit, and a second stash
+    /// restages the same draft against the same keys.
+    fn leave_front_tab(&mut self, cx: &mut Context<Self>) {
+        self.finish_cell_edit(cx);
+        self.stash_current_draft(cx);
+    }
+
     pub(crate) fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        // Before the switch, and only for a switch that is really happening:
+        // folding the draft away for a tab that is already in front would
+        // stage a value the user is still typing.
         if index >= self.tabs.items.len() || index == self.tabs.active {
             return;
         }
-        self.stash_current_draft(cx);
+        self.leave_front_tab(cx);
         self.tabs.activate(index);
         self.selected_cell = None;
         self.detail_input = None;
@@ -850,11 +889,12 @@ impl DbUi {
         if index >= self.tabs.items.len() {
             return;
         }
-        // What is in the detail sidebar has to reach `pending_edits` before
-        // anything counts them, or a value typed and not yet committed is
-        // work the prompt does not know about.
+        // What is still being typed -- the sidebar draft, and the box open
+        // over a cell -- has to reach `pending_edits` before anything counts
+        // them, or a value typed and not yet committed is work the prompt does
+        // not know about, and ⌘W closes the tab over it without asking.
         if index == self.tabs.active {
-            self.stash_current_draft(cx);
+            self.leave_front_tab(cx);
         }
         let Some(tab) = self.tabs.items.get(index) else {
             return;
@@ -862,7 +902,14 @@ impl DbUi {
         let changes = tab.pending_change_count();
         if changes > 0 {
             self.close_guard = Some(CloseGuard {
-                target: CloseTarget::Tab(index),
+                // Named rather than numbered: the list this index points into
+                // can be swapped out from under the question -- ⌘⌥] carries
+                // another connection's tabs in -- and a stale index closes, or
+                // commits, whatever slid into the slot.
+                target: CloseTarget::Tab {
+                    connection: self.workspace.active_id(),
+                    id: tab.id(),
+                },
                 label: SharedString::from(tab.label()),
                 changes,
             });
@@ -880,6 +927,12 @@ impl DbUi {
     pub(crate) fn close_tab_now(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.items.len() {
             return;
+        }
+        // The routes that skip the question still have to close the editor
+        // over the tab they are removing: one left open outlives the tab it
+        // was opened on, and commits into whatever the close brings forward.
+        if index == self.tabs.active {
+            self.leave_front_tab(cx);
         }
         self.tabs.close(index);
         self.selected_cell = None;
@@ -930,14 +983,17 @@ impl DbUi {
     /// menu entry, and answering the same prompt four times is not consent,
     /// it is attrition.
     pub(crate) fn close_tab_scope(&mut self, scope: TabScope, cx: &mut Context<Self>) {
-        // Only when the active tab is going: folding the open draft into a tab
-        // that stays would stage a value the user is still typing.
+        // Only when the active tab is going: folding what is being typed into
+        // a tab that stays would stage a value the user has not finished. When
+        // it is going -- "Close All Tabs" from the palette, which does not
+        // close the cell editor on the way in -- the box over the cell counts
+        // too, or every tab closes without the question its value deserved.
         if self
             .tabs
             .active_id()
             .is_some_and(|id| self.tabs_in_scope(scope).contains(&id))
         {
-            self.stash_current_draft(cx);
+            self.leave_front_tab(cx);
         }
         let doomed = self.tabs_in_scope(scope);
         if doomed.is_empty() {
@@ -1076,11 +1132,11 @@ impl DbUi {
 
     pub(crate) fn open_sql_tab(&mut self, cx: &mut Context<Self>) {
         // Opening a tab moves the front of the deck the same way clicking one
-        // does, so the draft has to be folded away first -- see the note on
-        // `activate_tab`. Without it the tab left behind holds a typed value
-        // that nothing counts, and closing it later throws the value away
-        // without asking.
-        self.stash_current_draft(cx);
+        // does, so what is being typed has to be folded away first -- see the
+        // note on `leave_front_tab`. Without it the tab left behind holds a
+        // typed value that nothing counts, and closing it later throws the
+        // value away without asking.
+        self.leave_front_tab(cx);
         self.tabs.open_sql();
         self.focus = Focus::Editor;
         self.persist_session();
@@ -1181,16 +1237,47 @@ impl DbUi {
             return;
         }
 
-        // Fold any half-finished row edit into the outgoing tab set before it
-        // is put away, or the change is lost on the way out.
-        self.stash_current_draft(cx);
+        self.workspace.activate(id);
+        self.swap_front_tabs(previous, cx);
+
+        self.persist_session();
+        cx.notify();
+        // A restored tab has no rows yet. Loading here rather than on restore
+        // means a background connection never dials out on its own.
+        self.load_active_table_if_empty(cx);
+    }
+
+    /// Put the front tab list away under the connection that owned it, and
+    /// take up the list belonging to whichever connection is in front now.
+    ///
+    /// Called once `workspace` has been told to move the front; `previous`
+    /// names who held it before. Both ways the front changes come through
+    /// here -- a connection brought forward, and a connection just made --
+    /// because everything below is a pointer into the list being put away,
+    /// and the two paths had already drifted into clearing different halves
+    /// of it. A third copy of this list is a third set of omissions.
+    ///
+    /// `column_cache` is the one with teeth: it is keyed by schema and table
+    /// with no connection in the key, so a `users` left in it from the old
+    /// connection is handed to autocomplete as the new connection's `users`
+    /// until a real fetch lands. Same-named tables across two connections is
+    /// the ordinary case -- staging and production -- not an exotic one.
+    fn swap_front_tabs(&mut self, previous: Option<ConnectionId>, cx: &mut Context<Self>) {
+        // Fold any half-finished row edit -- the open cell included -- into
+        // the outgoing tab set before it is put away, or the change is lost on
+        // the way out.
+        self.leave_front_tab(cx);
         if let Some(previous) = previous {
             self.stashed_tabs
                 .insert(previous, std::mem::take(&mut self.tabs));
         }
-
-        self.workspace.activate(id);
-        self.tabs = self.stashed_tabs.remove(&id).unwrap_or_default();
+        // A connection nobody has opened tabs on yet -- one made a moment ago
+        // above all -- has no list waiting, and starts with an empty one.
+        self.tabs = self
+            .workspace
+            .active_id()
+            .and_then(|id| self.stashed_tabs.remove(&id))
+            .unwrap_or_default();
 
         self.selected_cell = None;
         self.detail_input = None;
@@ -1202,12 +1289,6 @@ impl DbUi {
         self.column_cache.clear();
         self.workspace.open_table = self.tabs.active().and_then(|tab| tab.table_ref().cloned());
         self.focus = Focus::Sidebar;
-
-        self.persist_session();
-        cx.notify();
-        // A restored tab has no rows yet. Loading here rather than on restore
-        // means a background connection never dials out on its own.
-        self.load_active_table_if_empty(cx);
     }
 
     // -- connection tabs ----------------------------------------------------
@@ -1231,8 +1312,12 @@ impl DbUi {
         if !self.workspace.is_open(id) {
             return;
         }
+        // ⌘⇧W and the × on a connection chip both arrive with the cell editor
+        // still open, and neither closes it on the way. Uncounted, the whole
+        // tab set is dropped without the question a staged change would have
+        // raised.
         if self.workspace.active_id() == Some(id) {
-            self.stash_current_draft(cx);
+            self.leave_front_tab(cx);
         }
 
         // Every tab this connection owns goes with it, so the count is over
@@ -1269,7 +1354,14 @@ impl DbUi {
             return;
         };
         match guard.target {
-            CloseTarget::Tab(index) => self.close_tab_now(index, cx),
+            // Found again rather than remembered: if the tab has gone, or
+            // another connection's list is in front, there is nothing here
+            // this question was asking about.
+            CloseTarget::Tab { connection, id } => {
+                if let Some(index) = self.guarded_tab_index(connection, id) {
+                    self.close_tab_now(index, cx);
+                }
+            }
             CloseTarget::TabGroup(scope) => self.close_tab_scope_now(scope, cx),
             CloseTarget::Connection(id) => self.close_connection_tab_now(id, cx),
         }
@@ -1288,6 +1380,19 @@ impl DbUi {
             Some(&self.tabs)
         } else {
             self.stashed_tabs.get(&id)
+        }
+    }
+
+    /// The same, to write to.
+    ///
+    /// What an answer that crossed to the server and back has to go through:
+    /// by the time one lands, the connection it was sent on may have been put
+    /// away, and `self.tabs` belongs to whoever is in front now.
+    pub(crate) fn connection_tabs_mut(&mut self, id: ConnectionId) -> Option<&mut Tabs> {
+        if self.workspace.active_id() == Some(id) {
+            Some(&mut self.tabs)
+        } else {
+            self.stashed_tabs.get_mut(&id)
         }
     }
 
@@ -1318,6 +1423,12 @@ impl DbUi {
             self.tabs = promoted
                 .and_then(|next| self.stashed_tabs.remove(&next))
                 .unwrap_or_default();
+            // With the rest of the cursor state, and for a sharper reason: the
+            // cell editor is drawn from `editing_cell` alone, so one left
+            // behind is a box still on screen over a table belonging to
+            // another connection -- and the next thing to move the focus
+            // commits it into whatever draft was promoted with it.
+            self.editing_cell = None;
             self.selected_cell = None;
             self.detail_input = None;
             self.detail_value_menu = None;
@@ -1515,6 +1626,12 @@ impl DbUi {
     // -- tables and queries -----------------------------------------------
 
     pub(crate) fn open_table_tab(&mut self, table: TableRef, cx: &mut Context<Self>) {
+        // Both before the switch, and in this order. ⌘P and ⌘⇧F reach here
+        // with the cell editor still open, and an editor closed on the far
+        // side of the switch is an edit landing on the table it was never
+        // typed into; an editor closed after the stash is a value staged
+        // without it.
+        self.finish_cell_edit(cx);
         // Same as `open_sql_tab`: what was typed reaches the staged batch
         // before the tab it belongs to stops being the one in front.
         self.stash_current_draft(cx);
@@ -1525,7 +1642,27 @@ impl DbUi {
         self.load_active_table(cx);
     }
 
+    /// Reload the front table tab.
+    ///
+    /// Every command that rereads a table -- refresh, paging, the filters, the
+    /// page size, sorting, opening the tab -- comes through here, so this is
+    /// where the open draft is folded into the staged batch. The load that
+    /// lands sets `draft` to `None`, and what was typed lives only in that
+    /// draft's inputs: a path that reloaded without stashing first destroyed
+    /// it with no message and nothing to recover it from. Staging is by
+    /// primary key rather than by position, so the edit goes on counting and
+    /// goes on committing even when the page that comes back no longer holds
+    /// the row.
+    ///
+    /// The cell editor is finished first for the reason it is in
+    /// `save_pending_edits`: it folds into the draft, and the draft is what is
+    /// folded away here, so the other order stashes the value without it.
     fn load_active_table(&mut self, cx: &mut Context<Self>) {
+        self.finish_cell_edit(cx);
+        self.stash_current_draft(cx);
+        // Written on every reload, refusal or not, so a complaint answered by
+        // the next one cannot outlive it.
+        self.refused_draft = self.draft_error();
         let Some(tab_id) = self.tabs.active_id() else {
             return;
         };
@@ -1533,7 +1670,12 @@ impl DbUi {
     }
 
     fn load_table(&mut self, tab_id: crate::tabs::TabId, cx: &mut Context<Self>) {
-        let Some(driver) = self.workspace.active_driver() else {
+        // The connection is taken with the driver and carried through the
+        // spawn: it is what the rows coming back belong to, and by the time
+        // they land it may no longer be the one in front.
+        let (Some(driver), Some(connection)) =
+            (self.workspace.active_driver(), self.workspace.active_id())
+        else {
             self.status = Status::error("Not connected");
             cx.notify();
             return;
@@ -1575,10 +1717,17 @@ impl DbUi {
             let landed = task.await;
             this.update(cx, |this, cx| {
                 this.finish_tab_load(
+                    connection,
                     tab_id,
                     load_seq,
                     |this, is_current, is_active| match landed {
                         Some(Ok(contents)) if is_current => {
+                            // Taken here rather than under `is_active`: a
+                            // complaint this reload cannot say is one the next
+                            // load says instead, against a tab it was never
+                            // about -- and the post-commit reload is the one
+                            // load that does not overwrite it first.
+                            let refused = this.refused_draft.take();
                             let summary = table_summary(&contents);
                             if let Some(WorkspaceTab::Table {
                                 result,
@@ -1616,7 +1765,17 @@ impl DbUi {
                             }
                             this.apply_column_widths(tab_id);
                             if is_active {
-                                this.status = Status::Idle;
+                                // The draft this load just cleared may have
+                                // been one nothing could be staged from. ⌘S
+                                // answers that complaint by name; a reload
+                                // that swallowed it taught the user their
+                                // typing simply disappears.
+                                this.status = match refused {
+                                    Some(message) => {
+                                        Status::error(format!("Edit not kept — {message}"))
+                                    }
+                                    None => Status::Idle,
+                                };
                                 this.focus = Focus::Grid;
                             }
                         }
@@ -1624,6 +1783,10 @@ impl DbUi {
                         // that failed to load behind a tab the user has since
                         // moved away from still failed to load.
                         Some(Err(error)) if is_current => {
+                            // A load that failed kept the draft, complaint and
+                            // all, so there is nothing here to report and
+                            // nothing to leave lying about.
+                            this.refused_draft = None;
                             this.put_run_failure(tab_id, &error, &[], 0, is_active);
                         }
                         _ => {}
@@ -1640,12 +1803,22 @@ impl DbUi {
     /// busy status when nothing else is loading.
     fn finish_tab_load(
         &mut self,
+        connection: ConnectionId,
         tab_id: crate::tabs::TabId,
         load_seq: u64,
         apply: impl FnOnce(&mut Self, bool, bool),
     ) {
-        let is_current = self.tabs.load_is_current(tab_id, load_seq);
-        let is_active = self.tabs.active_id() == Some(tab_id);
+        // Nothing is written anywhere but the front tab list, so a load whose
+        // connection has been swapped out from under it is dropped. Tab ids
+        // count from zero within each connection, and `load_is_current` asked
+        // against the list in front would vouch for a stranger's tab of the
+        // same number and the same load count -- which is another table's rows
+        // written over it, and the half-typed draft on it thrown away. Nothing
+        // was staged on a load, so there is nothing to reconcile by dropping
+        // one; the tab keeps what it was already showing.
+        let in_front = self.workspace.active_id() == Some(connection);
+        let is_current = in_front && self.tabs.load_is_current(tab_id, load_seq);
+        let is_active = in_front && self.tabs.active_id() == Some(tab_id);
         apply(self, is_current, is_active);
         self.loads_in_flight = self.loads_in_flight.saturating_sub(1);
         if self.loads_in_flight == 0 && matches!(self.status, Status::Busy(_)) {
@@ -2136,6 +2309,9 @@ impl DbUi {
             return;
         };
 
+        let Some(connection) = self.workspace.active_id() else {
+            return;
+        };
         let Some((tab_id, load_seq)) = self.tabs.begin_active_load() else {
             return;
         };
@@ -2158,6 +2334,7 @@ impl DbUi {
             this.update(cx, |this, cx| {
                 let mut catalog_is_stale = false;
                 this.finish_tab_load(
+                    connection,
                     tab_id,
                     load_seq,
                     |this, is_current, is_active| match landed {
@@ -3366,8 +3543,15 @@ impl DbUi {
     }
 
     /// Write what was typed back into the draft, which stages it.
+    ///
+    /// Only if the draft is still the one built over the row the box was
+    /// opened on. The row was being thrown away and the column matched on its
+    /// own, so a commit arriving after the draft had moved -- or after another
+    /// table had been put in front, which a reload now does -- wrote the text
+    /// into whatever row sat at that column and staged it as an UPDATE against
+    /// a row nobody had typed into.
     pub(crate) fn commit_cell_edit(&mut self, cx: &mut Context<Self>) {
-        let Some((_, column)) = self.editing_cell.take() else {
+        let Some((row, column)) = self.editing_cell.take() else {
             return;
         };
         let typed = self.cell_editor.text().to_string();
@@ -3375,9 +3559,11 @@ impl DbUi {
             draft: Some(draft), ..
         }) = self.tabs.active_mut()
         {
-            if let Some((_, input, _)) = draft.fields.get_mut(column) {
-                let multiline = input.is_multiline();
-                *input = crate::text_input::TextInput::with_text(typed, multiline);
+            if draft.rows == [row] {
+                if let Some((_, input, _)) = draft.fields.get_mut(column) {
+                    let multiline = input.is_multiline();
+                    *input = crate::text_input::TextInput::with_text(typed, multiline);
+                }
             }
         }
         self.focus = Focus::Grid;
@@ -3915,11 +4101,19 @@ impl DbUi {
             .unwrap_or(0)
     }
 
-    /// The staged inserts as values ready to bind, or the first parse failure.
-    pub(crate) fn collect_batch_inserts(&self) -> Result<Vec<dbui_app::RowInsert>, String> {
+    /// The staged inserts of one tab as values ready to bind, or the first
+    /// parse failure.
+    ///
+    /// Taken by index rather than off the tab in front: ⌘S answering a close
+    /// guard commits the guarded tab, and the × on a tab pill raises that
+    /// guard without bringing the tab forward.
+    pub(crate) fn collect_batch_inserts(
+        &self,
+        index: usize,
+    ) -> Result<Vec<dbui_app::RowInsert>, String> {
         let Some(WorkspaceTab::Table {
             pending_inserts, ..
-        }) = self.tabs.active()
+        }) = self.tabs.items.get(index)
         else {
             return Ok(Vec::new());
         };
@@ -4241,12 +4435,83 @@ impl DbUi {
         }
     }
 
+    /// Where the tab a `CloseTarget::Tab` guard is asking about sits now, if
+    /// it is still in front of the user at all.
+    ///
+    /// The tab list can be swapped out while the question is still on screen:
+    /// ⌘⌥] carries another connection's tabs in without bringing the guard
+    /// down. Matching on connection as well as id is what stops "discard the
+    /// changes on members?" from being answered against a stranger's tab.
+    fn guarded_tab_index(
+        &self,
+        connection: Option<ConnectionId>,
+        id: crate::tabs::TabId,
+    ) -> Option<usize> {
+        if self.workspace.active_id() != connection {
+            return None;
+        }
+        self.tabs.items.iter().position(|tab| tab.id() == id)
+    }
+
+    /// Which tab a ⌘S pressed under an open guard is answering, or the reason
+    /// it cannot answer at all. `None` when no guard is up, and ⌘S means what
+    /// it has always meant: the tab in front.
+    ///
+    /// The guard's own caption offers ⌘S as the way to keep the work, so ⌘S
+    /// has to act on the batch the question is quoting. That only resolves
+    /// when the question is about one tab that is still there and still
+    /// holding work: a group of tabs, or a whole connection, is several
+    /// batches -- each committing in its own transaction against its own
+    /// table -- and there is no single one of them to send.
+    fn guarded_commit_target(&self) -> Option<Result<usize, String>> {
+        let guard = self.close_guard.as_ref()?;
+        let label = &guard.label;
+        let changes = guard.changes;
+        Some(match guard.target {
+            CloseTarget::Tab { connection, id } => match self.guarded_tab_index(connection, id) {
+                Some(index) if self.tabs.items[index].pending_change_count() > 0 => Ok(index),
+                Some(_) => Err(format!("Nothing left to commit on “{label}”")),
+                None => Err(format!(
+                    "“{label}” is not the tab in front — switch back to it and press ⌘S."
+                )),
+            },
+            CloseTarget::TabGroup(_) => Err(format!(
+                "⌘S commits one tab at a time — {changes} staged across {label}. \
+                 Switch to each tab and press ⌘S."
+            )),
+            CloseTarget::Connection(_) => Err(format!(
+                "⌘S commits one tab at a time — {changes} staged on “{label}”. \
+                 Switch to each tab and press ⌘S."
+            )),
+        })
+    }
+
     pub(crate) fn save_pending_edits(&mut self, cx: &mut Context<Self>) {
         if self.refuse_if_read_only("Commit", cx) {
             return;
         }
+
+        // An open guard is asking about one tab, and its own caption offers ⌘S
+        // as the answer, so ⌘S has to commit that tab. The × on a tab pill
+        // raises the guard without bringing the tab forward, and committing
+        // whatever is in front instead saves the wrong table and then takes
+        // the question away along with the work it was quoting.
+        let guarded = match self.guarded_commit_target() {
+            None => None,
+            Some(Ok(index)) => Some(index),
+            // Nothing here for ⌘S to send. Say where the work is, the way a
+            // ⌘S on the wrong tab does, and leave the question standing
+            // rather than committing a table on a guess.
+            Some(Err(message)) => {
+                self.status = Status::info(message);
+                cx.notify();
+                return;
+            }
+        };
+        let target = guarded.unwrap_or(self.tabs.active);
+
         if matches!(
-            self.tabs.active(),
+            self.tabs.items.get(target),
             Some(WorkspaceTab::Table { saving: true, .. })
         ) {
             // Pressing ⌘S again while the first batch is still in flight is
@@ -4262,24 +4527,31 @@ impl DbUi {
         // the sidebar draft, and the box still open over a cell. Committing a
         // batch that leaves out the value the user typed a moment ago is how
         // an edit silently goes missing.
-        self.finish_cell_edit(cx);
-        self.stash_current_draft(cx);
+        //
+        // Only when the tab being committed is the one in front, though: both
+        // of these act on the active tab, so under a guard raised on another
+        // one they would fold a half-typed value into someone else's batch.
+        // `close_tab` draws the same line before it counts.
+        if target == self.tabs.active {
+            self.finish_cell_edit(cx);
+            self.stash_current_draft(cx);
 
-        // A draft that would not stage stops the commit here, and says why.
-        // Otherwise the batch it was left out of reads as empty, and ⌘S
-        // answers "no changes to commit" to a screen full of typing -- which
-        // is how a table with no primary key came to look like a broken key
-        // rather than a table that cannot be edited.
-        if let Some(message) = self.draft_error() {
-            self.status = Status::error(format!("Cannot commit — {message}"));
-            cx.notify();
-            return;
+            // A draft that would not stage stops the commit here, and says why.
+            // Otherwise the batch it was left out of reads as empty, and ⌘S
+            // answers "no changes to commit" to a screen full of typing -- which
+            // is how a table with no primary key came to look like a broken key
+            // rather than a table that cannot be edited.
+            if let Some(message) = self.draft_error() {
+                self.status = Status::error(format!("Cannot commit — {message}"));
+                cx.notify();
+                return;
+            }
         }
 
         // The staged inserts are turned into values here rather than later:
         // a row that will not parse has to stop the commit before anything is
         // sent, not halfway through the transaction.
-        let inserts = match self.collect_batch_inserts() {
+        let inserts = match self.collect_batch_inserts(target) {
             Ok(inserts) => inserts,
             Err(message) => {
                 self.status = Status::error(message);
@@ -4288,7 +4560,7 @@ impl DbUi {
             }
         };
 
-        let (table, edits, deletes, tab_id) = match self.tabs.active() {
+        let (table, edits, deletes, tab_id) = match self.tabs.items.get(target) {
             Some(WorkspaceTab::Table {
                 id,
                 table,
@@ -4325,7 +4597,9 @@ impl DbUi {
 
         // Checked after the batch so an unsaved-but-disconnected tab says the
         // useful thing rather than "no changes".
-        let Some(driver) = self.workspace.active_driver() else {
+        let (Some(driver), Some(connection)) =
+            (self.workspace.active_driver(), self.workspace.active_id())
+        else {
             self.status = Status::error("Not connected");
             cx.notify();
             return;
@@ -4336,10 +4610,33 @@ impl DbUi {
             *saving = true;
         }
         // Answering "discard or keep?" with ⌘S is answering it: the batch the
-        // guard was standing in front of is on its way to the server, so the
-        // question -- and the count it was quoting -- is stale.
+        // guard was standing in front of -- this one, since a guard pointing
+        // anywhere else refused the commit above -- is on its way to the
+        // server, so the question and the count it quoted are stale.
         self.close_guard = None;
-        self.status = Status::busy(format!("Committing {count} change(s)…"));
+        // A chrome dropdown is what let ⌘S reach here in the first place when
+        // one was open; it has no further part in a commit that is already on
+        // its way, so it goes with the guard rather than hanging over rows
+        // that are no longer what it was drawn on top of.
+        self.close_chrome_menus();
+
+        // A commit answered from the guard lands while another tab is in
+        // front, so the user goes on working while it is in the air. Stamp
+        // the line it puts up -- which commit wrote it, and what it says --
+        // so the answer can be dropped rather than written over a query they
+        // started since, or a refusal they have just read.
+        self.commit_stamp = self.commit_stamp.wrapping_add(1);
+        let stamp = self.commit_stamp;
+        let line = Status::busy(format!("Committing {count} change(s)…"));
+        self.status = line.clone();
+        // Taken now because a rollback has to name the tab it rolled back on,
+        // and by the time one lands that tab can be behind another.
+        let label = self
+            .tabs
+            .items
+            .get(target)
+            .map(|tab| tab.label())
+            .unwrap_or_default();
         cx.notify();
 
         let runtime = self.runtime.clone();
@@ -4366,45 +4663,100 @@ impl DbUi {
             let landed = commands::apply_changes(&runtime, driver, table, batch).await;
 
             this.update(cx, |this, cx| {
-                if let Some(WorkspaceTab::Table { saving, .. }) = this.tabs.get_mut(tab_id) {
-                    *saving = false;
+                // ⌘⌥] can carry another connection's whole tab list into
+                // `self.tabs` while the commit is in the air, and tab ids
+                // start again at zero for each connection -- so `tab_id`
+                // looked up in whatever list is in front names a stranger's
+                // tab of the same number. `CloseTarget::Tab` carries a
+                // connection for this reason; so does this.
+                //
+                // Resolved wherever this connection's tabs are kept, stashed
+                // included, rather than only while it is in front: the rows
+                // are on the server either way, and a tab left holding a
+                // batch that has already landed would send the whole of it
+                // again -- inserts and all -- on the next ⌘S. The `saving`
+                // flag comes off by the same route, so a tab whose connection
+                // was put away while its commit was in flight is not left
+                // answering every later ⌘S with "Already committing".
+                let in_front = this.workspace.active_id() == Some(connection);
+                if let Some(tabs) = this.connection_tabs_mut(connection) {
+                    if let Some(WorkspaceTab::Table { saving, .. }) = tabs.get_mut(tab_id) {
+                        *saving = false;
+                    }
                 }
-                let is_active = this.tabs.active_id() == Some(tab_id);
+                let is_active = in_front && this.tabs.active_id() == Some(tab_id);
+                // The tab in front answers back as it always has. A commit
+                // whose tab is not in front -- answered from under the guard,
+                // or simply left behind by ⌘⌥] -- speaks only while the busy
+                // line it put up is still the one on screen.
+                //
+                // That line is its own, so replacing it cannot write over
+                // anything the user is reading: a line they are reading is by
+                // definition not this one. Staying silent instead leaves the
+                // footer claiming the commit is still running long after it
+                // finished, and nothing ever says that it worked.
+                let answers_back = is_active || (this.commit_stamp == stamp && this.status == line);
                 match landed {
                     Some(Ok(saved)) => {
-                        if let Some(WorkspaceTab::Table {
-                            pending_edits,
-                            pending_deletes,
-                            pending_inserts,
-                            editing_insert,
-                            change_bubble_expanded,
-                            selection,
-                            draft,
-                            ..
-                        }) = this.tabs.get_mut(tab_id)
-                        {
-                            pending_edits.clear();
-                            pending_deletes.clear();
-                            pending_inserts.clear();
-                            *editing_insert = None;
-                            *change_bubble_expanded = false;
-                            // Row indices mean nothing once the rows below a
-                            // deleted one have moved up.
-                            selection.clear();
-                            if let Some(draft) = draft.as_mut() {
-                                draft.message = Some((true, "Saved".into()));
+                        if let Some(tabs) = this.connection_tabs_mut(connection) {
+                            if let Some(WorkspaceTab::Table {
+                                pending_edits,
+                                pending_deletes,
+                                pending_inserts,
+                                editing_insert,
+                                change_bubble_expanded,
+                                selection,
+                                draft,
+                                ..
+                            }) = tabs.get_mut(tab_id)
+                            {
+                                pending_edits.clear();
+                                pending_deletes.clear();
+                                pending_inserts.clear();
+                                *editing_insert = None;
+                                *change_bubble_expanded = false;
+                                // Row indices mean nothing once the rows below a
+                                // deleted one have moved up.
+                                selection.clear();
+                                if let Some(draft) = draft.as_mut() {
+                                    draft.message = Some((true, "Saved".into()));
+                                }
                             }
                         }
-                        if is_active {
-                            this.status = Status::info(format!("Committed {saved} change(s)"));
+                        if answers_back {
+                            // Named when the tab is not the one in front, so
+                            // the answer is not read against whatever table
+                            // is -- the reason the rollback arm names it too.
+                            this.status = Status::info(if is_active {
+                                format!("Committed {saved} change(s)")
+                            } else {
+                                format!("“{label}” — committed {saved} change(s)")
+                            });
                         }
-                        this.load_table(tab_id, cx);
+                        // The reread goes out on the front connection's driver
+                        // and lands in the front connection's tab list, so it
+                        // can only be asked for while this commit's connection
+                        // is still the one in front. Behind, it would read this
+                        // table through a stranger's socket. The tab keeps the
+                        // rows it already had until it is opened again.
+                        if in_front {
+                            this.load_table(tab_id, cx);
+                        }
                     }
                     Some(Err(error)) => {
                         // Transaction rolled back — leave everything staged.
-                        if is_active {
-                            this.status = Status::error(error.to_string());
-                        }
+                        //
+                        // Said whatever else has reached the line since, unlike
+                        // the answer above: this is the answer to something the
+                        // user asked for and was told was under way, and never
+                        // hearing it failed reads as it having worked. Named
+                        // when the tab is not the one in front, so the failure
+                        // is not read against whatever table is.
+                        this.status = Status::error(if is_active {
+                            error.to_string()
+                        } else {
+                            format!("“{label}” — {error}")
+                        });
                         cx.notify();
                     }
                     None => cx.notify(),
@@ -4551,6 +4903,31 @@ impl DbUi {
         cx.notify();
     }
 
+    /// Save a new connection and bring it to the front, tabs and all.
+    ///
+    /// [`Workspace::add`] moves the front to the connection it has just made,
+    /// and `self.tabs` still holds the list belonging to whoever was in front
+    /// before it. Left there, it is one connection's tabs standing under
+    /// another's name: the next switch files them away under the new id, and
+    /// an answer still in flight for the connection that was in front -- a
+    /// commit looking for the tab whose batch it is clearing -- cannot find
+    /// its tabs at all, so the batch stays staged after it has landed and the
+    /// tab goes on refusing every later ⌘S as already committing. It makes
+    /// the same swap [`Self::select_connection`] does, through the same
+    /// helper, for the same reason.
+    ///
+    /// [`Workspace::add`]: dbui_app::Workspace::add
+    fn add_connection(
+        &mut self,
+        config: dbui_app::domain::ConnectionConfig,
+        cx: &mut Context<Self>,
+    ) -> ConnectionId {
+        let previous = self.workspace.active_id();
+        let id = self.workspace.add(config);
+        self.swap_front_tabs(previous, cx);
+        id
+    }
+
     /// Pull PostgreSQL / MySQL connections out of TablePlus's plist + keychain.
     pub(crate) fn import_tableplus_connections(&mut self, cx: &mut Context<Self>) {
         self.connection_picker_open = false;
@@ -4560,7 +4937,7 @@ impl DbUi {
                 let summary = report.summary();
                 let added = report.imported.len();
                 for config in report.imported {
-                    self.workspace.add(config);
+                    self.add_connection(config, cx);
                 }
                 if added > 0 {
                     self.persist_connections();
@@ -4684,7 +5061,7 @@ impl DbUi {
                 }
             }
         } else {
-            self.workspace.add(config);
+            self.add_connection(config, cx);
         }
 
         self.modal = None;
@@ -4864,6 +5241,24 @@ impl DbUi {
 
     // -- keyboard ----------------------------------------------------------
 
+    /// True while some panel is holding the keyboard for itself.
+    ///
+    /// This has to mirror the early returns at the top of [`Self::on_key`],
+    /// in the same order, and is kept next to them for that reason: the two
+    /// drifting apart is how a shortcut starts firing underneath a panel that
+    /// believes the keyboard is its own.
+    fn keyboard_is_claimed(&self) -> bool {
+        self.palette.is_some()
+            || self.confirm.is_some()
+            || self.close_guard.is_some()
+            || self.context_menu.is_some()
+            || self.modal.is_some()
+            || self.connection_picker_open
+            || self.settings_menu_open
+            || self.detail_menu_open
+            || self.page_size_menu_open
+    }
+
     pub(crate) fn on_key(
         &mut self,
         event: &KeyDownEvent,
@@ -4899,7 +5294,12 @@ impl DbUi {
         if self.close_guard.is_some() {
             match key {
                 "escape" => self.cancel_close(cx),
-                "enter" => self.confirm_close(cx),
+                // Unmodified only, the way the confirmation prompt guards its
+                // own Enter. ⌘↵ is the run-query shortcut, and now that its
+                // action is not registered under the guard the keystroke
+                // arrives here -- where confirming would throw away exactly
+                // the batch the guard is asking about.
+                "enter" if !command => self.confirm_close(cx),
                 _ => {}
             }
             return;
@@ -4911,8 +5311,15 @@ impl DbUi {
                     self.close_context_menu(cx);
                     return;
                 }
+                // Unmodified Enter only, and swallowed either way: with
+                // `RunQuery` unregistered under the menu, ⌘↵ reaches here,
+                // and it must neither run the highlighted item nor fall
+                // through to the shortcuts below and follow a foreign key out
+                // from under the menu the user is still reading.
                 "up" | "down" | "enter" => {
-                    self.handle_context_menu_key(key, cx);
+                    if !command {
+                        self.handle_context_menu_key(key, cx);
+                    }
                     return;
                 }
                 _ => self.close_context_menu(cx),
@@ -5719,109 +6126,127 @@ impl Render for DbUi {
                     )
                 },
             )
-            .on_action(cx.listener(|this, _: &crate::NewConnection, _window, cx| {
-                this.open_new_connection(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::GoToTable, _window, cx| {
-                this.open_palette(PaletteKind::GoToTable, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::CommandPalette, _window, cx| {
-                this.open_palette(PaletteKind::Actions, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::ChooseTheme, _window, cx| {
-                this.open_palette(PaletteKind::Themes, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::Find, _window, cx| this.cmd_find(cx)))
-            .on_action(cx.listener(|this, _: &crate::SearchTables, _window, cx| {
-                this.focus_sidebar_search(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::CommitChanges, _window, cx| {
-                this.save_pending_edits(cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &crate::SelectAllRows, _window, cx| this.select_all_rows(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::DeleteRows, _window, cx| {
+            // A bound action runs before `on_key` does and stops the
+            // keystroke there, so an action left registered while a panel is
+            // up is wrong twice over: it fires behind the panel, and the
+            // panel never sees the key it was waiting for. ⌘↵ under the close
+            // guard followed a foreign key into a tab nobody could see while
+            // the guard's own Enter handling was skipped. Not registering
+            // them is the only thing that lets the keystroke through to the
+            // panel -- stopping propagation inside `on_key` is too late.
+            .when(!self.keyboard_is_claimed(), |root| {
+                root.on_action(cx.listener(|this, _: &crate::NewConnection, _window, cx| {
+                    this.open_new_connection(cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::GoToTable, _window, cx| {
+                    this.open_palette(PaletteKind::GoToTable, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::CommandPalette, _window, cx| {
+                    this.open_palette(PaletteKind::Actions, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::ChooseTheme, _window, cx| {
+                    this.open_palette(PaletteKind::Themes, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::Find, _window, cx| this.cmd_find(cx)))
+                .on_action(cx.listener(|this, _: &crate::SearchTables, _window, cx| {
+                    this.focus_sidebar_search(cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectAllRows, _window, cx| {
+                    this.select_all_rows(cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::DeleteRows, _window, cx| {
                     this.delete_selected_rows(cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &crate::DuplicateRows, _window, cx| {
-                this.duplicate_selected_rows(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::PasteRows, _window, cx| this.paste_rows(cx)))
-            .on_action(cx.listener(|this, _: &crate::DiscardChanges, _window, cx| {
-                this.discard_pending_edits(cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::OpenSql, _window, cx| this.open_sql_tab(cx)))
-            .on_action(cx.listener(|this, _: &crate::Refresh, _window, cx| this.refresh_result(cx)))
-            .on_action(
-                cx.listener(|this, _: &crate::RunQuery, _window, cx| this.run_or_follow_link(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::RunAllQueries, _window, cx| this.run_all_queries(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::CloseTab, _window, cx| this.close_active_tab(cx)),
-            )
-            .on_action(cx.listener(|this, _: &crate::NextTab, _window, cx| this.next_tab(cx)))
-            .on_action(cx.listener(|this, _: &crate::PrevTab, _window, cx| this.prev_tab(cx)))
-            .on_action(
-                cx.listener(|this, _: &crate::CloseConnection, _window, cx| {
-                    this.close_active_connection_tab(cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &crate::NextConnection, _window, cx| {
-                this.cycle_connection_tab(true, cx)
-            }))
-            .on_action(cx.listener(|this, _: &crate::PrevConnection, _window, cx| {
-                this.cycle_connection_tab(false, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab1, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::DuplicateRows, _window, cx| {
+                    this.duplicate_selected_rows(cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::PasteRows, _window, cx| this.paste_rows(cx)),
+                )
+                .on_action(cx.listener(|this, _: &crate::DiscardChanges, _window, cx| {
+                    this.discard_pending_edits(cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::OpenSql, _window, cx| this.open_sql_tab(cx)),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::Refresh, _window, cx| this.refresh_result(cx)),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::RunQuery, _window, cx| {
+                        this.run_or_follow_link(cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &crate::RunAllQueries, _window, cx| {
+                    this.run_all_queries(cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::CloseTab, _window, cx| this.close_active_tab(cx)),
+                )
+                .on_action(cx.listener(|this, _: &crate::NextTab, _window, cx| this.next_tab(cx)))
+                .on_action(cx.listener(|this, _: &crate::PrevTab, _window, cx| this.prev_tab(cx)))
+                .on_action(
+                    cx.listener(|this, _: &crate::CloseConnection, _window, cx| {
+                        this.close_active_connection_tab(cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &crate::NextConnection, _window, cx| {
+                    this.cycle_connection_tab(true, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::PrevConnection, _window, cx| {
+                    this.cycle_connection_tab(false, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab1, _window, cx| {
                     this.select_tab_number(1, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab2, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab2, _window, cx| {
                     this.select_tab_number(2, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab3, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab3, _window, cx| {
                     this.select_tab_number(3, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab4, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab4, _window, cx| {
                     this.select_tab_number(4, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab5, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab5, _window, cx| {
                     this.select_tab_number(5, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab6, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab6, _window, cx| {
                     this.select_tab_number(6, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab7, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab7, _window, cx| {
                     this.select_tab_number(7, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab8, _window, cx| {
+                }))
+                .on_action(cx.listener(|this, _: &crate::SelectTab8, _window, cx| {
                     this.select_tab_number(8, cx)
-                }),
+                }))
+                .on_action(cx.listener(
+                    |this, _: &crate::SelectTab9, _window, cx| this.select_tab_number(9, cx),
+                ))
+            })
+            // ⌘S survives the close guard, because the guard's own caption
+            // promises it -- "⌘S commits them and keeps this open." It also
+            // survives the four chrome dropdowns: those are transient menus,
+            // not a question standing between the user and their data, so a
+            // save pressed over one is still a save. `save_pending_edits`
+            // closes them once the commit is actually sent, which is what
+            // keeps a dropdown from hanging open over work that already went.
+            .when(
+                !self.keyboard_is_claimed()
+                    || self.close_guard.is_some()
+                    || self.connection_picker_open
+                    || self.settings_menu_open
+                    || self.detail_menu_open
+                    || self.page_size_menu_open,
+                |root| {
+                    root.on_action(cx.listener(|this, _: &crate::CommitChanges, _window, cx| {
+                        this.save_pending_edits(cx)
+                    }))
+                },
             )
-            .on_action(
-                cx.listener(|this, _: &crate::SelectTab9, _window, cx| {
-                    this.select_tab_number(9, cx)
-                }),
-            )
+            // Zoom stays live under everything. The panels size themselves
+            // with `metrics::scaled`, so they grow along with the rest of the
+            // window, and a dialog too small to read is worth enlarging.
             .on_action(cx.listener(|this, _: &crate::ZoomIn, _window, cx| this.zoom_delta(1, cx)))
             .on_action(cx.listener(|this, _: &crate::ZoomOut, _window, cx| this.zoom_delta(-1, cx)))
             .on_action(
