@@ -17,21 +17,32 @@ pub struct CompletionItem {
     pub kind: CompletionKind,
 }
 
+/// Declaration order is the ranking: `build_popup` sorts on `kind as u8`, so
+/// catalog objects must come before `Keyword`. Every keyword matches an empty
+/// prefix, and with keywords first the 40-item cap filled up before a single
+/// schema or table got in — a loaded catalog was invisible, and `users` ranked
+/// below `USING` for prefix `u`.
+///
+/// Among the catalog kinds the order runs narrowest first, which decides one
+/// real case: a qualifier that names both a schema and a table makes the
+/// qualifier branch emit that schema's tables *and* that table's columns, and
+/// after `x.` the caret is inside `x`, so its columns are the closer answer and
+/// lead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionKind {
-    Keyword,
-    Schema,
-    Table,
     Column,
+    Table,
+    Schema,
+    Keyword,
 }
 
 impl CompletionKind {
     pub fn label(self) -> &'static str {
         match self {
-            CompletionKind::Keyword => "keyword",
-            CompletionKind::Schema => "schema",
-            CompletionKind::Table => "table",
             CompletionKind::Column => "column",
+            CompletionKind::Table => "table",
+            CompletionKind::Schema => "schema",
+            CompletionKind::Keyword => "keyword",
         }
     }
 }
@@ -186,13 +197,42 @@ pub fn build_popup(
         }
     }
 
-    // Stable order: kind then label. Cap the list so the popup stays usable.
+    // Stable order: kind then label, so the names in the user's database lead
+    // and keywords fill whatever is left.
     items.sort_by(|a, b| {
         (a.kind as u8, a.label.to_ascii_lowercase())
             .cmp(&(b.kind as u8, b.label.to_ascii_lowercase()))
     });
+    // Only neighbours are compared, which suffices because the sort has already
+    // made equal labels adjacent. A schema and a table sharing a name collapse
+    // to the table; accepting either inserts the same text, so only the kind
+    // chip differs.
     items.dedup_by(|a, b| a.label.eq_ignore_ascii_case(&b.label));
-    items.truncate(40);
+
+    // Cap the list so the popup stays usable, but hold a few slots back for
+    // keywords: on a database with more than `MAX - KEYWORD_SLOTS` matching
+    // objects the catalog would otherwise fill every slot, and ⌃Space on an
+    // empty line would offer no SQL at all. Keywords sort last, so the overflow
+    // to drop is the tail of the catalog run.
+    const MAX: usize = 40;
+    const KEYWORD_SLOTS: usize = 8;
+    if items.len() > MAX {
+        let keywords_at = items.partition_point(|i| i.kind != CompletionKind::Keyword);
+        let reserved = (items.len() - keywords_at).min(KEYWORD_SLOTS);
+        let keep = (MAX - reserved).min(keywords_at);
+        items.drain(keep..keywords_at);
+        // `partition_point` finds the keyword run only while `Keyword` is the
+        // last variant. Reorder the enum so it is not, and this would silently
+        // drop catalog rows and keep keyword overflow instead — no panic, and no
+        // failing test, since every fixture has keywords last either way.
+        debug_assert!(
+            items[keep..]
+                .iter()
+                .all(|i| i.kind == CompletionKind::Keyword),
+            "CompletionKind::Keyword must sort last for the reserve to work"
+        );
+    }
+    items.truncate(MAX);
 
     if items.is_empty() {
         return None;
@@ -263,26 +303,31 @@ fn resolve_qualifier(
     None
 }
 
+/// Whether `upper` holds `word` at byte `i` with a non-identifier byte on each
+/// side. The scan walks one byte at a time, so it can land inside a multi-byte
+/// character; comparing bytes rather than slicing a `&str` keeps that from
+/// panicking. The leading byte matters too, or `valid_from` reads as `FROM`.
+fn keyword_at(upper: &[u8], i: usize, word: &[u8]) -> bool {
+    let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    upper[i..].starts_with(word)
+        && upper[..i].last().is_none_or(|c| !ident(c))
+        && upper[i + word.len()..].first().is_none_or(|c| !ident(c))
+}
+
 /// Rough `(alias_or_name, table_name)` pairs from FROM/JOIN clauses.
 fn scan_from_aliases(sql: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    // ASCII uppercasing never changes a byte's width, so offsets into `upper`
+    // still line up with `sql`.
     let upper = sql.to_ascii_uppercase();
+    let upper_bytes = upper.as_bytes();
     let bytes = sql.as_bytes();
     let mut i = 0usize;
 
     while i < bytes.len() {
         // Find FROM or JOIN as whole words.
-        let rest = &upper[i..];
-        let at_from = rest.starts_with("FROM")
-            && rest
-                .as_bytes()
-                .get(4)
-                .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_');
-        let at_join = rest.starts_with("JOIN")
-            && rest
-                .as_bytes()
-                .get(4)
-                .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_');
+        let at_from = keyword_at(upper_bytes, i, b"FROM");
+        let at_join = keyword_at(upper_bytes, i, b"JOIN");
 
         if !(at_from || at_join) {
             i += 1;
@@ -300,12 +345,7 @@ fn scan_from_aliases(sql: &str) -> Vec<(String, String)> {
             i += 1;
         }
         // Optional AS
-        if upper[i..].starts_with("AS")
-            && upper
-                .as_bytes()
-                .get(i + 2)
-                .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
-        {
+        if keyword_at(upper_bytes, i, b"AS") {
             i += 2;
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
@@ -384,6 +424,34 @@ mod tests {
         }
     }
 
+    /// A catalog wide enough that its tables alone overflow the 40-item cap.
+    fn wide_catalog() -> Catalog {
+        Catalog {
+            schemas: vec![Schema {
+                name: "public".into(),
+                tables: (0..61)
+                    .map(|i| Table {
+                        schema: "public".into(),
+                        name: format!("t_{i:02}"),
+                        kind: TableKind::Table,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn column(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: "text".into(),
+            nullable: true,
+            default: None,
+            is_primary_key: false,
+            ordinal: 0,
+            references: None,
+        }
+    }
+
     #[test]
     fn request_finds_prefix_and_qualifier() {
         let req = request_at("SELECT u.", 9);
@@ -414,6 +482,149 @@ mod tests {
     }
 
     #[test]
+    fn empty_prefix_still_shows_the_catalog() {
+        // Every keyword matches an empty prefix, so a kind order that put
+        // keywords first spent the whole cap on them and hid the loaded
+        // catalog entirely.
+        let sql = "SELECT * FROM ";
+        let req = request_at(sql, sql.len());
+        let popup =
+            build_popup(&req, Some(&catalog()), &HashMap::new(), sql, sql.len()).expect("popup");
+        assert!(popup.items.iter().any(|i| i.label == "users"));
+        assert!(popup.items.iter().any(|i| i.label == "public"));
+        assert!(popup
+            .items
+            .iter()
+            .any(|i| i.kind == CompletionKind::Keyword));
+        assert!(popup.items.len() <= 40);
+    }
+
+    #[test]
+    fn table_outranks_keywords_for_the_same_prefix() {
+        let sql = "SELECT * FROM u";
+        let req = request_at(sql, sql.len());
+        let popup =
+            build_popup(&req, Some(&catalog()), &HashMap::new(), sql, sql.len()).expect("popup");
+        let users = popup
+            .items
+            .iter()
+            .position(|i| i.label == "users")
+            .expect("users");
+        let keyword = popup
+            .items
+            .iter()
+            .position(|i| i.kind == CompletionKind::Keyword)
+            .expect("a keyword");
+        assert!(
+            users < keyword,
+            "expected users ahead of keywords, got {:?}",
+            popup.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn qualifier_completes_columns_only() {
+        let sql = "SELECT u. FROM users u";
+        let caret = 9;
+        let mut columns = HashMap::new();
+        columns.insert(
+            ("public".to_string(), "users".to_string()),
+            vec![column("id"), column("name"), column("email")],
+        );
+        let req = request_at(sql, caret);
+        let popup = build_popup(&req, Some(&catalog()), &columns, sql, caret).expect("popup");
+        assert!(popup.items.iter().all(|i| i.kind == CompletionKind::Column));
+        assert_eq!(
+            popup
+                .items
+                .iter()
+                .map(|i| i.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["email", "id", "name"]
+        );
+    }
+
+    #[test]
+    fn a_wide_catalog_cannot_evict_every_keyword() {
+        // 61 tables all match an empty prefix, so without reserved slots the
+        // catalog fills the cap and the popup offers no SQL at all.
+        let sql = "SELECT * FROM ";
+        let req = request_at(sql, sql.len());
+        let popup = build_popup(&req, Some(&wide_catalog()), &HashMap::new(), sql, sql.len())
+            .expect("popup");
+        assert_eq!(popup.items.len(), 40);
+        assert_eq!(popup.items[0].label, "t_00");
+        assert_eq!(
+            popup
+                .items
+                .iter()
+                .filter(|i| i.kind == CompletionKind::Keyword)
+                .count(),
+            8
+        );
+
+        // Prefix `t` matches every table and only four keywords, so all four
+        // fit in the reserved slots rather than being pushed out.
+        let sql = "SELECT * FROM t";
+        let req = request_at(sql, sql.len());
+        let popup = build_popup(&req, Some(&wide_catalog()), &HashMap::new(), sql, sql.len())
+            .expect("popup");
+        assert!(popup.items.len() <= 40);
+        for keyword in ["TABLE", "THEN", "TRANSACTION", "TRUE"] {
+            assert!(
+                popup.items.iter().any(|i| i.label == keyword),
+                "{keyword} was evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualifier_that_names_both_a_schema_and_a_table_leads_with_columns() {
+        let catalog = Catalog {
+            schemas: vec![
+                Schema {
+                    name: "audit".into(),
+                    tables: vec![Table {
+                        schema: "audit".into(),
+                        name: "events".into(),
+                        kind: TableKind::Table,
+                    }],
+                },
+                Schema {
+                    name: "public".into(),
+                    tables: vec![Table {
+                        schema: "public".into(),
+                        name: "audit".into(),
+                        kind: TableKind::Table,
+                    }],
+                },
+            ],
+        };
+        let mut columns = HashMap::new();
+        columns.insert(
+            ("public".to_string(), "audit".to_string()),
+            vec![column("id"), column("actor")],
+        );
+        let sql = "SELECT audit. FROM audit";
+        let caret = 13;
+        let req = request_at(sql, caret);
+        assert_eq!(req.qualifier.as_deref(), Some("audit"));
+        let popup = build_popup(&req, Some(&catalog), &columns, sql, caret).expect("popup");
+        assert_eq!(
+            popup
+                .items
+                .iter()
+                .map(|i| (i.label.as_str(), i.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("actor", CompletionKind::Column),
+                ("id", CompletionKind::Column),
+                ("events", CompletionKind::Table),
+            ]
+        );
+    }
+
+    #[test]
     fn resolves_alias_to_table() {
         let sql = "SELECT u. FROM users u";
         let caret = 9; // after `u.`
@@ -421,5 +632,23 @@ mod tests {
         assert_eq!(req.qualifier.as_deref(), Some("u"));
         let table = resolve_qualifier("u", Some(&catalog()), sql, caret).unwrap();
         assert_eq!(table.name, "users");
+    }
+
+    #[test]
+    fn scans_aliases_past_non_ascii_literals() {
+        let sql = "SELECT * FROM users u WHERE u.name = 'café' AND u.";
+        assert_eq!(
+            scan_from_aliases(sql),
+            vec![("u".to_string(), "users".to_string())]
+        );
+    }
+
+    #[test]
+    fn ignores_identifier_ending_in_from() {
+        let sql = "SELECT valid_from FROM users u WHERE u.";
+        assert_eq!(
+            scan_from_aliases(sql),
+            vec![("u".to_string(), "users".to_string())]
+        );
     }
 }

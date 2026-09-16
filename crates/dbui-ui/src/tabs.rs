@@ -1036,8 +1036,9 @@ impl WorkspaceTab {
     /// Counted the same way the change bubble counts it, so the number in the
     /// "discard?" prompt is the number the user was just looking at. The open
     /// draft is not included: it is folded into `pending_edits` before anything
-    /// asks -- see `DbUi::stash_current_draft` -- which is what keeps a value
-    /// typed into the detail sidebar and not yet committed from being missed.
+    /// asks -- see `DbUi::leave_front_tab` -- which is what keeps a value typed
+    /// into the detail sidebar, or into the box open over a cell, and not yet
+    /// committed from being missed.
     pub fn pending_change_count(&self) -> usize {
         match self {
             Self::Table {
