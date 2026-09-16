@@ -7,7 +7,9 @@
 
 use dbui_domain::{ConnectionConfig, ConnectionId};
 use keyring::Entry;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const KEYCHAIN_SERVICE: &str = "dbui";
 
@@ -172,24 +174,51 @@ pub fn save_prefs(path: &Path, prefs: &Prefs) -> Result<(), StoreError> {
 pub fn load(path: &Path) -> Result<Vec<ConnectionConfig>, StoreError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // No file is a first launch, not a failure: there are no ids to miss
+        // and nothing on disk for a later save to destroy.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            set_unloaded(path, false);
+            return Ok(Vec::new());
+        }
         Err(error) => {
+            set_unloaded(path, true);
             return Err(StoreError::Read {
                 path: path.to_path_buf(),
                 message: error.to_string(),
-            })
+            });
         }
     };
 
-    let mut configs: Vec<ConnectionConfig> =
-        serde_json::from_str(&text).map_err(|error| StoreError::Parse {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
+    let mut configs: Vec<ConnectionConfig> = match serde_json::from_str(&text) {
+        Ok(configs) => configs,
+        Err(error) => {
+            set_unloaded(path, true);
+            return Err(StoreError::Parse {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    };
+
+    assign_ids(&mut configs);
+    set_unloaded(path, false);
 
     for config in &mut configs {
-        ConnectionId::observe(config.id);
-        config.password = load_password(config.id).unwrap_or_default();
+        match load_password(config.id) {
+            Ok(password) => {
+                config.password = password;
+                set_password_unread(config.id, false);
+            }
+            // A locked keychain, or a user who pressed Deny on the prompt,
+            // leaves us with no password for a connection that may well have
+            // one. The field has to be empty because there is nothing to put
+            // in it, so remember that the emptiness is ours and not the
+            // user's before `save` reads it as an instruction to delete.
+            Err(_) => {
+                config.password = String::new();
+                set_password_unread(config.id, true);
+            }
+        }
     }
 
     Ok(configs)
@@ -197,14 +226,24 @@ pub fn load(path: &Path) -> Result<Vec<ConnectionConfig>, StoreError> {
 
 /// Write saved connections, creating the directory if it is missing.
 ///
-/// Each config's password is synced to the keychain; empty passwords remove
-/// any existing secret for that id.
+/// Each config's password is synced to the keychain; an empty password
+/// removes the secret for that id, unless the password is empty only because
+/// reading it failed (see [`password_sync`]).
 pub fn save(path: &Path, configs: &[ConnectionConfig]) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| StoreError::Write {
-            path: parent.to_path_buf(),
-            message: error.to_string(),
-        })?;
+    // The connections in a file we could not read are ones whose ids were
+    // never observed, so the counter hands the next new connection an id that
+    // is already taken on disk -- and the first save of that duplicate deletes
+    // the older connection's keychain password. Refusing before the write and
+    // before the password loop leaves both the file and the keychain as they
+    // were, which is the only state anyone can recover from.
+    if is_unloaded(path) {
+        return Err(StoreError::Write {
+            path: path.to_path_buf(),
+            message: "it could not be read when dbui started, and saving would \
+                      discard the connections it holds -- repair or move the \
+                      file, then restart dbui"
+                .into(),
+        });
     }
 
     let text = serde_json::to_string_pretty(configs).map_err(|error| StoreError::Write {
@@ -212,24 +251,150 @@ pub fn save(path: &Path, configs: &[ConnectionConfig]) -> Result<(), StoreError>
         message: error.to_string(),
     })?;
 
-    std::fs::write(path, text).map_err(|error| StoreError::Write {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
+    // A half-written connections file does not parse, and the app answers an
+    // unparseable one with an empty connection list that the next save then
+    // makes permanent.
+    write_atomic(path, &text)?;
 
     for config in configs {
-        let _ = store_password(config.id, &config.password);
+        match password_sync(&config.password, password_unread(config.id)) {
+            PasswordSync::Keep => {}
+            PasswordSync::Delete => {
+                let _ = store_password(config.id, "");
+            }
+            PasswordSync::Set => {
+                // Having written it, we now know it, so a later empty field
+                // for this id is the user clearing it rather than our own gap.
+                if store_password(config.id, &config.password).is_ok() {
+                    set_password_unread(config.id, false);
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
+/// What [`save`] should do with the keychain secret for one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordSync {
+    Keep,
+    Delete,
+    Set,
+}
+
+/// Decide between keeping, deleting and writing a connection's secret.
+///
+/// An empty password means two opposite things depending on where it came
+/// from: the user emptied the field, or we never managed to read the field in
+/// the first place. Only the first is an instruction to delete, and a delete
+/// cannot be taken back, so the unread case keeps whatever is already there.
+fn password_sync(password: &str, unread: bool) -> PasswordSync {
+    if !password.is_empty() {
+        PasswordSync::Set
+    } else if unread {
+        PasswordSync::Keep
+    } else {
+        PasswordSync::Delete
+    }
+}
+
+/// Connections whose password this process failed to read.
+///
+/// Kept here rather than on `ConnectionConfig` because the flag is about this
+/// process's luck with the keychain, not about the connection: it must never
+/// reach disk, and it has to survive the config being cloned through the
+/// workspace and rebuilt by the connection form.
+static UNREAD_PASSWORDS: Mutex<BTreeSet<ConnectionId>> = Mutex::new(BTreeSet::new());
+
+fn set_password_unread(id: ConnectionId, unread: bool) {
+    let mut ids = UNREAD_PASSWORDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if unread {
+        ids.insert(id);
+    } else {
+        ids.remove(&id);
+    }
+}
+
+fn password_unread(id: ConnectionId) -> bool {
+    UNREAD_PASSWORDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&id)
+}
+
+/// Files whose last [`load`] failed, and which [`save`] must therefore leave
+/// alone.
+///
+/// Keyed by path rather than remembered by the caller because the refusal has
+/// to outlive every config the UI is holding: the danger is exactly that the
+/// in-memory list is empty while the file is not.
+static UNLOADED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+fn set_unloaded(path: &Path, unloaded: bool) {
+    let mut paths = UNLOADED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if unloaded {
+        paths.insert(path.to_path_buf());
+    } else {
+        paths.remove(path);
+    }
+}
+
+fn is_unloaded(path: &Path) -> bool {
+    UNLOADED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(path)
+}
+
+/// Keep the id counter clear of the file, and give an id to anything that
+/// arrived without one.
+///
+/// The two passes cannot be merged: an id has to be minted knowing every
+/// number the file claims, including the ones further down it, or the new
+/// connection lands on an existing one and inherits its keychain entry.
+fn assign_ids(configs: &mut [ConnectionConfig]) {
+    for config in configs.iter() {
+        if !config.id.is_unassigned() {
+            ConnectionId::observe(config.id);
+        }
+    }
+    for config in configs.iter_mut() {
+        if config.id.is_unassigned() {
+            config.id = ConnectionId::next();
+        }
+    }
+}
+
 /// Drop the keychain secret for a connection that is being deleted.
+///
+/// Refused when the connections file failed to load this session, and when we
+/// cannot even name that file. Deleting the connection dbui has just said it
+/// will not save is a very plausible next click, and the id being deleted was
+/// minted against a counter the unread file never primed -- so it may name
+/// somebody else's connection, whose password this would take with it.
 pub fn delete_password(id: ConnectionId) {
-    let Ok(entry) = password_entry(id) else {
+    let Ok(connections) = connections_path() else {
         return;
     };
+    delete_password_at(&connections, id);
+}
+
+/// The body of [`delete_password`], with the file it judges by passed in.
+/// `true` means the keychain was reached for.
+fn delete_password_at(connections: &Path, id: ConnectionId) -> bool {
+    if is_unloaded(connections) {
+        return false;
+    }
+    let Ok(entry) = password_entry(id) else {
+        return false;
+    };
     let _ = entry.delete_credential();
+    true
 }
 
 fn password_entry(id: ConnectionId) -> keyring::Result<Entry> {
@@ -315,6 +480,56 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_password_is_kept_while_a_cleared_one_is_deleted() {
+        assert_eq!(password_sync("", true), PasswordSync::Keep);
+        assert_eq!(password_sync("", false), PasswordSync::Delete);
+        assert_eq!(password_sync("hunter2", false), PasswordSync::Set);
+        assert_eq!(password_sync("hunter2", true), PasswordSync::Set);
+    }
+
+    /// A read-only file is the one case where the two implementations differ
+    /// observably without a crash: `fs::write` needs to open the file itself,
+    /// while a rename only needs a writable directory.
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_an_unwritable_file_still_replaces_it_whole() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("atomic");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let first = ConnectionConfig::new(Driver::Postgres);
+        let mut second = ConnectionConfig::new(Driver::MySql);
+        second.name = "Survivor".into();
+        let before = vec![first, second.clone()];
+        std::fs::write(&path, serde_json::to_string_pretty(&before).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        // Root ignores the mode bits, so there the plain write would pass this
+        // test for the wrong reason.
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            return;
+        }
+
+        // Nothing read this password, so the save must leave the keychain
+        // alone -- which is also what keeps this test off the real one.
+        set_password_unread(second.id, true);
+        save(&path, std::slice::from_ref(&second)).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let after: Vec<ConnectionConfig> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name, "Survivor");
+
+        let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        assert!(!temp.exists(), "the temp file must not outlive the rename");
+
+        set_password_unread(second.id, false);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn malformed_json_is_reported_not_swallowed() {
         let path = temp_path("malformed");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -323,5 +538,130 @@ mod tests {
         assert!(matches!(load(&path), Err(StoreError::Parse { .. })));
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_that_failed_to_load_is_not_saved_over() {
+        let path = temp_path("unloaded");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let on_disk = "[{\"id\": 7, \"name\": \"Prod\"";
+        std::fs::write(&path, on_disk).unwrap();
+
+        assert!(matches!(load(&path), Err(StoreError::Parse { .. })));
+
+        let config = ConnectionConfig::new(Driver::Sqlite);
+        // Nothing read this password, so even a save that got through would
+        // leave the keychain alone -- which is what keeps this test off the
+        // real one.
+        set_password_unread(config.id, true);
+        assert!(matches!(
+            save(&path, std::slice::from_ref(&config)),
+            Err(StoreError::Write { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), on_disk);
+
+        set_password_unread(config.id, false);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_first_launch_with_no_file_can_still_save() {
+        let path = temp_path("first-launch");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        assert_eq!(load(&path).unwrap(), Vec::new());
+
+        let mut config = ConnectionConfig::new(Driver::Sqlite);
+        config.name = "Notes".into();
+        set_password_unread(config.id, true);
+        save(&path, std::slice::from_ref(&config)).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Notes"));
+
+        set_password_unread(config.id, false);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The good file holds no connections on purpose: hydrating a password
+    /// would reach for the real keychain, and what is under test is the path,
+    /// not the secrets.
+    #[test]
+    fn a_repaired_file_can_be_saved_over_again() {
+        let path = temp_path("repaired");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        assert!(load(&path).is_err());
+        assert!(save(&path, &[]).is_err());
+
+        std::fs::write(&path, "[]").unwrap();
+        assert_eq!(load(&path).unwrap(), Vec::new());
+        save(&path, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_config_that_omits_its_id_does_not_reuse_one_from_the_same_file() {
+        let raw = r#"[
+            {"id": 1, "name": "Prod", "driver": "postgres", "host": "db",
+             "port": 5432, "username": "u", "database": "shop"},
+            {"name": "Notes", "driver": "sqlite", "host": "", "port": 0,
+             "username": "", "database": "/tmp/notes.db"}
+        ]"#;
+
+        let mut configs: Vec<ConnectionConfig> = serde_json::from_str(raw).unwrap();
+        assign_ids(&mut configs);
+
+        assert_eq!(configs[0].id, ConnectionId(1));
+        assert!(!configs[1].id.is_unassigned());
+        assert_ne!(configs[1].id, configs[0].id);
+    }
+
+    #[test]
+    fn a_file_that_failed_to_load_holds_back_the_keychain_delete() {
+        let path = temp_path("delete-guard");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        assert!(load(&path).is_err());
+
+        // False is "never reached for the secret", which is both the point of
+        // the guard and what keeps this test off the real keychain.
+        assert!(!delete_password_at(&path, ConnectionId(1)));
+
+        set_unloaded(&path, false);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The input that tells the two passes apart from one interleaved pass: a
+    /// config with no id standing *before* the ids the file goes on to claim.
+    /// Minting as we walk would hand it one of them.
+    #[test]
+    fn an_id_is_minted_only_after_the_whole_file_has_been_read() {
+        // Above every id the rest of the suite mints, so the numbers claimed
+        // below are exactly the ones a single pass would mint into.
+        let base = 9_000_000_000;
+        ConnectionId::observe(ConnectionId(base));
+
+        let mut entries = vec![r#"{"name": "Notes", "driver": "sqlite", "host": "",
+             "port": 0, "username": "", "database": "/tmp/notes.db"}"#
+            .to_string()];
+        // A block of ids rather than one: connections minted in parallel by
+        // other tests shift the counter, and every landing spot is taken.
+        for claimed in base + 1..=base + 32 {
+            entries.push(format!(
+                r#"{{"id": {claimed}, "name": "Prod", "driver": "postgres",
+                     "host": "db", "port": 5432, "username": "u",
+                     "database": "shop"}}"#
+            ));
+        }
+
+        let mut configs: Vec<ConnectionConfig> =
+            serde_json::from_str(&format!("[{}]", entries.join(","))).unwrap();
+        assign_ids(&mut configs);
+
+        let ids: BTreeSet<ConnectionId> = configs.iter().map(|config| config.id).collect();
+        assert_eq!(ids.len(), configs.len(), "an id was handed out twice");
     }
 }
