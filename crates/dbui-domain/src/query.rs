@@ -263,8 +263,61 @@ pub fn returns_rows(sql: &str) -> bool {
         // `WITH ... INSERT` exists, but the common case is a CTE feeding a
         // SELECT, and `RETURNING` makes writes produce rows too.
         "WITH" => true,
-        _ => sql.to_ascii_uppercase().contains(" RETURNING "),
+        _ => has_returning(sql),
     }
+}
+
+/// Does a write carry a `RETURNING` clause?
+///
+/// Matching the bare substring reads a quoted string as a clause and misses the
+/// clause whenever the surrounding whitespace is a newline or the word is up
+/// against a bracket, so the scan skips literals, dollar-quoted bodies and
+/// comments the way the statement splitter does and requires the word to stand
+/// on its own.
+///
+/// The word only stands on its own between bytes that cannot continue an
+/// identifier, and a multi-byte character is made of bytes that can: reading
+/// `\u{e9}` as a boundary is what made `\u{e9}returning` look like the clause.
+fn has_returning(sql: &str) -> bool {
+    use crate::sql_split::is_ident_cont;
+
+    const WORD: &[u8] = b"RETURNING";
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                i = crate::sql_split::skip_quoted(bytes, i, quote);
+            }
+            // Dollar-quoted bodies are values too, and a function body is
+            // where a stray `RETURNING` is most likely to sit. Missing this
+            // sent a plain write down the rows path, so its verdict read
+            // "0 rows" instead of the count it had affected.
+            b'$' => {
+                i = crate::sql_split::skip_dollar_quoted(bytes, i).unwrap_or(i + 1);
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i = crate::sql_split::skip_line_comment(bytes, i);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = crate::sql_split::skip_block_comment(bytes, i);
+            }
+            _ => {
+                let end = i + WORD.len();
+                if end <= bytes.len()
+                    && bytes[i..end].eq_ignore_ascii_case(WORD)
+                    && !i.checked_sub(1).is_some_and(|b| is_ident_cont(bytes[b]))
+                    && !bytes.get(end).copied().is_some_and(is_ident_cont)
+                {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -279,11 +332,82 @@ mod tests {
         assert!(returns_rows("WITH x AS (SELECT 1) SELECT * FROM x"));
         assert!(returns_rows("-- a note\nSELECT 1"));
         assert!(returns_rows("INSERT INTO t VALUES (1) RETURNING id"));
+        assert!(returns_rows("DELETE FROM t WHERE id=1 RETURNING *"));
+        assert!(returns_rows("UPDATE t SET a=1 RETURNING id;"));
 
         assert!(!returns_rows("INSERT INTO t VALUES (1)"));
         assert!(!returns_rows("UPDATE t SET a = 1"));
         assert!(!returns_rows("CREATE TABLE t (id int)"));
+        assert!(!returns_rows("CREATE TABLE returning_log (id int)"));
         assert!(!returns_rows(""));
+    }
+
+    /// The bug this fixes: the clause was found by searching for `" RETURNING "`,
+    /// so a clause behind a newline or against a bracket was missed and the rows
+    /// it produced were thrown away.
+    #[test]
+    fn returning_is_found_whatever_delimits_it() {
+        assert!(returns_rows("UPDATE t SET a=1\nRETURNING id"));
+        assert!(returns_rows("UPDATE t SET a=1 RETURNING\n  id"));
+        assert!(returns_rows("UPDATE t SET a=1\r\nRETURNING id"));
+        assert!(returns_rows("UPDATE t SET a=1 RETURNING(id)"));
+        assert!(returns_rows("INSERT INTO t VALUES (1)RETURNING id"));
+        assert!(returns_rows("update t set a=1 returning id"));
+    }
+
+    /// And the other direction: the word only counts where the engine would
+    /// read it as a keyword, not inside a value, an identifier or a comment.
+    #[test]
+    fn returning_inside_text_is_not_a_clause() {
+        assert!(!returns_rows("INSERT INTO t VALUES ('a returning b')"));
+        assert!(!returns_rows("UPDATE t SET note = 'x returning y'"));
+        assert!(!returns_rows("UPDATE t SET note = 'it''s returning'"));
+        assert!(!returns_rows(r#"UPDATE t SET "returning" = 1"#));
+        assert!(!returns_rows("UPDATE t SET a=1 -- returning id"));
+        assert!(!returns_rows("UPDATE t SET a=1 /* returning id */"));
+        assert!(!returns_rows("UPDATE t SET a=1 WHERE b='ñ returning'"));
+    }
+
+    /// The other half of the same bug: `has_returning` reused the splitter's
+    /// skip helpers, which knew nothing of dollar quoting, so `$$ returning $$`
+    /// read as a clause. A plain write then went down the rows path and its
+    /// verdict said "0 rows" instead of the count it had affected.
+    #[test]
+    fn returning_inside_a_dollar_quoted_body_is_not_a_clause() {
+        assert!(!returns_rows("UPDATE t SET a=$$ returning $$"));
+        assert!(!returns_rows("UPDATE t SET a=$tag$ returning $tag$"));
+        assert!(!returns_rows(
+            "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 RETURNING x $$ LANGUAGE sql"
+        ));
+        // Not recursive, and case-sensitive: neither inner tag ends the body.
+        assert!(!returns_rows(
+            "UPDATE t SET a=$$ x $inner$ returning $inner$ y $$"
+        ));
+        assert!(!returns_rows("UPDATE t SET a=$TAG$ $tag$ returning $TAG$"));
+        // An unterminated body runs to the end rather than spinning.
+        assert!(!returns_rows("UPDATE t SET a=$$ returning"));
+    }
+
+    /// The regression this closes: the byte scan called every byte `>= 0x80` a
+    /// word boundary, so a multi-byte character abutting the word made an
+    /// identifier read as the keyword. The substring search this replaced got
+    /// these right, so they must not start failing now.
+    #[test]
+    fn a_non_ascii_neighbour_is_not_a_word_boundary() {
+        assert!(!returns_rows("UPDATE t SET \u{e9}returning = 1"));
+        assert!(!returns_rows("UPDATE t SET returning\u{e9} = 1"));
+        assert!(!returns_rows("UPDATE t SET a\u{e9}RETURNING = 1"));
+    }
+
+    /// And a `$` that opens nothing must not swallow the clause behind it:
+    /// `$1` is a placeholder and `a$b` is one identifier.
+    #[test]
+    fn a_lone_dollar_does_not_hide_the_clause() {
+        assert!(returns_rows("UPDATE t SET a=$1 RETURNING id"));
+        assert!(returns_rows("INSERT INTO t VALUES ($1, $2) RETURNING id"));
+        assert!(returns_rows("UPDATE t SET a$b = 1 RETURNING id"));
+        assert!(returns_rows("UPDATE t SET a = 100 $ 2 RETURNING id"));
+        assert!(returns_rows("UPDATE t SET a = 1 RETURNING id -- $$"));
     }
 
     #[test]
