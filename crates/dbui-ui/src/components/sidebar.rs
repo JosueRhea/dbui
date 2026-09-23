@@ -3,8 +3,8 @@
 //! Connections are chosen from the titlebar picker; this surface only walks
 //! the catalog of whatever is currently connected.
 
-use super::caption;
 use super::context_menu::ContextTarget;
+use super::{caption, motion};
 use crate::root::{DbUi, Focus, SidebarItem};
 use crate::theme::metrics;
 use dbui_app::domain::ConnectionId;
@@ -475,23 +475,41 @@ impl DbUi {
                 };
                 let is_cursor = cursor.as_ref() == Some(&table_item);
 
-                rows.push(
-                    div()
-                        .id(("table", schema_index * 10_000 + table_index))
-                        .relative()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .pl(metrics::scaled(28.))
-                        .pr_3()
-                        .py_1()
-                        .cursor_pointer()
-                        .when(is_open, |row| row.bg(theme.selection))
-                        .hover(|row| row.bg(theme.hover))
-                        .children((is_cursor && cursor_shown).then(|| cursor_marker(theme)))
-                        .on_click(cx.listener({
+                let row = div()
+                    .id(("table", schema_index * 10_000 + table_index))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl(metrics::scaled(28.))
+                    .pr_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(is_open, |row| row.bg(theme.selection))
+                    .hover(|row| row.bg(theme.hover))
+                    .children((is_cursor && cursor_shown).then(|| cursor_marker(theme)))
+                    .on_click(cx.listener({
+                        let target = target.clone();
+                        move |this, _, _window, cx| {
+                            this.set_sidebar_cursor(
+                                SidebarItem::Table {
+                                    connection: id,
+                                    table: target.clone(),
+                                },
+                                cx,
+                            );
+                            this.open_table_tab(target.clone(), cx);
+                        }
+                    }))
+                    // Right-click moves the cursor too: the menu names one
+                    // table, and the tree has to show which.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
                             let target = target.clone();
-                            move |this, _, _window, cx| {
+                            let kind = table.kind;
+                            move |this, event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
                                 this.set_sidebar_cursor(
                                     SidebarItem::Table {
                                         connection: id,
@@ -499,52 +517,46 @@ impl DbUi {
                                     },
                                     cx,
                                 );
-                                this.open_table_tab(target.clone(), cx);
+                                this.open_context_menu(
+                                    ContextTarget::Table {
+                                        table: target.clone(),
+                                        kind,
+                                    },
+                                    event.position,
+                                    cx,
+                                );
                             }
-                        }))
-                        // Right-click moves the cursor too: the menu names one
-                        // table, and the tree has to show which.
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener({
-                                let target = target.clone();
-                                let kind = table.kind;
-                                move |this, event: &MouseDownEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    this.set_sidebar_cursor(
-                                        SidebarItem::Table {
-                                            connection: id,
-                                            table: target.clone(),
-                                        },
-                                        cx,
-                                    );
-                                    this.open_context_menu(
-                                        ContextTarget::Table {
-                                            table: target.clone(),
-                                            kind,
-                                        },
-                                        event.position,
-                                        cx,
-                                    );
-                                }
-                            }),
-                        )
-                        .child(super::icons::kind_icon(
-                            table.kind,
-                            if table.kind.is_view() {
-                                theme.value_structured
-                            } else {
-                                theme.text_faint
-                            },
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_color(theme.text)
-                                .child(SharedString::from(table.name.clone())),
+                        }),
+                    )
+                    .child(super::icons::kind_icon(
+                        table.kind,
+                        if table.kind.is_view() {
+                            theme.value_structured
+                        } else {
+                            theme.text_faint
+                        },
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme.text)
+                            .child(SharedString::from(table.name.clone())),
+                    );
+                // Unfolding a schema pours its tables in. Not while filtering:
+                // every keystroke reshuffles which rows are drawn, and a tree
+                // that re-fades under each letter is one that flickers.
+                if query.is_empty() {
+                    rows.push(
+                        motion::cascade(
+                            ("table-in", schema_index * 10_000 + table_index),
+                            row,
+                            table_index,
                         )
                         .into_any_element(),
-                );
+                    );
+                } else {
+                    rows.push(row.into_any_element());
+                }
             }
         }
 

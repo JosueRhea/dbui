@@ -67,7 +67,7 @@ impl PendingRowDelete {
     }
 }
 
-fn pk_equal(left: &[(String, Value)], right: &[(String, Value)]) -> bool {
+pub(crate) fn pk_equal(left: &[(String, Value)], right: &[(String, Value)]) -> bool {
     left.len() == right.len()
         && left
             .iter()

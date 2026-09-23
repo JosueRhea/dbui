@@ -7,7 +7,7 @@
 //! move it: the same pair as the toolbar, at the other end of a window that is
 //! often tall enough for the toolbar to be nowhere near the last row you read.
 
-use super::icon_button;
+use super::{icon_button, motion};
 use crate::root::{DbUi, ResultSource, Status};
 use crate::theme::metrics;
 use crate::update::UpdateAction;
@@ -77,8 +77,19 @@ impl DbUi {
             .border_t_1()
             .border_color(theme.border)
             .text_size(metrics::text_size_small())
-            .child(super::dot(light))
-            .child(div().text_color(color).child(message))
+            // The light breathes while the app is waiting on something, so a
+            // long load reads as in progress rather than stuck.
+            .child(if matches!(self.status, Status::Busy(_)) {
+                motion::pulse("status-busy", super::dot(light)).into_any_element()
+            } else {
+                super::dot(light).into_any_element()
+            })
+            // Keyed on what it says, so each new message fades in and a
+            // redraw of the same one does not.
+            .child(motion::fade(
+                ("status-message", motion::content_key(&message)),
+                div().text_color(color).child(message),
+            ))
             .child(div().flex_1())
             // Left of the other trailing items: an update is about the app, not
             // about what is on screen, so it should not sit between a value and

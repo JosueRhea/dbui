@@ -1,6 +1,6 @@
 //! The new/edit connection sheet.
 
-use super::{button_with_focus, caption};
+use super::{button_with_focus, caption, motion};
 use crate::root::DbUi;
 use crate::text_input::{self, TextInput};
 use crate::theme::{metrics, Theme};
@@ -605,7 +605,9 @@ impl DbUi {
 
         // The scrim: a click outside the sheet dismisses it, the way every
         // other modal on the platform behaves.
-        div()
+        motion::dialog(
+"modal-in",
+div()
             .id("modal-scrim")
             .absolute()
             .top_0()
@@ -720,7 +722,9 @@ impl DbUi {
                                 )),
                             ),
                     ),
-            )
+            ),
+px(0.),
+)
             .into_any_element()
     }
 }

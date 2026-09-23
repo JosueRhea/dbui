@@ -3,9 +3,9 @@
 //! The tab strip that used to head this column now lives in the titlebar;
 //! what is left starts with the toolbar that decides what the content shows.
 
-use super::{button, caption, scrollbar};
+use super::{button, caption, motion, scrollbar};
 use crate::highlight;
-use crate::root::{DbUi, Focus};
+use crate::root::{DbUi, Focus, Status};
 use crate::sql_format;
 use crate::tabs::{TablePane, WorkspaceTab};
 use crate::text_input::{self, selection_on_line};
@@ -21,7 +21,9 @@ impl DbUi {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let busy = matches!(self.status, Status::Busy(_));
         div()
+            .relative()
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
@@ -32,6 +34,8 @@ impl DbUi {
             .child(self.render_filter_strip(cx))
             .child(self.render_columns_panel(cx))
             .child(self.render_tab_content(window, cx))
+            // Last, so it draws over the toolbar's top edge rather than under.
+            .children(busy.then(|| motion::busy_bar(self.theme.accent)))
     }
 
     fn render_columns_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -226,8 +230,11 @@ impl DbUi {
                 .text_color(theme.text_muted)
                 .child(SharedString::from(sql))
         });
+        // Keyed on the message: a new failure fades in, and a redraw of the
+        // one already showing stays put.
+        let key = motion::content_key(&error.message);
 
-        div()
+        let panel = div()
             .relative()
             .flex_shrink_0()
             .child(
@@ -272,8 +279,8 @@ impl DbUi {
                 "error-scrollbar",
                 self.error_scroll.clone(),
                 theme,
-            ))
-            .into_any_element()
+            ));
+        motion::fade(("error-panel-in", key), panel).into_any_element()
     }
 
     /// One chip per statement of the last run.

@@ -6,9 +6,11 @@
 //! then hunting along the bottom of the window for "Structure" was two
 //! journeys for one thought.
 
-use super::icons::{columns_icon, funnel_icon, plus_icon, table_icon, view_icon};
+use super::icons::{columns_icon, funnel_icon, plus_icon, table_icon, view_icon, RefreshIcon};
 use super::text_field::{text_field, InputTarget};
-use super::{caption, icon_button, menu_row, menu_surface, toolbar_button, toolbar_icon_color};
+use super::{
+    caption, icon_button, menu_row, menu_surface, motion, toolbar_button, toolbar_icon_color,
+};
 use crate::root::{DbUi, Focus, ResultSource};
 use crate::tabs::{TablePane, WorkspaceTab};
 use crate::theme::metrics;
@@ -191,8 +193,17 @@ impl DbUi {
             // Reloading is about the result, so it sits with the controls that
             // page through it rather than in the tab strip it used to.
             .child(
-                icon_button("refresh-result", "↻", theme, false)
-                    .on_click(cx.listener(|this, _, _window, cx| this.refresh_result(cx))),
+                icon_button(
+                    "refresh-result",
+                    motion::spin(
+                        "refresh-result-spin",
+                        RefreshIcon::new(theme.text_muted),
+                        self.result_refreshes,
+                    ),
+                    theme,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _window, cx| this.refresh_result(cx))),
             )
             .when(paging, |bar| {
                 let draft = page_size_draft.expect("table tab has page size draft");
@@ -281,7 +292,8 @@ impl DbUi {
                 ),
             )
             .children(open.then(|| {
-                deferred(
+                deferred(motion::menu(
+                    "page-size-menu-in",
                     menu_surface("page-size-menu", theme)
                         .top_full()
                         .right_0()
@@ -299,7 +311,8 @@ impl DbUi {
                                 .child("Rows / page"),
                         )
                         .children(rows),
-                )
+                    metrics::scaled(4.),
+                ))
             }))
             .into_any_element()
     }

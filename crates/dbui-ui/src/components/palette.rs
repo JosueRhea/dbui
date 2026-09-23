@@ -2,6 +2,7 @@
 
 use super::close_guard::TabScope;
 use super::icons::{command_mark, table_icon, theme_mark};
+use super::motion;
 use super::text_field::{text_field, InputTarget};
 use crate::root::{DbUi, Focus, Status};
 use crate::text_input::TextInput;
@@ -1130,102 +1131,105 @@ impl DbUi {
         };
 
         Some(
-            div()
-                .id("palette-scrim")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .justify_center()
-                .pt(metrics::scaled(72.))
-                .bg(scrim)
-                .on_click(cx.listener(|this, _, _, cx| this.close_palette(cx)))
-                .child(
-                    div()
-                        .id("palette-panel")
-                        .w(metrics::scaled(560.))
-                        .max_h(metrics::scaled(480.))
-                        .flex()
-                        .flex_col()
-                        .rounded(px(16.))
-                        .bg(theme.elevated)
-                        .border_1()
-                        .border_color(theme.border)
-                        .overflow_hidden()
-                        .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .px_3()
-                                .pt_1()
-                                .pb_1()
-                                .child(div().flex_1().min_w(px(0.)).child(text_field(
-                                    "palette-query",
-                                    query,
-                                    InputTarget::PaletteQuery,
-                                    true,
-                                    Some(placeholder),
-                                    theme,
-                                    cx,
-                                )))
-                                .child(
-                                    div()
-                                        .id("palette-close")
-                                        .w(metrics::scaled(28.))
-                                        .h(metrics::scaled(28.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(6.))
-                                        .cursor_pointer()
-                                        .text_color(theme.text_faint)
-                                        .hover(|s| s.bg(theme.hover).text_color(theme.text))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.close_palette(cx);
-                                        }))
-                                        .child("×"),
-                                ),
-                        )
-                        .child(div().h(px(1.)).w_full().bg(theme.divider))
-                        .child(
-                            div()
-                                .relative()
-                                .flex_1()
-                                .min_h(px(0.))
-                                .max_h(metrics::scaled(360.))
-                                .child(
-                                    div()
-                                        .id("palette-list")
-                                        .track_scroll(&list_scroll)
-                                        .size_full()
-                                        .min_h(px(0.))
-                                        .overflow_y_scroll()
-                                        .pb_1()
-                                        .children(list),
-                                )
-                                .child(crate::components::scrollbar::vertical_scrollbar(
-                                    "palette-scrollbar",
-                                    list_scroll.clone(),
-                                    theme,
-                                )),
-                        )
-                        .child(div().h(px(1.)).w_full().bg(theme.divider))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .px_3()
-                                .py_1p5()
-                                .child(legend_item("↑↓", "Navigate", theme))
-                                .child(legend_item("↵", "Confirm", theme))
-                                .child(legend_item("esc", "Close", theme)),
-                        ),
-                )
-                .into_any_element(),
+            motion::dialog(
+                "palette-in",
+                div()
+                    .id("palette-scrim")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .justify_center()
+                    .bg(scrim)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_palette(cx)))
+                    .child(
+                        div()
+                            .id("palette-panel")
+                            .w(metrics::scaled(560.))
+                            .max_h(metrics::scaled(480.))
+                            .flex()
+                            .flex_col()
+                            .rounded(px(16.))
+                            .bg(theme.elevated)
+                            .border_1()
+                            .border_color(theme.border)
+                            .overflow_hidden()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_3()
+                                    .pt_1()
+                                    .pb_1()
+                                    .child(div().flex_1().min_w(px(0.)).child(text_field(
+                                        "palette-query",
+                                        query,
+                                        InputTarget::PaletteQuery,
+                                        true,
+                                        Some(placeholder),
+                                        theme,
+                                        cx,
+                                    )))
+                                    .child(
+                                        div()
+                                            .id("palette-close")
+                                            .w(metrics::scaled(28.))
+                                            .h(metrics::scaled(28.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(6.))
+                                            .cursor_pointer()
+                                            .text_color(theme.text_faint)
+                                            .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.close_palette(cx);
+                                            }))
+                                            .child("×"),
+                                    ),
+                            )
+                            .child(div().h(px(1.)).w_full().bg(theme.divider))
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .max_h(metrics::scaled(360.))
+                                    .child(
+                                        div()
+                                            .id("palette-list")
+                                            .track_scroll(&list_scroll)
+                                            .size_full()
+                                            .min_h(px(0.))
+                                            .overflow_y_scroll()
+                                            .pb_1()
+                                            .children(list),
+                                    )
+                                    .child(crate::components::scrollbar::vertical_scrollbar(
+                                        "palette-scrollbar",
+                                        list_scroll.clone(),
+                                        theme,
+                                    )),
+                            )
+                            .child(div().h(px(1.)).w_full().bg(theme.divider))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .px_3()
+                                    .py_1p5()
+                                    .child(legend_item("↑↓", "Navigate", theme))
+                                    .child(legend_item("↵", "Confirm", theme))
+                                    .child(legend_item("esc", "Close", theme)),
+                            ),
+                    ),
+                metrics::scaled(72.),
+            )
+            .into_any_element(),
         )
     }
 }

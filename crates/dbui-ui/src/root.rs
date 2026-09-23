@@ -10,11 +10,11 @@ use crate::components::context_menu::{ConfirmPrompt, ContextMenu};
 use crate::components::palette::{Palette, PaletteKind};
 use crate::components::{ConnectionForm, DetailInput, FormAction};
 use crate::sql_complete::CompletionPopup;
-use crate::tabs::{RowDraft, Tabs, WorkspaceTab};
+use crate::tabs::{RowDraft, TabId, Tabs, WorkspaceTab};
 use crate::theme::{metrics, Theme};
 use dbui_app::commands;
 use dbui_app::domain::{
-    Catalog, Column, ColumnInfo, ConnectionId, Page, QueryOutcome, ResultSet, TableRef,
+    Catalog, Column, ColumnInfo, ConnectionId, Page, QueryOutcome, ResultSet, TableRef, Value,
 };
 use dbui_app::{
     session, store, ConnectionStatus, DbRuntime, RowUpdate, SavedConnectionTab, Session, Workspace,
@@ -25,6 +25,8 @@ use gpui::{
     Window,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Which surface the keyboard is talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +121,10 @@ pub struct ResultView {
     /// touching the rows, which still store their values in the order the
     /// server sent them.
     pub order: Vec<usize>,
+    /// Which arrival this is, unique for the life of the process. The grid
+    /// keys its fade-in on it, so a new page or a re-run fades in and a
+    /// sort or a column drag -- the same rows, rearranged -- does not.
+    pub arrival: u64,
 }
 
 impl ResultView {
@@ -138,6 +144,10 @@ impl ResultView {
             structure,
             origin: Vec::new(),
             order: (0..column_count).collect(),
+            arrival: {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
         }
     }
 
@@ -301,6 +311,22 @@ impl Status {
     }
 }
 
+/// Rows the grid lights up for a moment -- see
+/// [`motion::flash`](crate::components::motion::flash).
+pub(crate) struct RowFlash {
+    pub tab: TabId,
+    pub rows: FlashRows,
+    pub started: Instant,
+}
+
+pub(crate) enum FlashRows {
+    /// Copied: named by position, since the page they sit on stays put.
+    Copied(Vec<usize>),
+    /// Committed: named by key, since the reload that follows a commit moves
+    /// rows around -- and the flash is meant to be seen on the reloaded page.
+    Committed(Vec<Vec<(String, Value)>>),
+}
+
 pub struct DbUi {
     pub(crate) runtime: DbRuntime,
     pub(crate) workspace: Workspace,
@@ -336,6 +362,18 @@ pub struct DbUi {
     /// bottom of the window, and a copy answered only there reads as nothing
     /// having happened.
     pub(crate) copied_cell: Option<(usize, usize)>,
+    /// When [`Self::copied_cell`] was copied: the tint flares and settles
+    /// rather than simply switching on.
+    pub(crate) copied_at: Option<Instant>,
+    /// A grid cell just staged by editing it in place, lit for a moment so
+    /// the eye finds what changed: `(tab, row, column, when)`.
+    pub(crate) cell_flash: Option<(TabId, usize, usize, Instant)>,
+    /// Rows lit for a moment after something happened to them.
+    pub(crate) row_flash: Option<RowFlash>,
+    /// Presses of the two reload buttons. Each spins its icon once, keyed on
+    /// the count so a press mid-spin starts a fresh turn.
+    pub(crate) catalog_refreshes: usize,
+    pub(crate) result_refreshes: usize,
     /// The detail field whose copy button was last pressed.
     ///
     /// The status bar is at the far bottom of the window, and a sidebar
@@ -423,6 +461,12 @@ pub struct DbUi {
     pub(crate) column_move: Option<ColumnMove>,
     /// A tab being dragged along the strip, if one is.
     pub(crate) tab_drag: Option<TabDrag>,
+    /// Where the pointer is while a tab or a column is in hand, for the copy
+    /// of it drawn under the pointer. Window coordinates.
+    pub(crate) drag_pointer: Option<gpui::Point<Pixels>>,
+    /// The underline under the front tab, where it is sliding to, and how
+    /// far down the strip it sits.
+    pub(crate) tab_indicator: Option<(crate::components::motion::Slide, Pixels)>,
     /// Right-click menu, if one is open.
     pub(crate) context_menu: Option<ContextMenu>,
     /// A destructive action waiting on the user typing the table's name.
@@ -588,6 +632,11 @@ impl DbUi {
             loads_in_flight: 0,
             selected_cell: None,
             copied_cell: None,
+            copied_at: None,
+            cell_flash: None,
+            row_flash: None,
+            catalog_refreshes: 0,
+            result_refreshes: 0,
             copied_field: None,
             modal: None,
             connection_picker_open: false,
@@ -617,6 +666,8 @@ impl DbUi {
             column_drag: None,
             column_move: None,
             tab_drag: None,
+            drag_pointer: None,
+            tab_indicator: None,
             context_menu: None,
             confirm: None,
             close_guard: None,
@@ -1464,6 +1515,7 @@ impl DbUi {
     }
 
     pub(crate) fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        self.catalog_refreshes += 1;
         self.reload_catalog(true, cx);
     }
 
@@ -1766,6 +1818,18 @@ impl DbUi {
         self.selected_cell = None;
         self.copied_cell = None;
         self.copied_field = None;
+        // Positional flashes too: lit rows that were copied from the top of
+        // the page would otherwise light whichever rows sorted up there.
+        self.cell_flash = None;
+        if matches!(
+            self.row_flash,
+            Some(RowFlash {
+                rows: FlashRows::Copied(_),
+                ..
+            })
+        ) {
+            self.row_flash = None;
+        }
 
         self.status = match &next {
             Some(key) if key.ascending => Status::info(format!("Sorted by {column_name} ↑")),
@@ -2420,6 +2484,7 @@ impl DbUi {
     }
 
     pub(crate) fn refresh_result(&mut self, cx: &mut Context<Self>) {
+        self.result_refreshes += 1;
         match self.tabs.active() {
             Some(WorkspaceTab::Table { .. }) => self.load_active_table(cx),
             Some(WorkspaceTab::Sql { .. }) => self.run_query(cx),
@@ -3003,6 +3068,7 @@ impl DbUi {
         let Some(drag) = self.tab_drag.take() else {
             return;
         };
+        self.drag_pointer = None;
         if drag.moved {
             match self.tabs.items.iter().position(|tab| tab.id() == drag.id) {
                 // `activate_tab` writes the session on its way through.
@@ -3367,18 +3433,26 @@ impl DbUi {
 
     /// Write what was typed back into the draft, which stages it.
     pub(crate) fn commit_cell_edit(&mut self, cx: &mut Context<Self>) {
-        let Some((_, column)) = self.editing_cell.take() else {
+        let Some((row, column)) = self.editing_cell.take() else {
             return;
         };
         let typed = self.cell_editor.text().to_string();
+        let tab_id = self.tabs.active_id();
+        let mut changed = false;
         if let Some(WorkspaceTab::Table {
             draft: Some(draft), ..
         }) = self.tabs.active_mut()
         {
             if let Some((_, input, _)) = draft.fields.get_mut(column) {
+                changed = input.text() != typed;
                 let multiline = input.is_multiline();
                 *input = crate::text_input::TextInput::with_text(typed, multiline);
             }
+        }
+        // Only a real change lights up: pressing Enter on an untouched value
+        // staged nothing, and a flash would claim otherwise.
+        if let Some(tab) = tab_id.filter(|_| changed) {
+            self.cell_flash = Some((tab, row, column, Instant::now()));
         }
         self.focus = Focus::Grid;
         cx.notify();
@@ -3564,6 +3638,7 @@ impl DbUi {
         let Some(drag) = self.column_move.take() else {
             return;
         };
+        self.drag_pointer = None;
         if !drag.moved {
             let name = self
                 .tabs
@@ -4037,6 +4112,7 @@ impl DbUi {
 
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.copied_cell = Some((row, column));
+        self.copied_at = Some(Instant::now());
         self.status = Status::info(format!("Copied {name}"));
         cx.notify();
         true
@@ -4098,6 +4174,16 @@ impl DbUi {
 
         let count = rows.len();
         let plural = if count == 1 { "row" } else { "rows" };
+        let copied = if selected.is_empty() {
+            (0..count).collect()
+        } else {
+            selected
+        };
+        self.row_flash = Some(RowFlash {
+            tab: tab.id(),
+            rows: FlashRows::Copied(copied),
+            started: Instant::now(),
+        });
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.status = Status::info(format!("Copied {count} {plural}"));
         cx.notify();
@@ -4343,6 +4429,8 @@ impl DbUi {
         cx.notify();
 
         let runtime = self.runtime.clone();
+        let saved_keys: Vec<Vec<(String, Value)>> =
+            edits.iter().map(|edit| edit.pk.clone()).collect();
         let batch = dbui_app::RowBatch {
             inserts,
             updates: edits
@@ -4398,6 +4486,13 @@ impl DbUi {
                         if is_active {
                             this.status = Status::info(format!("Committed {saved} change(s)"));
                         }
+                        // Lit by key, so the glow lands on the rows as the
+                        // reload redraws them.
+                        this.row_flash = Some(RowFlash {
+                            tab: tab_id,
+                            rows: FlashRows::Committed(saved_keys),
+                            started: Instant::now(),
+                        });
                         this.load_table(tab_id, cx);
                     }
                     Some(Err(error)) => {
@@ -5643,6 +5738,7 @@ impl Render for DbUi {
         let context_menu = self.render_context_menu(window, cx);
         let confirm = self.render_confirm(cx);
         let close_guard = self.render_close_guard(cx);
+        let drag_ghost = self.render_drag_ghost();
 
         div()
             .size_full()
@@ -5670,6 +5766,16 @@ impl Render for DbUi {
                 |root| {
                     root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         this.drag_titlebar();
+                        // The carried copy follows every move, not just the
+                        // ones that cross into a new slot.
+                        let carrying = this.tab_drag.as_ref().is_some_and(|drag| drag.moved)
+                            || this.column_move.is_some_and(|drag| drag.moved);
+                        if this.tab_drag.is_some() || this.column_move.is_some() {
+                            this.drag_pointer = Some(event.position);
+                            if carrying {
+                                cx.notify();
+                            }
+                        }
                         if this.change_bubble_drag.is_some() {
                             this.drag_change_bubble(event.position.y, window, cx);
                         }
@@ -5847,6 +5953,9 @@ impl Render for DbUi {
             .children(context_menu)
             .children(confirm)
             .children(close_guard)
+            // Over everything: it is the pointer's, and the pointer can be
+            // anywhere.
+            .children(drag_ghost)
     }
 }
 

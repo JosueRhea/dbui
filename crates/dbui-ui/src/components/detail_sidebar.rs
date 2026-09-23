@@ -4,7 +4,7 @@ use super::icons::calendar_icon;
 use super::text_field::{
     sized_text_field, text_field, DetailInput, FieldHeight, InputTarget, MAX_VISIBLE_LINES,
 };
-use super::{caption, icon_button, menu_row, menu_surface, type_badge};
+use super::{caption, icon_button, menu_row, menu_surface, motion, type_badge};
 use crate::json_format::{self, JsonStyle};
 use crate::root::DbUi;
 use crate::row_export::RowFormat;
@@ -224,7 +224,8 @@ impl DbUi {
         }
         let theme = &self.theme;
         Some(
-            deferred(
+            deferred(motion::menu(
+                "detail-menu-in",
                 menu_surface("detail-menu", theme)
                     .top_full()
                     .right_0()
@@ -264,7 +265,8 @@ impl DbUi {
                             }),
                         ),
                     ),
-            )
+                metrics::scaled(4.),
+            ))
             .into_any_element(),
         )
     }
@@ -844,7 +846,8 @@ fn special_value_menu(
         );
     }
 
-    deferred(
+    deferred(motion::menu(
+        ("detail-value-menu-in", index),
         menu_surface(("detail-value-menu", index), theme)
             .top_full()
             .right_0()
@@ -854,7 +857,8 @@ fn special_value_menu(
                 this.close_detail_value_menu(cx);
             }))
             .children(rows),
-    )
+        metrics::scaled(4.),
+    ))
     .into_any_element()
 }
 

@@ -15,8 +15,8 @@
 //! saved. Closing a chip therefore does not delete anything, which is why the
 //! `×` and the picker's `✎`/`⏻` are different gestures with different reach.
 
-use super::icons::{database_icon, search_icon, settings_icon};
-use super::{caption, dot, icon_button, menu_row, menu_surface};
+use super::icons::{database_icon, search_icon, settings_icon, RefreshIcon};
+use super::{caption, dot, icon_button, menu_row, menu_surface, motion};
 use crate::components::palette::PaletteKind;
 use crate::root::DbUi;
 use crate::theme::{metrics, Theme};
@@ -117,8 +117,17 @@ impl DbUi {
             // than about the rows -- and next to the box you would have gone
             // looking for a missing table in.
             .child(
-                icon_button("refresh-catalog", "↻", theme, false)
-                    .on_click(cx.listener(|this, _, _window, cx| this.refresh_catalog(cx))),
+                icon_button(
+                    "refresh-catalog",
+                    motion::spin(
+                        "refresh-catalog-spin",
+                        RefreshIcon::new(theme.text_muted),
+                        self.catalog_refreshes,
+                    ),
+                    theme,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _window, cx| this.refresh_catalog(cx))),
             )
             .child(
                 div()
@@ -443,7 +452,8 @@ impl DbUi {
             }
         }
 
-        deferred(
+        deferred(motion::menu(
+            "connection-picker-menu-in",
             menu_surface("connection-picker-menu", theme)
                 .top_full()
                 .left_0()
@@ -491,7 +501,8 @@ impl DbUi {
                         }))
                         .child("New Connection…"),
                 ),
-        )
+            metrics::scaled(4.),
+        ))
         .into_any_element()
     }
 
@@ -517,7 +528,8 @@ impl DbUi {
         };
 
         Some(
-            deferred(
+            deferred(motion::menu(
+                "settings-menu-in",
                 menu_surface("settings-menu", theme)
                     .top_full()
                     .right_0()
@@ -580,7 +592,8 @@ impl DbUi {
                         )
                         .on_click(cx.listener(|this, _, _window, cx| this.zoom_delta(0, cx))),
                     ),
-            )
+                metrics::scaled(4.),
+            ))
             .into_any_element(),
         )
     }

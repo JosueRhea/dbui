@@ -385,3 +385,86 @@ pub(crate) fn plus_icon(color: Rgba) -> impl IntoElement {
                 .bg(color),
         )
 }
+
+/// A circular arrow, for reloading.
+///
+/// Drawn as a path rather than borrowed from a font: `↻` comes out of SF Pro
+/// a size smaller and a weight lighter than the drawn icons it sits beside.
+#[derive(IntoElement)]
+pub(crate) struct RefreshIcon {
+    color: Rgba,
+    /// Rotation in whole turns -- the button spins once when pressed.
+    turn: f32,
+}
+
+impl RefreshIcon {
+    pub(crate) fn new(color: Rgba) -> Self {
+        Self { color, turn: 0. }
+    }
+
+    pub(crate) fn turn(mut self, turn: f32) -> Self {
+        self.turn = turn;
+        self
+    }
+}
+
+impl RenderOnce for RefreshIcon {
+    fn render(self, _: &mut gpui::Window, _: &mut gpui::App) -> impl IntoElement {
+        const SIZE: f32 = 14.;
+        const RADIUS: f32 = 5.;
+        const STROKE: f32 = 1.5;
+        // The arc runs clockwise from just above three o'clock, round the
+        // bottom, to twelve -- leaving the top-right open for the arrowhead
+        // to point into.
+        const START: f32 = -10.;
+        const END: f32 = 260.;
+        let Self { color, turn } = self;
+        gpui::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let spin = turn * 360.;
+                let centre = bounds.center();
+                let at = |degrees: f32| {
+                    let radians = (degrees + spin).to_radians();
+                    gpui::point(
+                        centre.x + px(RADIUS * radians.cos()),
+                        centre.y + px(RADIUS * radians.sin()),
+                    )
+                };
+
+                let mut arc = gpui::PathBuilder::stroke(px(STROKE));
+                arc.move_to(at(START));
+                arc.arc_to(
+                    gpui::point(px(RADIUS), px(RADIUS)),
+                    px(0.),
+                    true,
+                    true,
+                    at(END),
+                );
+                if let Ok(path) = arc.build() {
+                    window.paint_path(path, color);
+                }
+
+                // The head sits on the arc's end, pointing along it:
+                // clockwise, which at twelve o'clock is to the right.
+                let end = (END + spin).to_radians();
+                let (out_x, out_y) = (end.cos(), end.sin());
+                let (ahead_x, ahead_y) = (-out_y, out_x);
+                let along =
+                    |distance: f32| gpui::point(px(ahead_x * distance), px(ahead_y * distance));
+                let across =
+                    |distance: f32| gpui::point(px(out_x * distance), px(out_y * distance));
+                let tip = at(END) + along(3.2);
+                let base = at(END) - along(0.6);
+                let mut head = gpui::PathBuilder::fill();
+                head.add_polygon(&[tip, base + across(2.7), base - across(2.7)], true);
+                if let Ok(path) = head.build() {
+                    window.paint_path(path, color);
+                }
+            },
+        )
+        .w(px(SIZE))
+        .h(px(SIZE))
+        .flex_none()
+    }
+}
