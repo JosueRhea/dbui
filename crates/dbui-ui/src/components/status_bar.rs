@@ -18,7 +18,8 @@ impl DbUi {
         let update = self.update_chip();
         let position = self.page_position();
         let paging = self.paging_state();
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
 
         let (message, color): (SharedString, Rgba) = match &self.status {
             Status::Idle => (self.idle_message(), theme.text_muted),
@@ -73,9 +74,9 @@ impl DbUi {
             .px_3()
             .h(metrics::status_height())
             .flex_shrink_0()
-            .bg(theme.panel)
-            .border_t_1()
-            .border_color(theme.border)
+            .when(!self.glass, |bar| {
+                bar.bg(theme.panel).border_t_1().border_color(theme.border)
+            })
             .text_size(metrics::text_size_small())
             // The light breathes while the app is waiting on something, so a
             // long load reads as in progress rather than stuck.
@@ -142,7 +143,8 @@ impl DbUi {
         at_end: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
         let arrow = |id: &'static str, glyph: &'static str, disabled: bool| {
             icon_button(id, glyph, theme, false)
                 .h(metrics::status_height())

@@ -16,7 +16,9 @@ use dbui_domain::{
     QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
     TableRef, Value,
 };
+use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::Sqlite;
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -168,6 +170,23 @@ impl DatabaseDriver for SqliteDriver {
         where_clause: &str,
         order: &[SortKey],
     ) -> Result<ResultSet> {
+        self.table_rows_tracked(table, page, where_clause, order, &QueryToken::new())
+            .await
+    }
+
+    async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64> {
+        self.row_count_tracked(table, where_clause, &QueryToken::new())
+            .await
+    }
+
+    async fn table_rows_tracked(
+        &self,
+        table: &TableRef,
+        page: Page,
+        where_clause: &str,
+        order: &[SortKey],
+        token: &QueryToken,
+    ) -> Result<ResultSet> {
         let bound = sql_build::select_page_sql(Driver::Sqlite, table, where_clause, order);
         let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
         for value in &bound.binds {
@@ -175,23 +194,36 @@ impl DatabaseDriver for SqliteDriver {
         }
         query = query.bind(page.probe_limit()).bind(page.offset as i64);
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| DriverError::query(&bound.sql, &error))?;
+        let mut conn = self.interruptible_connection(&bound.sql, token).await?;
+        let tracking = token.track(0);
+        let rows = query.fetch_all(&mut *conn).await;
+        drop(tracking);
+        // Handed back before the backfill, which needs the pool's one
+        // connection for itself.
+        release_interruptible(conn).await;
+        let rows = rows.map_err(|error| DriverError::query(&bound.sql, &error))?;
 
         let mut set = build_result_set(rows, page.limit as usize);
         self.backfill_columns(&mut set, &bound.sql).await;
         Ok(set)
     }
 
-    async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64> {
+    async fn row_count_tracked(
+        &self,
+        table: &TableRef,
+        where_clause: &str,
+        token: &QueryToken,
+    ) -> Result<i64> {
         let bound = sql_build::count_sql(Driver::Sqlite, table, where_clause);
         debug_assert!(bound.binds.is_empty(), "count_sql binds nothing");
-        sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()))
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|error| DriverError::query(&bound.sql, &error))
+        let mut conn = self.interruptible_connection(&bound.sql, token).await?;
+        let tracking = token.track(0);
+        let count = sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()))
+            .fetch_one(&mut *conn)
+            .await;
+        drop(tracking);
+        release_interruptible(conn).await;
+        count.map_err(|error| DriverError::query(&bound.sql, &error))
     }
 
     async fn update_row(
@@ -290,23 +322,7 @@ impl DatabaseDriver for SqliteDriver {
     async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
         let started = Instant::now();
 
-        // SQLite runs in-process: there is no server to ask, and dropping the
-        // future does not stop a statement mid-step -- the one connection
-        // would stay busy, and the next query would queue behind it. So the
-        // statement stops itself: SQLite calls the progress handler every so
-        // many steps, and a `false` from it ends the statement there.
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| DriverError::query(sql, &error))?;
-        {
-            let token = token.clone();
-            conn.lock_handle()
-                .await
-                .map_err(|error| DriverError::query(sql, &error))?
-                .set_progress_handler(1_000, move || !token.should_stop());
-        }
+        let mut conn = self.interruptible_connection(sql, token).await?;
         let tracking = token.track(0);
 
         let outcome = if query::returns_rows(sql) {
@@ -321,12 +337,9 @@ impl DatabaseDriver for SqliteDriver {
                 .map(|done| QueryOutcome::Affected(done.rows_affected()))
         };
         drop(tracking);
-        if let Ok(mut handle) = conn.lock_handle().await {
-            handle.remove_progress_handler();
-        }
         // Handed back before the backfill, which needs the pool's one
         // connection for itself.
-        drop(conn);
+        release_interruptible(conn).await;
 
         let mut outcome = outcome.map_err(|error| DriverError::query(sql, &error))?;
         if let QueryOutcome::Rows(set) = &mut outcome {
@@ -356,6 +369,33 @@ impl DatabaseDriver for SqliteDriver {
 }
 
 impl SqliteDriver {
+    /// A connection that stops its statement once `token` is told to.
+    ///
+    /// SQLite runs in-process: there is no server to ask, and dropping the
+    /// future does not stop a statement mid-step -- the one connection would
+    /// stay busy, and the next query would queue behind it. So the statement
+    /// stops itself: SQLite calls the progress handler every so many steps,
+    /// and a `false` from it ends the statement there.
+    async fn interruptible_connection(
+        &self,
+        sql: &str,
+        token: &QueryToken,
+    ) -> Result<PoolConnection<Sqlite>> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?;
+        {
+            let token = token.clone();
+            conn.lock_handle()
+                .await
+                .map_err(|error| DriverError::query(sql, &error))?
+                .set_progress_handler(1_000, move || !token.should_stop());
+        }
+        Ok(conn)
+    }
+
     /// See the Postgres adapter's copy: a query that matched nothing carries
     /// no column metadata, and a grid with no headers looks broken.
     async fn backfill_columns(&self, set: &mut ResultSet, sql: &str) {
@@ -421,5 +461,12 @@ fn bind_value<'q>(
         Value::Float(number) => query.bind(*number),
         Value::Bytes(bytes) => query.bind(bytes.clone()),
         other => query.bind(other.to_text()),
+    }
+}
+
+/// Take the progress handler off and hand the connection back to the pool.
+async fn release_interruptible(mut conn: PoolConnection<Sqlite>) {
+    if let Ok(mut handle) = conn.lock_handle().await {
+        handle.remove_progress_handler();
     }
 }

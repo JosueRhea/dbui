@@ -33,7 +33,8 @@ impl DbUi {
                 .active()
                 .map(|tab| tab.pending_inserts().len())
                 .unwrap_or(0);
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
 
         let tabs: Vec<AnyElement> = self
             .tabs
@@ -218,7 +219,8 @@ impl DbUi {
             ),
             (None, true) => Some(another_frame().into_any_element()),
         };
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
 
         let strip = if tabs.is_empty() {
             div()

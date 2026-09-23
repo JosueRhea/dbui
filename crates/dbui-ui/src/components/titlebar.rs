@@ -34,7 +34,8 @@ impl DbUi {
         let tab_strip = self.render_tab_bar(cx);
         let settings = self.render_settings_menu(cx);
         let settings_open = self.settings_menu_open;
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
 
         div()
             .id("titlebar")
@@ -46,9 +47,9 @@ impl DbUi {
             .pl(metrics::traffic_light_inset())
             .pr_2()
             .gap_2()
-            .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.border)
+            .when(!self.glass, |bar| {
+                bar.bg(theme.panel).border_b_1().border_color(theme.border)
+            })
             .text_color(theme.text_muted)
             .text_size(metrics::text_size_small())
             .child(connections)
@@ -162,7 +163,8 @@ impl DbUi {
     /// the query actually lives. Drawing it as a field is what makes the
     /// shortcut discoverable to someone who has never pressed it.
     fn render_titlebar_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
         div()
             .id("titlebar-search")
             .flex()
@@ -206,7 +208,8 @@ impl DbUi {
     /// The strip is allowed to shrink and scroll rather than push the tab
     /// strip and the drag area off the end of the bar.
     fn render_connection_chips(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
         let active = self.workspace.active_id();
         let picker_open = self.connection_picker_open;
 
@@ -576,6 +579,35 @@ impl DbUi {
                     )
                     .child(separator())
                     .child(
+                        menu_row(
+                            "settings-translucent",
+                            "Translucent Window",
+                            Some(if self.translucent { "On" } else { "Off" }),
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_translucent(cx))),
+                    )
+                    // Only while it is on: they tune a glass that is not there
+                    // otherwise, and would read as broken controls.
+                    .when(self.translucent, |menu| {
+                        menu.child(stepper_row(
+                            "settings-glass-opacity",
+                            "Tint",
+                            format!("{}%", self.glass_opacity_pct),
+                            theme,
+                            cx.listener(|this, _, _window, cx| this.step_glass_opacity(-1, cx)),
+                            cx.listener(|this, _, _window, cx| this.step_glass_opacity(1, cx)),
+                        ))
+                        .child(stepper_row(
+                            "settings-glass-blur",
+                            "Blur",
+                            self.glass_blur.to_string(),
+                            theme,
+                            cx.listener(|this, _, _window, cx| this.step_glass_blur(-1, cx)),
+                            cx.listener(|this, _, _window, cx| this.step_glass_blur(1, cx)),
+                        ))
+                    })
+                    .child(
                         menu_row("settings-zoom-in", "Zoom In", Some("⌘+"), theme)
                             .on_click(cx.listener(|this, _, _window, cx| this.zoom_delta(1, cx))),
                     )
@@ -597,6 +629,61 @@ impl DbUi {
             .into_any_element(),
         )
     }
+}
+
+/// A settings row that is a value with − and + beside it rather than a
+/// command. The row itself does nothing on click, so a press that misses
+/// the buttons does not close the menu under the user mid-adjustment.
+fn stepper_row(
+    id: &'static str,
+    label: &'static str,
+    value: String,
+    theme: &Theme,
+    on_less: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    on_more: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let button = |suffix: &'static str, glyph: &'static str| {
+        div()
+            .id((id, usize::from(suffix == "more")))
+            .w(metrics::scaled(20.))
+            .h(metrics::scaled(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .hover(|button| button.bg(theme.hover).text_color(theme.text))
+            .child(glyph)
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .pl_3()
+        .pr_2()
+        .py_0p5()
+        .text_color(theme.text)
+        .child(div().pl_3().child(label))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(button("less", "−").on_click(on_less))
+                .child(
+                    div()
+                        .w(metrics::scaled(36.))
+                        .flex()
+                        .justify_center()
+                        .text_size(metrics::text_size_small())
+                        .text_color(theme.text_muted)
+                        .child(value),
+                )
+                .child(button("more", "+").on_click(on_more)),
+        )
 }
 
 fn status_color(status: &ConnectionStatus, theme: &Theme) -> gpui::Rgba {

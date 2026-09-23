@@ -197,9 +197,9 @@ impl DbUi {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.panel)
-            .border_r_1()
-            .border_color(theme.border)
+            .when(!self.glass, |rail| {
+                rail.bg(theme.panel).border_r_1().border_color(theme.border)
+            })
             // The database name and its reload used to head this rail. They
             // are in the titlebar now, beside the connection they belong to,
             // which is what lets the tree start at the top of the panel.
@@ -239,7 +239,8 @@ impl DbUi {
 
         let focused = self.focus == Focus::SidebarSearch;
         let has_text = !self.sidebar_filter.is_empty();
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
 
         div()
             .flex()
@@ -288,7 +289,8 @@ impl DbUi {
     }
 
     fn render_sidebar_body(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
 
         if self.workspace.is_empty() {
             return vec![div()
@@ -352,7 +354,8 @@ impl DbUi {
 
     /// The schemas and tables of one connection.
     fn render_tree(&self, id: ConnectionId, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let theme = &self.theme;
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
         let cursor = self.sidebar_cursor.clone();
         // The cursor is only drawn while the tree owns the keyboard. Left
         // showing at all times it is a second highlight competing with the

@@ -43,6 +43,9 @@ pub fn refresh_catalog(
 /// ordered by. An unordered `LIMIT`/`OFFSET` is not pagination: the engine may
 /// return rows in any order it likes, so the same row can appear on two pages
 /// while another never appears at all.
+///
+/// `stop` ends it early -- the tab it was loading into has closed -- at
+/// whichever of the three reads it had reached, on the server as well.
 pub fn open_table(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
@@ -50,15 +53,46 @@ pub fn open_table(
     page: Page,
     where_clause: String,
     sort: Option<SortKey>,
+    mut stop: Stop,
 ) -> Task<Outcome<TableContents>> {
     runtime.spawn(async move {
-        let columns = driver.columns(&table).await.unwrap_or_default();
+        let driver = driver.as_ref();
+        let label = table.qualified();
+
+        // The two that are allowed to fail without failing the load -- a
+        // table with no readable columns still has rows, a count that errors
+        // still leaves a page -- are still not allowed to swallow a stop.
+        let token = QueryToken::new();
+        let columns =
+            match until_stopped(driver, &label, &token, driver.columns(&table), &mut stop).await {
+                Err(error @ DriverError::Cancelled { .. }) => return Err(error),
+                columns => columns.unwrap_or_default(),
+            };
         let order = dbui_domain::order_for(sort.as_ref(), &key_columns(&columns));
 
-        let rows = driver
-            .table_rows(&table, page, &where_clause, &order)
-            .await?;
-        let total_rows = driver.row_count(&table, &where_clause).await.ok();
+        let token = QueryToken::new();
+        let rows = until_stopped(
+            driver,
+            &label,
+            &token,
+            driver.table_rows_tracked(&table, page, &where_clause, &order, &token),
+            &mut stop,
+        )
+        .await?;
+
+        let token = QueryToken::new();
+        let total_rows = match until_stopped(
+            driver,
+            &label,
+            &token,
+            driver.row_count_tracked(&table, &where_clause, &token),
+            &mut stop,
+        )
+        .await
+        {
+            Err(error @ DriverError::Cancelled { .. }) => return Err(error),
+            count => count.ok(),
+        };
 
         Ok(TableContents {
             table,
@@ -245,13 +279,20 @@ pub struct Stop {
 
 /// The UI's end of a [`Stop`]: pressing Stop is [`StopHandle::stop`].
 ///
-/// Dropping it stops nothing -- a tab closed mid-run lets the run finish --
-/// so it is safe to let go of without a second thought.
+/// Dropping it stops nothing, so it is safe to let go of without a second
+/// thought: a tab that closes mid-run calls [`stop`](Self::stop) on purpose.
 pub struct StopHandle(watch::Sender<bool>);
 
 impl StopHandle {
     pub fn stop(&self) {
         let _ = self.0.send(true);
+    }
+}
+
+impl Stop {
+    /// Whether the run has been told to stop.
+    pub fn is_stopped(&self) -> bool {
+        *self.signal.borrow()
     }
 }
 
@@ -275,7 +316,30 @@ async fn run_stoppable(
     stop: &mut Stop,
 ) -> Outcome<QueryResult> {
     let token = QueryToken::new();
-    let run = driver.execute_tracked(sql, &token);
+    until_stopped(
+        driver,
+        sql,
+        &token,
+        driver.execute_tracked(sql, &token),
+        stop,
+    )
+    .await
+}
+
+/// Await `run`, a call tracked in `token`, unless `stop` fires or its timeout
+/// runs out first -- in which case the server is told through `token`, and
+/// the answer is [`DriverError::Cancelled`] or [`DriverError::TimedOut`] for
+/// `statement`. A `run` whose token was never tracked is simply dropped.
+///
+/// A stop that has already fired ends the next call at once, so a load made
+/// of several calls in a row stops at whichever one it had reached.
+async fn until_stopped<T>(
+    driver: &dyn DatabaseDriver,
+    statement: &str,
+    token: &QueryToken,
+    run: impl std::future::Future<Output = Outcome<T>>,
+    stop: &mut Stop,
+) -> Outcome<T> {
     tokio::pin!(run);
 
     let pressed = async {
@@ -293,16 +357,20 @@ async fn run_stoppable(
 
     let why = tokio::select! {
         result = &mut run => return result,
-        _ = pressed => DriverError::Cancelled { statement: sql.to_string() },
+        _ = pressed => DriverError::Cancelled { statement: statement.to_string() },
         _ = expired => DriverError::TimedOut {
-            statement: sql.to_string(),
+            statement: statement.to_string(),
             seconds: stop.timeout.map(|limit| limit.as_secs()).unwrap_or_default(),
         },
     };
 
     // Told on the server, it ends by itself; wait for that. Not told --
-    // SQLite, or the telling failed -- dropping `run` is what stops it.
-    if matches!(driver.cancel(&token).await, Ok(true)) {
+    // SQLite, or the telling failed -- dropping `run` is what stops it. The
+    // telling gets a limit of its own: it borrows a connection from the same
+    // pool the stuck statement may have drained, and a server that sits on a
+    // `KILL` would otherwise hold the stop hostage to the very thing it stops.
+    let told = tokio::time::timeout(WIND_DOWN, driver.cancel(token)).await;
+    if matches!(told, Ok(Ok(true))) {
         let _ = tokio::time::timeout(WIND_DOWN, &mut run).await;
     }
     Err(why)
@@ -470,6 +538,11 @@ mod tests {
     const RUNAWAY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
                            SELECT count(*) FROM (SELECT i FROM n LIMIT 5000000000)";
 
+    /// The rows behind [`RUNAWAY`]: any page of them is quick, counting them
+    /// is not.
+    const RUNAWAY_ROWS: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+                                SELECT i FROM n LIMIT 5000000000";
+
     /// A SQLite file of its own, deleted on drop.
     struct Scratch(std::path::PathBuf);
 
@@ -530,7 +603,52 @@ mod tests {
             .expect("the connection is free");
     }
 
-    /// Letting go of the handle -- the tab closed mid-run -- is not a Stop.
+    /// A page load whose tab closes is stopped, not left to run: here the
+    /// count over an endless view, which would otherwise never come back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_ends_a_table_load_as_cancelled() {
+        let runtime = DbRuntime::new().expect("runtime");
+        let (_file, driver) = sqlite("load").await;
+        driver
+            .execute(&format!("CREATE VIEW endless AS {RUNAWAY_ROWS}"))
+            .await
+            .expect("create the view");
+        let (handle, stop) = stop_signal(None);
+
+        let started = std::time::Instant::now();
+        let load = open_table(
+            &runtime,
+            driver.clone(),
+            TableRef::new("main", "endless"),
+            Page {
+                limit: 10,
+                offset: 0,
+            },
+            String::new(),
+            None,
+            stop,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.stop();
+        let result = load.await.expect("the load answers");
+
+        assert!(
+            matches!(result, Err(DriverError::Cancelled { .. })),
+            "{:?}",
+            result.map(|contents| contents.total_rows)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        driver
+            .execute("SELECT 1")
+            .await
+            .expect("the connection is free");
+        // See `export_all`: a runtime is let go of on a blocking thread.
+        tokio::task::spawn_blocking(move || drop(runtime))
+            .await
+            .unwrap();
+    }
+
+    /// Letting go of the handle is not a Stop.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dropped_handle_lets_the_run_finish() {
         let (_file, driver) = sqlite("dropped").await;

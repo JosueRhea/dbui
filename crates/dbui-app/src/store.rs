@@ -99,6 +99,18 @@ pub struct Prefs {
     /// Row detail panel width in CSS pixels (unzoomed).
     #[serde(default = "default_detail_width_px")]
     pub detail_width_px: u32,
+    /// Blur the desktop through the titlebar and sidebar, with the content
+    /// in a rounded card on top. On unless the user turns it off.
+    #[serde(default = "default_translucent")]
+    pub translucent: bool,
+    /// How strongly the theme tints the glass, 0–100.
+    #[serde(default = "default_glass_opacity_pct")]
+    pub glass_opacity_pct: u32,
+    /// How far the glass blurs the desktop behind it, in points. macOS's own
+    /// sidebar material uses 30; a little more keeps busy windows behind
+    /// from showing through as shapes.
+    #[serde(default = "default_glass_blur")]
+    pub glass_blur: u32,
 }
 
 fn default_theme_id() -> String {
@@ -121,6 +133,20 @@ fn default_detail_width_px() -> u32 {
     280
 }
 
+pub fn default_translucent() -> bool {
+    true
+}
+
+/// Heavy enough that the theme, not the desktop, sets the chrome's colour --
+/// which is what keeps its text readable over a bright window.
+pub fn default_glass_opacity_pct() -> u32 {
+    80
+}
+
+pub fn default_glass_blur() -> u32 {
+    40
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -129,6 +155,9 @@ impl Default for Prefs {
             sql_editor_height_px: default_sql_editor_height_px(),
             sidebar_width_px: default_sidebar_width_px(),
             detail_width_px: default_detail_width_px(),
+            translucent: default_translucent(),
+            glass_opacity_pct: default_glass_opacity_pct(),
+            glass_blur: default_glass_blur(),
         }
     }
 }

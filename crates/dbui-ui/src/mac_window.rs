@@ -22,8 +22,8 @@
 
 use cocoa::appkit::{NSApplication, NSWindow};
 use cocoa::base::{id, nil};
-use cocoa::foundation::NSPoint;
-use objc::runtime::NO;
+use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSString};
+use objc::runtime::{BOOL, NO, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use std::cell::Cell;
 
@@ -121,4 +121,160 @@ pub fn drag_window() {
 /// Let go. Safe to call when no drag is in progress.
 pub fn end_window_drag() {
     ANCHOR.with(|anchor| anchor.set(None));
+}
+
+/// Tags our effect view so a later call can find it again.
+const VIBRANCY_ID: &str = "dbui.vibrancy";
+
+/// Put AppKit's sidebar material behind the window's content, or take it away.
+///
+/// gpui's own `Blurred` background strips the material's tint and saturation
+/// and leaves a bare blur, which over a light desktop reads as mud rather than
+/// glass. This is the material Finder's sidebar uses, tinted by AppKit to the
+/// window's appearance -- which is pinned to the theme's, not the system's, so
+/// a dark theme gets dark glass on a light-mode Mac. The window must already be
+/// non-opaque (`WindowBackgroundAppearance::Transparent`) for it to show.
+///
+/// `light` is `None` to remove the material.
+#[allow(unexpected_cfgs)]
+pub fn set_vibrancy(light: Option<bool>) {
+    unsafe {
+        let window = key_window();
+        if window == nil {
+            return;
+        }
+        let content: id = msg_send![window, contentView];
+        if content == nil {
+            return;
+        }
+        let identifier = NSString::alloc(nil).init_str(VIBRANCY_ID).autorelease();
+        let existing = vibrancy_view(content, identifier);
+
+        let Some(light) = light else {
+            if existing != nil {
+                let _: () = msg_send![existing, removeFromSuperview];
+            }
+            let _: () = msg_send![window, setAppearance: nil];
+            return;
+        };
+
+        let name = NSString::alloc(nil)
+            .init_str(if light {
+                "NSAppearanceNameAqua"
+            } else {
+                "NSAppearanceNameDarkAqua"
+            })
+            .autorelease();
+        let appearance: id = msg_send![class!(NSAppearance), appearanceNamed: name];
+        let _: () = msg_send![window, setAppearance: appearance];
+
+        if existing != nil {
+            return;
+        }
+        let frame: NSRect = msg_send![content, bounds];
+        let view: id = msg_send![class!(NSVisualEffectView), alloc];
+        let view: id = msg_send![view, initWithFrame: frame];
+        // NSVisualEffectMaterialSidebar, blended with what is behind the
+        // window, and kept lit when the window is not key so the chrome does
+        // not flash grey every time focus moves to another app.
+        let _: () = msg_send![view, setMaterial: 7_isize];
+        let _: () = msg_send![view, setBlendingMode: 0_isize];
+        let _: () = msg_send![view, setState: 1_isize];
+        // NSViewWidthSizable | NSViewHeightSizable
+        let _: () = msg_send![view, setAutoresizingMask: 2_usize | 16_usize];
+        let _: () = msg_send![view, setIdentifier: identifier];
+        // Below gpui's view, which is the one that draws everything else.
+        let _: () = msg_send![content, addSubview: view positioned: -1_isize relativeTo: nil];
+        let _: () = msg_send![view, release];
+    }
+}
+
+/// Our effect view, if the window has one.
+#[allow(unexpected_cfgs)]
+unsafe fn vibrancy_view(content: id, identifier: id) -> id {
+    let subviews: id = msg_send![content, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let view: id = msg_send![subviews, objectAtIndex: index];
+        let view_id: id = msg_send![view, identifier];
+        if view_id != nil {
+            let same: BOOL = msg_send![view_id, isEqualToString: identifier];
+            if same == YES {
+                return view;
+            }
+        }
+    }
+    nil
+}
+
+/// Set how far the material blurs what is behind the window, in points.
+///
+/// AppKit has no public knob for this. The material draws through a
+/// `CABackdropLayer` whose filters include one named `gaussianBlur`, and its
+/// `inputRadius` is what this sets. AppKit rebuilds the filters when it
+/// restyles the view -- a change of appearance, say -- so this is cheap to
+/// call every frame: it only writes when the radius has drifted. No-op when
+/// there is no material, and if a future macOS names things differently the
+/// material simply keeps its own blur.
+#[allow(unexpected_cfgs)]
+pub fn set_vibrancy_blur(radius: f64) {
+    unsafe {
+        let window = key_window();
+        if window == nil {
+            return;
+        }
+        let content: id = msg_send![window, contentView];
+        if content == nil {
+            return;
+        }
+        let identifier = NSString::alloc(nil).init_str(VIBRANCY_ID).autorelease();
+        let view = vibrancy_view(content, identifier);
+        if view == nil {
+            return;
+        }
+        let layer: id = msg_send![view, layer];
+        let backdrop = find_backdrop(layer);
+        if backdrop == nil {
+            return;
+        }
+        let key_path = NSString::alloc(nil)
+            .init_str("filters.gaussianBlur.inputRadius")
+            .autorelease();
+        let current: id = msg_send![backdrop, valueForKeyPath: key_path];
+        if current != nil {
+            let value: f64 = msg_send![current, doubleValue];
+            if (value - radius).abs() < 0.01 {
+                return;
+            }
+        }
+        let number: id = msg_send![class!(NSNumber), numberWithDouble: radius];
+        let _: () = msg_send![backdrop, setValue: number forKeyPath: key_path];
+    }
+}
+
+/// The first `CABackdropLayer` under `layer`, depth first.
+#[allow(unexpected_cfgs)]
+unsafe fn find_backdrop(layer: id) -> id {
+    if layer == nil {
+        return nil;
+    }
+    let Some(backdrop_class) = objc::runtime::Class::get("CABackdropLayer") else {
+        return nil;
+    };
+    let is_backdrop: BOOL = msg_send![layer, isKindOfClass: backdrop_class];
+    if is_backdrop == YES {
+        return layer;
+    }
+    let sublayers: id = msg_send![layer, sublayers];
+    if sublayers == nil {
+        return nil;
+    }
+    let count: usize = msg_send![sublayers, count];
+    for index in 0..count {
+        let found = find_backdrop(msg_send![sublayers, objectAtIndex: index]);
+        if found != nil {
+            return found;
+        }
+    }
+    nil
 }
