@@ -35,6 +35,8 @@ pub enum Focus {
     /// The table filter box above the tree.
     SidebarSearch,
     Editor,
+    /// The find / replace bar over the SQL editor.
+    Find,
     Grid,
     Detail,
     Filter,
@@ -465,6 +467,8 @@ pub struct DbUi {
     /// started them -- tab ids restart per connection -- each with the id of
     /// the run it belongs to.
     pub(crate) running: HashMap<(Option<ConnectionId>, TabId), (u64, commands::StopHandle)>,
+    /// The find / replace bar over the SQL editor, while it is open.
+    pub(crate) editor_find: Option<crate::components::editor_find::EditorFind>,
     /// The id the next run gets. Only the run holding a handle may clear it:
     /// one superseded on the same tab lands late and must leave the live
     /// run's Stop alone.
@@ -675,6 +679,7 @@ impl DbUi {
             column_move: None,
             tab_drag: None,
             running: HashMap::new(),
+            editor_find: None,
             next_run: 0,
             drag_pointer: None,
             tab_indicator: None,
@@ -890,6 +895,11 @@ impl DbUi {
         }
         self.stash_current_draft(cx);
         self.tabs.activate(index);
+        // The bar searched the editor that was in front; the next tab's is a
+        // different text, and may not be an editor at all.
+        if self.editor_find.take().is_some() && self.focus == Focus::Find {
+            self.focus = Focus::Editor;
+        }
         self.selected_cell = None;
         self.detail_input = None;
         self.detail_value_menu = None;
@@ -2943,7 +2953,11 @@ impl DbUi {
             return true;
         }
         match self.focus {
-            Focus::Editor | Focus::Filter | Focus::PageSize | Focus::SidebarSearch => true,
+            Focus::Editor
+            | Focus::Find
+            | Focus::Filter
+            | Focus::PageSize
+            | Focus::SidebarSearch => true,
             Focus::Detail => self.detail_input.is_some(),
             Focus::Sidebar | Focus::Grid => false,
         }
@@ -5426,7 +5440,18 @@ impl DbUi {
             }
         }
 
+        if self.focus == Focus::Find && self.handle_find_key(keystroke, cx) {
+            return;
+        }
+
         if self.focus == Focus::Editor {
+            // ⌘G walks the matches from the editor too, the bar open or not
+            // in focus: find, look, type a fix, ⌘G to the next one.
+            if command && key == "g" && self.editor_find.is_some() {
+                self.find_step(!shift, cx);
+                return;
+            }
+
             // Completion popup owns navigation while open.
             if self.completion.is_some() {
                 match key {
@@ -5469,7 +5494,29 @@ impl DbUi {
             }
 
             if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
-                if editor.handle_key(keystroke, cx) {
+                // What only a code editor does, ahead of the keys every text
+                // field shares: ⌘/ comments lines out, and brackets and
+                // quotes come in pairs. The form fields and filters keep the
+                // plain behaviour -- a `(` that grows a `)` in a password
+                // box is a bug, not a convenience.
+                let plain = !command && !keystroke.modifiers.control && !keystroke.modifiers.alt;
+                let handled = if command && key == "/" {
+                    editor.toggle_line_comment();
+                    true
+                } else if plain && key == "backspace" {
+                    editor.backspace_paired();
+                    true
+                } else if plain
+                    && keystroke
+                        .key_char
+                        .as_deref()
+                        .is_some_and(|typed| editor.type_paired(typed))
+                {
+                    true
+                } else {
+                    editor.handle_key(keystroke, cx)
+                };
+                if handled {
                     // Typing past the right edge pans the editor instead of
                     // writing where the user cannot see.
                     editor.ensure_editor_caret_visible();
@@ -5913,6 +5960,11 @@ impl Render for DbUi {
                 this.open_palette(PaletteKind::Themes, cx)
             }))
             .on_action(cx.listener(|this, _: &crate::Find, _window, cx| this.cmd_find(cx)))
+            .on_action(cx.listener(|this, _: &crate::FindReplace, _window, cx| {
+                if this.tabs.active().is_some_and(|tab| tab.is_sql()) {
+                    this.open_editor_find(true, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &crate::SearchTables, _window, cx| {
                 this.focus_sidebar_search(cx)
             }))

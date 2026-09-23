@@ -536,6 +536,12 @@ impl DbUi {
     pub(crate) fn cmd_find(&mut self, cx: &mut Context<Self>) {
         self.close_palette(cx);
 
+        // On a query tab, ⌘F searches the SQL.
+        if self.tabs.active().is_some_and(|tab| tab.is_sql()) {
+            self.open_editor_find(false, cx);
+            return;
+        }
+
         if matches!(
             self.tabs.active(),
             Some(crate::tabs::WorkspaceTab::Table { .. })

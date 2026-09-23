@@ -56,6 +56,9 @@ pub enum InputTarget {
     InsertField(usize),
     /// The one-line editor open over a grid cell.
     CellEditor,
+    /// The find / replace bar over the SQL editor.
+    FindQuery,
+    FindReplacement,
 }
 
 impl DbUi {
@@ -94,6 +97,10 @@ impl DbUi {
             InputTarget::SidebarFilter => Some(&mut self.sidebar_filter),
             InputTarget::ConfirmName => self.confirm.as_mut().map(|prompt| &mut prompt.input),
             InputTarget::CellEditor => Some(&mut self.cell_editor),
+            InputTarget::FindQuery => self.editor_find.as_mut().map(|find| &mut find.query),
+            InputTarget::FindReplacement => {
+                self.editor_find.as_mut().map(|find| &mut find.replacement)
+            }
             InputTarget::InsertField(index) => match self.tabs.active_mut() {
                 Some(crate::tabs::WorkspaceTab::Table {
                     pending_inserts,
@@ -163,6 +170,20 @@ impl DbUi {
                 self.focus = crate::root::Focus::Detail;
                 self.filter_focus = None;
                 self.page_size_focus = false;
+            }
+            InputTarget::FindQuery | InputTarget::FindReplacement => {
+                use crate::components::editor_find::FindField;
+                if let Some(find) = self.editor_find.as_mut() {
+                    find.field = if target == InputTarget::FindQuery {
+                        FindField::Query
+                    } else {
+                        FindField::Replacement
+                    };
+                }
+                self.focus = crate::root::Focus::Find;
+                self.filter_focus = None;
+                self.page_size_focus = false;
+                self.detail_input = None;
             }
         }
         cx.notify();
@@ -275,6 +296,8 @@ fn field_with_leading(
         InputTarget::InsertField(index) => ("insert-field-scroll", index).into(),
         InputTarget::CellEditor => "cell-editor-scroll".into(),
         InputTarget::DetailField(index) => ("detail-field-scroll", index).into(),
+        InputTarget::FindQuery => "find-query-scroll".into(),
+        InputTarget::FindReplacement => "find-replacement-scroll".into(),
     };
 
     if input.is_multiline() {

@@ -410,6 +410,111 @@ fn cmd_e_opens_the_sql_tab_and_cmd_k_clears_it(cx: &mut TestAppContext) {
     view.update(cx, |view, _| assert!(sql_editor_text(view).is_empty()));
 }
 
+/// Selected text in the front SQL editor, if any.
+fn sql_editor_selection(view: &DbUi) -> Option<String> {
+    match view.tabs.active() {
+        Some(WorkspaceTab::Sql { editor, .. }) => editor.selected_text().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Brackets pair as they are typed, and a closer typed by habit is stepped
+/// over rather than doubled. Only in the SQL editor.
+#[gpui::test]
+fn the_sql_editor_pairs_brackets_as_you_type(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    cx.simulate_keystrokes(&typing("SELECT count(*) FROM t WHERE a = 'x'"));
+    view.update(cx, |view, _| {
+        assert_eq!(
+            sql_editor_text(view),
+            "SELECT count(*) FROM t WHERE a = 'x'"
+        );
+    });
+}
+
+/// ⌘/ comments the caret's line out, and a second press brings it back.
+#[gpui::test]
+fn cmd_slash_toggles_a_line_comment(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "SELECT 1\nSELECT 2")
+    });
+    cx.simulate_keystrokes("cmd-/");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "SELECT 1\n-- SELECT 2")
+    });
+    cx.simulate_keystrokes("cmd-/");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "SELECT 1\nSELECT 2")
+    });
+}
+
+/// ⌘F on a query tab searches the SQL: typing lands on the first match,
+/// Enter walks on, Esc hands the editor back with the match selected, and
+/// ⌘G carries on from the editor.
+#[gpui::test]
+fn cmd_f_finds_in_the_sql_editor(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "select a; SELECT b; select c");
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(0);
+        }
+    });
+
+    cx.simulate_keystrokes("cmd-f");
+    view.update(cx, |view, _| assert_eq!(view.focus, Focus::Find));
+    cx.simulate_keystrokes(&typing("select"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.find_matches().len(), 3, "case is ignored");
+        assert_eq!(sql_editor_selection(view).as_deref(), Some("select"));
+    });
+
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(
+            sql_editor_selection(view).as_deref(),
+            Some("SELECT"),
+            "the second"
+        );
+    });
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        assert_eq!(view.focus, Focus::Editor);
+        assert!(view.editor_find.is_none());
+        assert_eq!(sql_editor_selection(view).as_deref(), Some("SELECT"));
+    });
+}
+
+/// ⌥⌘F with a replacement: Replace All rewrites every match as one edit,
+/// which ⌘Z takes back whole.
+#[gpui::test]
+fn replace_all_is_one_undoable_edit(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "select 1; select 2")
+    });
+
+    cx.simulate_keystrokes("cmd-alt-f");
+    cx.simulate_keystrokes(&typing("select"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("SELECT"));
+    view.update(cx, |view, cx| view.replace_all(cx));
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "SELECT 1; SELECT 2")
+    });
+
+    cx.simulate_keystrokes("escape cmd-z");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "select 1; select 2")
+    });
+}
+
 #[gpui::test]
 fn run_resolves_selection_then_statement_under_caret(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);

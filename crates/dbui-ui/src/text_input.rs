@@ -85,6 +85,10 @@ pub struct TextInput {
     scroll_handle: ScrollHandle,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    /// The column a run of ↑/↓ presses started from, kept across them so a
+    /// caret that passes over a short line returns to where it was on the
+    /// long ones after it. Anything other than vertical motion drops it.
+    goal_column: Option<usize>,
 }
 
 impl Default for TextInput {
@@ -105,6 +109,7 @@ impl TextInput {
             scroll_handle: ScrollHandle::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            goal_column: None,
         }
     }
 
@@ -121,6 +126,7 @@ impl TextInput {
             scroll_handle: ScrollHandle::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            goal_column: None,
         }
     }
 
@@ -331,12 +337,14 @@ impl TextInput {
     }
 
     pub fn move_to(&mut self, offset: usize) {
+        self.goal_column = None;
         let offset = self.clamp_boundary(offset);
         self.selection = offset..offset;
         self.selection_reversed = false;
     }
 
     pub fn select_to(&mut self, offset: usize) {
+        self.goal_column = None;
         let offset = self.clamp_boundary(offset);
         if self.selection_reversed {
             self.selection.start = offset;
@@ -670,47 +678,44 @@ impl TextInput {
 
     /// Vertical motion keeps the column where it can.
     ///
-    /// Moving onto a shorter line clamps to its end. This one does not remember
-    /// the "goal column" across several moves -- deliberate: that state is the
-    /// beginning of a real editor.
+    /// Moving onto a shorter line clamps to its end, but the column the run of
+    /// presses started from is remembered: carry on past the short line and
+    /// the caret returns to it, the way every editor does.
     pub fn move_up(&mut self) {
-        let (line, column, widths) = self.caret_position();
-        if line == 0 {
-            self.move_to(0);
-            return;
-        }
-        let offset = self.offset_on_line(line - 1, column, &widths);
-        self.move_to(offset);
+        self.vertical(-1, false);
     }
 
     pub fn move_down(&mut self) {
-        let (line, column, widths) = self.caret_position();
-        if line + 1 >= widths.len() {
-            self.move_to(self.value.len());
-            return;
-        }
-        let offset = self.offset_on_line(line + 1, column, &widths);
-        self.move_to(offset);
+        self.vertical(1, false);
     }
 
     pub fn select_up(&mut self) {
-        let (line, column, widths) = self.caret_position();
-        if line == 0 {
-            self.select_to(0);
-            return;
-        }
-        let offset = self.offset_on_line(line - 1, column, &widths);
-        self.select_to(offset);
+        self.vertical(-1, true);
     }
 
     pub fn select_down(&mut self) {
+        self.vertical(1, true);
+    }
+
+    fn vertical(&mut self, delta: isize, extend: bool) {
         let (line, column, widths) = self.caret_position();
-        if line + 1 >= widths.len() {
-            self.select_to(self.value.len());
-            return;
+        let goal = self.goal_column.unwrap_or(column);
+        let target = line as isize + delta;
+        let offset = if target < 0 {
+            0
+        } else if target as usize >= widths.len() {
+            self.value.len()
+        } else {
+            self.offset_on_line(target as usize, goal, &widths)
+        };
+        if extend {
+            self.select_to(offset);
+        } else {
+            self.move_to(offset);
         }
-        let offset = self.offset_on_line(line + 1, column, &widths);
-        self.select_to(offset);
+        // Set after the move, which drops it: this is the one motion that
+        // keeps it.
+        self.goal_column = Some(goal);
     }
 
     pub fn copy(&self, cx: &App) {
@@ -743,6 +748,164 @@ impl TextInput {
             text.replace(['\n', '\r'], "")
         };
         self.replace_selection(&text);
+    }
+
+    /// ⌘/ -- comment out the lines the selection touches, or bring them back.
+    ///
+    /// All of them go the same way: if every line with text on it is already
+    /// a `--` comment, they are uncommented; otherwise every one is
+    /// commented, so a mixed block ends up uniformly off rather than
+    /// toggled line by line into a checkerboard. The marker goes at the
+    /// block's shallowest indent, so the code under it stays lined up.
+    pub fn toggle_line_comment(&mut self) {
+        let first = self.line_start(self.selection.start);
+        // A selection ending at the very start of a line does not include
+        // that line -- it is how a line-wise selection made with the arrow
+        // keys looks.
+        let last_offset = if self.selection.end > self.selection.start
+            && self.value[..self.selection.end].ends_with('\n')
+        {
+            self.selection.end - 1
+        } else {
+            self.selection.end
+        };
+        let end = self.line_end(last_offset);
+        let block = self.value[first..end].to_string();
+        let lines: Vec<&str> = block.split('\n').collect();
+        let with_text = || lines.iter().filter(|line| !line.trim().is_empty());
+        let indent = with_text()
+            .map(|line| line.len() - line.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        let all_commented =
+            with_text().count() > 0 && with_text().all(|line| line.trim_start().starts_with("--"));
+
+        let rewritten: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    return line.to_string();
+                }
+                if all_commented {
+                    let at = line.len() - line.trim_start().len();
+                    let rest = &line[at + 2..];
+                    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                    format!("{}{rest}", &line[..at])
+                } else {
+                    format!("{}-- {}", &line[..indent], &line[indent..])
+                }
+            })
+            .collect();
+        let replacement = rewritten.join("\n");
+
+        self.push_undo();
+        self.value.replace_range(first..end, &replacement);
+        // Keep the same lines selected, so a second ⌘/ undoes the first.
+        let new_end = first + replacement.len();
+        if self.selection.start == self.selection.end {
+            let caret = (self.selection.start as isize + if all_commented { -3 } else { 3 })
+                .clamp(first as isize, new_end as isize) as usize;
+            let caret = self.clamp_boundary(caret);
+            self.selection = caret..caret;
+        } else {
+            self.selection = first..new_end;
+        }
+        self.selection_reversed = false;
+    }
+
+    /// Type one character in a code editor, pairing brackets and quotes.
+    ///
+    /// Returns `false` for a character this has no opinion on, which the
+    /// caller then inserts the plain way.
+    ///
+    /// - An opener types its closer too, with the caret between; over a
+    ///   selection it wraps the selection instead of replacing it.
+    /// - A closer typed where that closer already sits steps over it, so
+    ///   typing the whole thing out by habit does not leave `(a))`.
+    /// - A quote after a letter or digit is left alone -- `don't`, `x'`.
+    pub fn type_paired(&mut self, typed: &str) -> bool {
+        const PAIRS: [(char, char); 6] = [
+            ('(', ')'),
+            ('[', ']'),
+            ('{', '}'),
+            ('\'', '\''),
+            ('"', '"'),
+            ('`', '`'),
+        ];
+        let mut chars = typed.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            return false;
+        };
+        let cursor = self.cursor();
+        let next = self.value[cursor..].chars().next();
+        let prev = self.value[..cursor].chars().next_back();
+
+        // Stepping over a closer the pairing already typed.
+        let is_closer = PAIRS.iter().any(|(_, close)| *close == c);
+        if is_closer && !self.has_selection() && next == Some(c) {
+            self.move_to(cursor + c.len_utf8());
+            return true;
+        }
+
+        let Some(&(open, close)) = PAIRS.iter().find(|(open, _)| *open == c) else {
+            return false;
+        };
+
+        if self.has_selection() {
+            let range = self.selection.clone();
+            let inner = self.value[range.clone()].to_string();
+            self.push_undo();
+            self.value
+                .replace_range(range.clone(), &format!("{open}{inner}{close}"));
+            let start = range.start + open.len_utf8();
+            self.selection = start..start + inner.len();
+            self.selection_reversed = false;
+            return true;
+        }
+
+        let is_quote = open == close;
+        if is_quote && prev.is_some_and(|p| p.is_alphanumeric() || p == '_') {
+            return false;
+        }
+        // Only pair where the closer would not be glued to the next word:
+        // `(` typed in front of `foo` is the start of wrapping it, not a call.
+        if next.is_some_and(|n| n.is_alphanumeric() || n == '_') {
+            return false;
+        }
+
+        self.push_undo();
+        self.value.insert_str(cursor, &format!("{open}{close}"));
+        let caret = cursor + open.len_utf8();
+        self.selection = caret..caret;
+        self.selection_reversed = false;
+        true
+    }
+
+    /// Backspace in a code editor: between a pair the pairing typed -- `(|)`
+    /// -- both halves go.
+    pub fn backspace_paired(&mut self) {
+        let cursor = self.cursor();
+        if !self.has_selection() && cursor > 0 {
+            let prev = self.value[..cursor].chars().next_back();
+            let next = self.value[cursor..].chars().next();
+            let pair = matches!(
+                (prev, next),
+                (Some('('), Some(')'))
+                    | (Some('['), Some(']'))
+                    | (Some('{'), Some('}'))
+                    | (Some('\''), Some('\''))
+                    | (Some('"'), Some('"'))
+                    | (Some('`'), Some('`'))
+            );
+            if pair {
+                self.push_undo();
+                self.value.replace_range(cursor - 1..cursor + 1, "");
+                self.selection = cursor - 1..cursor - 1;
+                self.selection_reversed = false;
+                return;
+            }
+        }
+        self.backspace();
     }
 
     pub fn undo(&mut self) {
@@ -917,6 +1080,7 @@ impl TextInput {
     }
 
     fn push_undo(&mut self) {
+        self.goal_column = None;
         self.undo.push(self.snapshot());
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
@@ -1508,5 +1672,115 @@ mod tests {
         let fixed = with_capslock(&key_char('s'), true).expect("the character changed");
         assert_eq!(fixed.key, "s");
         assert_eq!(fixed.key_char.as_deref(), Some("S"));
+    }
+
+    // -- the code editor's extras --------------------------------------------
+
+    #[test]
+    fn a_run_of_vertical_moves_keeps_its_column_across_a_short_line() {
+        let mut editor = input("SELECT name\nx\nFROM users");
+        editor.move_to(9); // "SELECT na|me"
+        editor.move_down();
+        assert_eq!(editor.cursor(), 13, "clamped to the end of the short line");
+        editor.move_down();
+        assert_eq!(editor.cursor(), 14 + 9, "back to column 9 on the long line");
+    }
+
+    #[test]
+    fn any_other_move_drops_the_goal_column() {
+        let mut editor = input("SELECT name\nx\nFROM users");
+        editor.move_to(9);
+        editor.move_down(); // onto "x", column 1
+        editor.move_left(); // column 0
+        editor.move_down();
+        assert_eq!(editor.cursor(), 14, "from column 0, not the old goal");
+    }
+
+    #[test]
+    fn toggling_a_comment_on_one_line_and_back() {
+        let mut editor = input("  SELECT 1");
+        editor.move_to(4);
+        editor.toggle_line_comment();
+        assert_eq!(editor.text(), "  -- SELECT 1");
+        assert_eq!(editor.cursor(), 7, "the caret stays on the same letter");
+        editor.toggle_line_comment();
+        assert_eq!(editor.text(), "  SELECT 1");
+        assert_eq!(editor.cursor(), 4);
+    }
+
+    #[test]
+    fn a_mixed_block_is_commented_uniformly_at_its_shallowest_indent() {
+        let mut editor = input("SELECT *\n  -- already\n\n  FROM t");
+        editor.select_all();
+        editor.toggle_line_comment();
+        assert_eq!(editor.text(), "-- SELECT *\n--   -- already\n\n--   FROM t");
+        // Still selected, so a second press brings the block back as it was.
+        editor.toggle_line_comment();
+        assert_eq!(editor.text(), "SELECT *\n  -- already\n\n  FROM t");
+    }
+
+    #[test]
+    fn a_selection_ending_at_a_line_start_leaves_that_line_alone() {
+        let mut editor = input("a\nb\nc");
+        editor.move_to(0);
+        editor.select_to(4); // "a\nb\n" -- ends at the start of "c"
+        editor.toggle_line_comment();
+        assert_eq!(editor.text(), "-- a\n-- b\nc");
+    }
+
+    #[test]
+    fn an_opener_types_its_closer_and_a_closer_steps_over_it() {
+        let mut editor = input("count");
+        editor.move_to(5);
+        assert!(editor.type_paired("("));
+        assert_eq!(editor.text(), "count()");
+        assert_eq!(editor.cursor(), 6);
+        editor.insert("*");
+        assert!(editor.type_paired(")"), "typed by habit");
+        assert_eq!(editor.text(), "count(*)", "no doubled closer");
+        assert_eq!(editor.cursor(), 8);
+    }
+
+    #[test]
+    fn an_opener_wraps_a_selection() {
+        let mut editor = input("a + b");
+        editor.select_all();
+        assert!(editor.type_paired("("));
+        assert_eq!(editor.text(), "(a + b)");
+        assert_eq!(
+            editor.selected_text(),
+            Some("a + b"),
+            "still selected inside"
+        );
+    }
+
+    #[test]
+    fn a_quote_after_a_letter_is_just_a_quote() {
+        let mut editor = input("don");
+        editor.move_to(3);
+        assert!(!editor.type_paired("'"), "left to the plain insert");
+        let mut editor = input("WHERE name = ");
+        editor.move_to(13);
+        assert!(editor.type_paired("'"));
+        assert_eq!(editor.text(), "WHERE name = ''");
+    }
+
+    #[test]
+    fn nothing_pairs_in_front_of_a_word() {
+        let mut editor = input("name");
+        editor.move_to(0);
+        assert!(!editor.type_paired("("));
+    }
+
+    #[test]
+    fn backspace_between_a_fresh_pair_takes_both() {
+        let mut editor = input("f");
+        editor.move_to(1);
+        editor.type_paired("(");
+        editor.backspace_paired();
+        assert_eq!(editor.text(), "f");
+        // Anywhere else it is an ordinary backspace.
+        editor.backspace_paired();
+        assert_eq!(editor.text(), "");
     }
 }

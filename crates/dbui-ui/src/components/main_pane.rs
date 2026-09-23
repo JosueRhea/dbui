@@ -462,6 +462,7 @@ impl DbUi {
         let editor_height = self.editor_height;
         let dragging = self.editor_drag.is_some();
         let completion = self.completion.clone();
+        let find_bar = self.render_editor_find(cx);
 
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
             return div().id("editor-empty").into_any_element();
@@ -581,6 +582,7 @@ impl DbUi {
                             )),
                     ),
             )
+            .children(find_bar)
             .child(
                 div()
                     .id("editor-body")

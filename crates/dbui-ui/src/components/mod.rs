@@ -11,6 +11,7 @@ mod connection_form;
 pub(crate) mod context_menu;
 mod detail_sidebar;
 mod drag_ghost;
+pub(crate) mod editor_find;
 mod filters;
 mod grid;
 mod icons;

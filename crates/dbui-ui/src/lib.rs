@@ -152,6 +152,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-p", CommandPalette, Some("DbUi")),
         KeyBinding::new("cmd-shift-t", ChooseTheme, Some("DbUi")),
         KeyBinding::new("cmd-f", Find, Some("DbUi")),
+        KeyBinding::new("cmd-alt-f", FindReplace, Some("DbUi")),
         KeyBinding::new("cmd-shift-f", SearchTables, Some("DbUi")),
         KeyBinding::new("cmd-s", CommitChanges, Some("DbUi")),
         // ⌘A, ⌘C, ⌘V, ⌘D, ⌘⌫ and ⌘Z are handled in `DbUi::on_key` rather
@@ -239,6 +240,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Command Palette…", CommandPalette),
                 MenuItem::action("Search Tables", SearchTables),
                 MenuItem::action("Find…", Find),
+                MenuItem::action("Find and Replace…", FindReplace),
             ],
         },
         Menu {
@@ -263,6 +265,7 @@ gpui::actions!(
         CommandPalette,
         ChooseTheme,
         Find,
+        FindReplace,
         SearchTables,
         CommitChanges,
         SelectAllRows,
