@@ -3,7 +3,7 @@
 A database editor for PostgreSQL, MySQL and SQLite — TablePlus-shaped, written in Rust,
 drawn with [GPUI](https://www.gpui.rs).
 
-![Browsing a table in dbui: the schema tree on the left, 1,400 rows of a typed grid in the middle, and the selected row's fields on the right](docs/screenshots/table.png)
+![dbui demo: browsing a PostgreSQL database — the schema tree, a typed grid, tabs and the row detail panel](docs/demo.mp4)
 
 This is a **starter**: the architecture is complete and the whole path works
 end to end — connect, browse the tree, click a table, page through its rows,
@@ -20,13 +20,9 @@ transaction; `⌘Z` throws it away. With several rows selected, the panel on the
 edits all of them at once — `MIXED` marks a column they disagree on, and a field left
 reading `MIXED` is written to nobody.
 
-![Rows struck through and staged for deletion in the grid, with the staged-changes table open underneath listing each one by row, column, old value and new](docs/screenshots/changes.png)
-
 **SQL, with the catalog behind it.** `⌘↵` runs the statement under the caret, `⌘⇧↵`
 runs every statement in the buffer, and `⌃Space` completes against the schemas, tables
 and columns the connection actually has. Results land in the same typed grid, timed.
-
-![The SQL editor with a highlighted GROUP BY query above its result grid, reporting the rows it returned and how long it took](docs/screenshots/query.png)
 
 ## Install
 
