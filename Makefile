@@ -328,9 +328,11 @@ publish:
 	@test -f $(DMG) && test -f $(ZIP) && test -f $(BUILD)/SHA256SUMS || \
 	    (echo "ERROR: no release artifacts -- run 'make release-macos' first"; exit 1)
 	@# Refuse to publish a build the updater would reject. Catching it here is
-	@# the difference between a bad release and no release.
+	@# the difference between a bad release and no release. `-R=<text>` is
+	@# codesign's inline form -- the one `=` is what marks it as text; a second
+	@# one is a syntax error, which failed this check for every build.
 	@{ test -n "$(CODESIGN_ID)" && \
-	    codesign --verify --deep --strict -R='=$(RELEASE_REQ)' $(APP) 2>/dev/null; } || \
+	    codesign --verify --deep --strict -R='$(RELEASE_REQ)' $(APP) 2>/dev/null; } || \
 	    (echo "ERROR: $(APP) is not signed with '$(SIGN_CERT_NAME)' -- run 'make release-macos'"; exit 1)
 	@echo "  PUBLISH $(TAG)"
 	@gh release create $(TAG) $(DMG) $(ZIP) $(BUILD)/SHA256SUMS \
