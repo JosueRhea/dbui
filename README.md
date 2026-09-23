@@ -35,13 +35,34 @@ Download the latest `.dmg` from
 Applications.
 
 One download covers both Intel and Apple Silicon — the binary is universal, so
-there is no wrong choice to make. Builds are signed and notarized by Apple, so
-it opens normally: no right-click-to-open, no `xattr` incantation.
+there is no wrong choice to make.
+
+**The first open needs one extra step.** dbui is signed, but not notarized by
+Apple, so macOS stops it the first time with *"dbui" Not Opened* (or *"Apple
+could not verify…"*). To let it through, once:
+
+1. Click **Done** on that dialog.
+2. Open **System Settings → Privacy & Security**, scroll to the message about
+   dbui, and click **Open Anyway**. Confirm with your password.
+
+Or from a terminal, after dragging it to Applications:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/dbui.app
+```
+
+Either way it opens normally from then on, and updates installed from inside
+the app do not ask again.
 
 dbui updates itself. It checks for a newer release on launch and offers it in
 the status bar; nothing downloads or installs without a click. See
 [RELEASING.md](RELEASING.md#the-updater) for what it verifies before it will
 replace itself.
+
+> **Upgrading from 0.2.8 or earlier?** Those builds were signed by a different
+> identity, and their updater will refuse the new one. Download the latest
+> `.dmg` once by hand and replace the app; updates work from inside the app
+> again after that.
 
 ## Develop locally
 
