@@ -14,7 +14,7 @@ pub mod tableplus;
 pub mod updater;
 pub mod workspace;
 
-pub use commands::{BatchQueryResult, Outcome, TableContents};
+pub use commands::{BatchQueryResult, Outcome, PageSink, TableContents};
 pub use history::{History, HistoryEntry};
 pub use runtime::{DbRuntime, Task};
 pub use session::{SavedConnectionTab, SavedTab, Session};

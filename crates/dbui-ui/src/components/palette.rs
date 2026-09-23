@@ -64,6 +64,10 @@ enum ActionId {
     CopyRowsTsv,
     CopyRowsJson,
     CopyRowsInsert,
+    ExportCsv,
+    ExportJson,
+    ExportSql,
+    ImportCsv,
     ClearSort,
     CommitChanges,
     DiscardChanges,
@@ -303,6 +307,30 @@ const ACTIONS: &[ActionDef] = &[
     ActionDef {
         id: ActionId::CopyRowsInsert,
         label: "Copy Rows as INSERT",
+        shortcut: None,
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::ExportCsv,
+        label: "Export as CSV…",
+        shortcut: None,
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::ExportJson,
+        label: "Export as JSON…",
+        shortcut: None,
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::ExportSql,
+        label: "Export as SQL INSERTs…",
+        shortcut: None,
+        section: "Rows",
+    },
+    ActionDef {
+        id: ActionId::ImportCsv,
+        label: "Import CSV…",
         shortcut: None,
         section: "Rows",
     },
@@ -825,6 +853,13 @@ impl DbUi {
                 .active()
                 .and_then(|tab| tab.result())
                 .is_some_and(|view| !view.set.rows.is_empty()),
+            // A table exports whole, loaded or not; a query exports its result.
+            ActionId::ExportCsv | ActionId::ExportJson | ActionId::ExportSql => {
+                (is_table && connected) || self.tabs.active().and_then(|tab| tab.result()).is_some()
+            }
+            ActionId::ImportCsv => {
+                is_table && self.tabs.active().and_then(|tab| tab.result()).is_some()
+            }
             ActionId::ClearSort => self.active_sort().is_some(),
             ActionId::DuplicateRows => {
                 is_table
@@ -933,6 +968,10 @@ impl DbUi {
             ActionId::CopyRowsInsert => {
                 self.copy_selected_rows(crate::row_export::RowFormat::Insert, cx)
             }
+            ActionId::ExportCsv => self.export_rows(crate::row_export::RowFormat::Csv, cx),
+            ActionId::ExportJson => self.export_rows(crate::row_export::RowFormat::Json, cx),
+            ActionId::ExportSql => self.export_rows(crate::row_export::RowFormat::Insert, cx),
+            ActionId::ImportCsv => self.import_csv(cx),
             ActionId::ClearSort => self.clear_sort(cx),
             ActionId::ShowHistory => self.open_palette(PaletteKind::History, cx),
             ActionId::SqlTemplates => self.open_palette(PaletteKind::Templates, cx),

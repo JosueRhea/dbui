@@ -7,8 +7,8 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, SortKey,
-    TableKind, TableRef, Value,
+    Catalog, Column, ColumnInfo, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet,
+    SortKey, TableKind, TableRef, Value,
 };
 use dbui_driver::{DatabaseDriver, DriverError, QueryToken, RowBatch, RowUpdate};
 use std::sync::Arc;
@@ -69,6 +69,81 @@ pub fn open_table(
             columns,
             total_rows,
         })
+    })
+}
+
+/// Where an export's rows go, a page at a time.
+///
+/// The app layer reads; the UI decides what the file looks like. Errors are
+/// already worded for the status bar.
+pub trait PageSink: Send + 'static {
+    fn page(&mut self, columns: &[ColumnInfo], rows: Vec<Vec<Value>>) -> Result<(), String>;
+    fn finish(&mut self) -> Result<(), String>;
+}
+
+/// How many rows an export reads per round trip: enough that the round trips
+/// are not the cost, few enough that a wide table's page is not the problem.
+const EXPORT_PAGE: u32 = 5_000;
+
+/// Read every row of `table` that `where_clause` matches, in `sort` order,
+/// and hand them to `sink` as they arrive. Resolves to how many were read.
+///
+/// Paged by the same ordering the grid uses -- the sort, then the key -- so no
+/// row is read twice or skipped between pages. A table with neither key nor
+/// sort has no order that holds still between reads, so it is read in one go
+/// instead: slower to start, but it is every row exactly once.
+pub fn export_table(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+    where_clause: String,
+    sort: Option<SortKey>,
+    mut sink: impl PageSink,
+) -> Task<Result<u64, String>> {
+    runtime.spawn(async move {
+        let columns = driver.columns(&table).await.unwrap_or_default();
+        let keys = key_columns(&columns);
+        let order = dbui_domain::order_for(sort.as_ref(), &keys);
+        let stable = sort.is_some() || !keys.is_empty();
+        let limit = if stable { EXPORT_PAGE } else { u32::MAX - 1 };
+
+        let mut offset = 0u64;
+        let mut read = 0u64;
+        loop {
+            let set = driver
+                .table_rows(&table, Page { limit, offset }, &where_clause, &order)
+                .await
+                .map_err(|error| error.to_string())?;
+            let count = set.rows.len() as u64;
+            let more = set.truncated;
+            sink.page(
+                &set.columns,
+                set.rows.into_iter().map(|row| row.0).collect(),
+            )?;
+            read += count;
+            offset += count;
+            if !more || count == 0 {
+                break;
+            }
+        }
+        sink.finish()?;
+        Ok(read)
+    })
+}
+
+/// Write rows already in hand -- a query's result -- through a sink, off the
+/// UI thread.
+pub fn export_rows(
+    runtime: &DbRuntime,
+    columns: Vec<ColumnInfo>,
+    rows: Vec<Vec<Value>>,
+    mut sink: impl PageSink,
+) -> Task<Result<u64, String>> {
+    runtime.spawn(async move {
+        let count = rows.len() as u64;
+        sink.page(&columns, rows)?;
+        sink.finish()?;
+        Ok(count)
     })
 }
 
@@ -435,5 +510,95 @@ mod tests {
 
         let result = run_stoppable(driver.as_ref(), "SELECT 42", &mut stop).await;
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// Collects what an export hands it.
+    struct Collect(std::sync::Arc<std::sync::Mutex<(Vec<i64>, usize, bool)>>);
+
+    impl PageSink for Collect {
+        fn page(&mut self, _: &[ColumnInfo], rows: Vec<Vec<Value>>) -> Result<(), String> {
+            let mut seen = self.0.lock().unwrap();
+            seen.1 += 1;
+            for row in rows {
+                if let Some(Value::Int(id)) = row.first() {
+                    seen.0.push(*id);
+                }
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<(), String> {
+            self.0.lock().unwrap().2 = true;
+            Ok(())
+        }
+    }
+
+    async fn export_all(
+        driver: Arc<dyn DatabaseDriver>,
+        table: &str,
+    ) -> (u64, Vec<i64>, usize, bool) {
+        let runtime = DbRuntime::new().expect("runtime");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0, false)));
+        let read = export_table(
+            &runtime,
+            driver,
+            TableRef::new("main", table),
+            String::new(),
+            None,
+            Collect(seen.clone()),
+        )
+        .await
+        .expect("the task ran")
+        .expect("the export worked");
+        let (ids, pages, finished) = seen.lock().unwrap().clone();
+        // A runtime cannot be dropped from inside another one's async
+        // context; letting it go on a blocking thread is allowed.
+        tokio::task::spawn_blocking(move || drop(runtime))
+            .await
+            .unwrap();
+        (read, ids, pages, finished)
+    }
+
+    /// More rows than one page: every one of them, once, in key order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keyed_table_exports_across_pages_without_gaps_or_repeats() {
+        let (_file, driver) = sqlite("export-keyed").await;
+        driver
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        driver
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12345) \
+                 INSERT INTO t SELECT i FROM n",
+            )
+            .await
+            .unwrap();
+
+        let (read, ids, pages, finished) = export_all(driver, "t").await;
+        assert_eq!(read, 12_345);
+        assert_eq!(ids, (1..=12_345).collect::<Vec<i64>>());
+        assert_eq!(pages, 3, "5000 + 5000 + 2345");
+        assert!(finished);
+    }
+
+    /// No key and no sort: no order holds still between pages, so it is read
+    /// in one go -- and still every row exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keyless_table_exports_in_one_read() {
+        let (_file, driver) = sqlite("export-keyless").await;
+        driver.execute("CREATE TABLE t (n INTEGER)").await.unwrap();
+        driver
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 7000) \
+                 INSERT INTO t SELECT i FROM n",
+            )
+            .await
+            .unwrap();
+
+        let (read, mut ids, pages, _) = export_all(driver, "t").await;
+        assert_eq!(read, 7_000);
+        assert_eq!(pages, 1);
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=7_000).collect::<Vec<i64>>());
     }
 }

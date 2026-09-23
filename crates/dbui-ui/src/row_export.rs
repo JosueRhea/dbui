@@ -1,9 +1,11 @@
-//! Turning selected rows into text for the clipboard.
+//! Turning rows into text -- for the clipboard, and for files.
 //!
-//! Three shapes, because three different places are being pasted into: a
-//! spreadsheet wants tab-separated columns, a script wants JSON, and a psql
-//! session wants statements it can run. All three are pure functions over a
-//! result set, so all three are unit tested.
+//! Three shapes for the clipboard, because three different places are being
+//! pasted into: a spreadsheet wants tab-separated columns, a script wants
+//! JSON, and a psql session wants statements it can run. A file adds CSV, the
+//! one every other tool reads. All of them are pure functions over a result
+//! set, so all of them are unit tested; [`ExportWriter`] streams the same
+//! shapes to disk a page at a time.
 
 use dbui_app::domain::{ColumnInfo, Driver, TableRef, Value};
 
@@ -16,6 +18,8 @@ pub enum RowFormat {
     Json,
     /// One `INSERT` per row, ready to replay elsewhere.
     Insert,
+    /// Comma-separated with a header row -- for files other tools will open.
+    Csv,
 }
 
 impl RowFormat {
@@ -24,6 +28,17 @@ impl RowFormat {
             RowFormat::Tsv => "Copy as TSV",
             RowFormat::Json => "Copy as JSON",
             RowFormat::Insert => "Copy as INSERT",
+            RowFormat::Csv => "Copy as CSV",
+        }
+    }
+
+    /// The file extension an export in this shape is saved with.
+    pub fn extension(self) -> &'static str {
+        match self {
+            RowFormat::Tsv => "tsv",
+            RowFormat::Json => "json",
+            RowFormat::Insert => "sql",
+            RowFormat::Csv => "csv",
         }
     }
 }
@@ -44,6 +59,157 @@ pub fn render(
         RowFormat::Tsv => tsv(columns, values),
         RowFormat::Json => json(columns, values),
         RowFormat::Insert => inserts(columns, values, driver, table),
+        RowFormat::Csv => csv(columns, values),
+    }
+}
+
+fn csv(columns: &[ColumnInfo], values: &[Vec<Value>]) -> String {
+    let mut out = csv_line(columns.iter().map(|column| column.name.clone()));
+    for row in values {
+        out.push_str(&csv_line(row.iter().map(cell_text)));
+    }
+    out
+}
+
+/// One CSV record, newline included. RFC 4180 quoting: a field holding a
+/// comma, a quote or a line break is wrapped in quotes, with its own quotes
+/// doubled.
+fn csv_line(fields: impl Iterator<Item = String>) -> String {
+    let mut line = fields
+        .map(|field| {
+            if field.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", field.replace('"', "\"\""))
+            } else {
+                field
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    line.push('\n');
+    line
+}
+
+/// Rows written to a file as they arrive, a page at a time.
+///
+/// A whole table can be far more than fits comfortably in memory, so nothing
+/// here holds more than the page in hand. `keep` narrows and orders the
+/// columns to the ones the grid shows, by name; `None` writes them all.
+pub struct ExportWriter<W: std::io::Write> {
+    out: W,
+    format: RowFormat,
+    driver: Driver,
+    table: Option<TableRef>,
+    keep: Option<Vec<String>>,
+    /// Where each kept column sits in the rows being written. Worked out from
+    /// the first page's columns.
+    picks: Option<Vec<usize>>,
+    started: bool,
+    pub rows: u64,
+}
+
+impl<W: std::io::Write> ExportWriter<W> {
+    pub fn new(
+        out: W,
+        format: RowFormat,
+        driver: Driver,
+        table: Option<TableRef>,
+        keep: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            out,
+            format,
+            driver,
+            table,
+            keep,
+            picks: None,
+            started: false,
+            rows: 0,
+        }
+    }
+
+    pub fn page(&mut self, columns: &[ColumnInfo], rows: &[Vec<Value>]) -> std::io::Result<()> {
+        let picks = self.picks.get_or_insert_with(|| match &self.keep {
+            Some(names) => names
+                .iter()
+                .filter_map(|name| columns.iter().position(|column| &column.name == name))
+                .collect(),
+            None => (0..columns.len()).collect(),
+        });
+        let columns: Vec<ColumnInfo> = picks.iter().map(|&at| columns[at].clone()).collect();
+        let rows: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|row| {
+                picks
+                    .iter()
+                    .map(|&at| row.get(at).cloned().unwrap_or(Value::Null))
+                    .collect()
+            })
+            .collect();
+
+        let first = !self.started;
+        self.started = true;
+        match self.format {
+            RowFormat::Csv => {
+                if first {
+                    self.out
+                        .write_all(csv_line(columns.iter().map(|c| c.name.clone())).as_bytes())?;
+                }
+                for row in &rows {
+                    self.out
+                        .write_all(csv_line(row.iter().map(cell_text)).as_bytes())?;
+                }
+            }
+            RowFormat::Tsv => {
+                let text = tsv(&columns, &rows);
+                // The header is the first line of every page's rendering;
+                // only the first page keeps it.
+                let body = if first {
+                    text.as_str()
+                } else {
+                    text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+                };
+                self.out.write_all(body.as_bytes())?;
+            }
+            RowFormat::Insert => {
+                let text = inserts(&columns, &rows, self.driver, self.table.as_ref());
+                self.out.write_all(text.as_bytes())?;
+            }
+            RowFormat::Json => {
+                // One array across every page: the brackets go on the ends
+                // of the file, and a comma between pages as well as rows.
+                self.out.write_all(if first { b"[" } else { b"" })?;
+                for (index, row) in rows.iter().enumerate() {
+                    let mut object = serde_json::Map::new();
+                    for (column, value) in columns.iter().zip(row) {
+                        object.insert(column.name.clone(), json_value(value));
+                    }
+                    let separator = if self.rows == 0 && index == 0 {
+                        "\n  "
+                    } else {
+                        ",\n  "
+                    };
+                    self.out.write_all(separator.as_bytes())?;
+                    let item = serde_json::to_string(&serde_json::Value::Object(object))
+                        .unwrap_or_default();
+                    self.out.write_all(item.as_bytes())?;
+                }
+            }
+        }
+        self.rows += rows.len() as u64;
+        Ok(())
+    }
+
+    /// Close off the file: JSON's array, and whatever is still buffered.
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        if self.format == RowFormat::Json {
+            let tail: &[u8] = match (self.started, self.rows) {
+                (false, _) => b"[]\n",
+                (true, 0) => b"]\n",
+                (true, _) => b"\n]\n",
+            };
+            self.out.write_all(tail)?;
+        }
+        self.out.flush()
     }
 }
 
@@ -191,7 +357,19 @@ pub struct PastedRows {
 /// than as the start of a new column or row. `None` when the text is not
 /// shaped like a table at all.
 pub fn parse_tsv(text: &str) -> Option<PastedRows> {
-    let mut records = split_records(text);
+    parse_delimited(text, '\t')
+}
+
+/// Parse a CSV file's text into rows: the first record is the header.
+///
+/// A byte-order mark is dropped first -- Excel writes one, and left in place
+/// it becomes part of the first column's name, which then matches nothing.
+pub fn parse_csv(text: &str) -> Option<PastedRows> {
+    parse_delimited(text.strip_prefix('\u{feff}').unwrap_or(text), ',')
+}
+
+fn parse_delimited(text: &str, separator: char) -> Option<PastedRows> {
+    let mut records = split_records(text, separator);
     if records.len() < 2 {
         // A header and at least one row. A lone line is a value someone
         // copied from somewhere else, not a table.
@@ -222,8 +400,8 @@ pub fn parse_tsv(text: &str) -> Option<PastedRows> {
     Some(PastedRows { columns, rows })
 }
 
-/// Split TSV text into records of fields, honouring quoted cells.
-fn split_records(text: &str) -> Vec<Vec<String>> {
+/// Split delimited text into records of fields, honouring quoted cells.
+fn split_records(text: &str, separator: char) -> Vec<Vec<String>> {
     let mut records = Vec::new();
     let mut record = Vec::new();
     let mut field = String::new();
@@ -248,7 +426,7 @@ fn split_records(text: &str) -> Vec<Vec<String>> {
 
         match ch {
             '"' if field.is_empty() => quoted = true,
-            '\t' => record.push(std::mem::take(&mut field)),
+            c if c == separator => record.push(std::mem::take(&mut field)),
             '\n' => {
                 record.push(std::mem::take(&mut field));
                 records.push(std::mem::take(&mut record));
@@ -463,5 +641,94 @@ mod tests {
             Some(&TableRef::new("s", "t")),
         );
         assert!(out.contains("VALUES (TRUE, 1.50)"), "got: {out}");
+    }
+
+    #[test]
+    fn csv_quotes_only_what_needs_it() {
+        let text = render(
+            RowFormat::Csv,
+            &columns(&["id", "note"]),
+            &[
+                vec![Value::Int(1), Value::Text("plain".into())],
+                vec![Value::Int(2), Value::Text("a, \"quoted\"\nline".into())],
+                vec![Value::Int(3), Value::Null],
+            ],
+            Driver::Postgres,
+            None,
+        );
+        assert_eq!(
+            text,
+            "id,note\n1,plain\n2,\"a, \"\"quoted\"\"\nline\"\n3,\n"
+        );
+        // And reading it back gives the same cells.
+        let parsed = parse_csv(&text).expect("a table");
+        assert_eq!(parsed.rows[1], vec!["2", "a, \"quoted\"\nline"]);
+    }
+
+    #[test]
+    fn a_json_export_across_pages_is_one_array() {
+        let mut out = Vec::new();
+        let mut writer = ExportWriter::new(&mut out, RowFormat::Json, Driver::Postgres, None, None);
+        let cols = columns(&["id"]);
+        writer
+            .page(&cols, &[vec![Value::Int(1)], vec![Value::Int(2)]])
+            .unwrap();
+        writer.page(&cols, &[]).unwrap();
+        writer.page(&cols, &[vec![Value::Int(3)]]).unwrap();
+        writer.finish().unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!([{"id": 1}, {"id": 2}, {"id": 3}]));
+    }
+
+    #[test]
+    fn an_empty_json_export_is_an_empty_array() {
+        let mut out = Vec::new();
+        let mut writer = ExportWriter::new(&mut out, RowFormat::Json, Driver::Postgres, None, None);
+        writer.page(&columns(&["id"]), &[]).unwrap();
+        writer.finish().unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!([]));
+    }
+
+    #[test]
+    fn an_export_keeps_the_grids_columns_in_the_grids_order() {
+        let mut out = Vec::new();
+        let mut writer = ExportWriter::new(
+            &mut out,
+            RowFormat::Csv,
+            Driver::Postgres,
+            None,
+            Some(vec!["name".into(), "id".into()]),
+        );
+        let cols = columns(&["id", "secret", "name"]);
+        writer
+            .page(
+                &cols,
+                &[vec![
+                    Value::Int(1),
+                    Value::Text("x".into()),
+                    Value::Text("Ada".into()),
+                ]],
+            )
+            .unwrap();
+        writer
+            .page(
+                &cols,
+                &[vec![
+                    Value::Int(2),
+                    Value::Text("y".into()),
+                    Value::Text("Bo".into()),
+                ]],
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "name,id\nAda,1\nBo,2\n");
+    }
+
+    #[test]
+    fn a_csv_with_a_byte_order_mark_reads_its_first_header_clean() {
+        let parsed = parse_csv("\u{feff}id,name\r\n1,Ada\r\n").expect("a table");
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.rows, vec![vec!["1", "Ada"]]);
     }
 }

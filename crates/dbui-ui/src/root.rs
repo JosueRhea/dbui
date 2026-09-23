@@ -3956,24 +3956,41 @@ impl DbUi {
             return;
         };
 
+        self.stage_named_rows(pasted, "Pasted", cx);
+    }
+
+    /// Stage rows that name their columns -- pasted, or read from a file --
+    /// as inserts into the front table.
+    ///
+    /// Columns are matched by name, exactly first and then ignoring case,
+    /// since a spreadsheet round trip often changes a header's case. A name
+    /// the table does not have is ignored rather than refused: three of five
+    /// columns is a reasonable thing to bring in. So is a name that appears
+    /// twice -- the first one is used and the repeat ignored and counted,
+    /// where it used to overwrite the first cell without a word.
+    pub(crate) fn stage_named_rows(
+        &mut self,
+        incoming: crate::row_export::PastedRows,
+        verb: &str,
+        cx: &mut Context<Self>,
+    ) {
         let Some(WorkspaceTab::Table {
             result: Some(view), ..
         }) = self.tabs.active()
         else {
-            self.status = Status::info("Pasting rows needs a table tab");
+            self.status = Status::info("Adding rows needs a table tab");
             cx.notify();
             return;
         };
         let columns = view.set.columns.clone();
         let structure = view.structure.clone();
 
-        // Match by name, case-insensitively as a fallback -- a spreadsheet
-        // round trip often changes the case of a header.
-        let matched: Vec<Option<String>> = pasted
+        let mut taken: Vec<String> = Vec::new();
+        let matched: Vec<Option<String>> = incoming
             .columns
             .iter()
             .map(|name| {
-                columns
+                let column = columns
                     .iter()
                     .find(|column| column.name == *name)
                     .or_else(|| {
@@ -3981,7 +3998,12 @@ impl DbUi {
                             .iter()
                             .find(|column| column.name.eq_ignore_ascii_case(name))
                     })
-                    .map(|column| column.name.clone())
+                    .map(|column| column.name.clone())?;
+                if taken.contains(&column) {
+                    return None;
+                }
+                taken.push(column.clone());
+                Some(column)
             })
             .collect();
 
@@ -3991,7 +4013,7 @@ impl DbUi {
             return;
         }
 
-        let staged: Vec<crate::tabs::PendingRowInsert> = pasted
+        let staged: Vec<crate::tabs::PendingRowInsert> = incoming
             .rows
             .iter()
             .map(|cells| {
@@ -4011,9 +4033,9 @@ impl DbUi {
 
         let plural = if count == 1 { "row" } else { "rows" };
         self.status = Status::info(if ignored > 0 {
-            format!("Pasted {count} {plural} — {ignored} column(s) ignored")
+            format!("{verb} {count} {plural} — {ignored} column(s) ignored")
         } else {
-            format!("Pasted {count} {plural} — ⌘S to commit")
+            format!("{verb} {count} {plural} — ⌘S to commit")
         });
         cx.notify();
     }
@@ -5983,6 +6005,16 @@ impl Render for DbUi {
                 this.duplicate_selected_rows(cx)
             }))
             .on_action(cx.listener(|this, _: &crate::PasteRows, _window, cx| this.paste_rows(cx)))
+            .on_action(cx.listener(|this, _: &crate::ExportCsv, _window, cx| {
+                this.export_rows(crate::row_export::RowFormat::Csv, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::ExportJson, _window, cx| {
+                this.export_rows(crate::row_export::RowFormat::Json, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::ExportSql, _window, cx| {
+                this.export_rows(crate::row_export::RowFormat::Insert, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::ImportCsv, _window, cx| this.import_csv(cx)))
             .on_action(cx.listener(|this, _: &crate::DiscardChanges, _window, cx| {
                 this.discard_pending_edits(cx)
             }))

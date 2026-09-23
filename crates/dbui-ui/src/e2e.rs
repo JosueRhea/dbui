@@ -3307,6 +3307,117 @@ fn stop_ends_a_runaway_query(cx: &mut TestAppContext) {
     });
 }
 
+/// A scratch path for a file a test writes, removed when dropped.
+struct ScratchFile(std::path::PathBuf);
+
+impl ScratchFile {
+    fn new(name: &str) -> Self {
+        let mut path = std::env::temp_dir();
+        path.push(format!("dbui-e2e-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Wait for the footer to say an export finished, and fail if it never does.
+fn settle_export(view: &Entity<DbUi>, cx: &mut VisualTestContext) -> String {
+    settle(view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    let said = view.update(cx, |view, _| describe(&view.status));
+    assert!(said.contains("Exported"), "the export finished: {said}");
+    said
+}
+
+/// Exporting a table tab writes the table -- every row, with a header -- as
+/// CSV a spreadsheet will open.
+#[gpui::test]
+fn a_table_exports_to_csv(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "export-csv");
+    let out = ScratchFile::new("members.csv");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.export_to_path(out.0.clone(), crate::row_export::RowFormat::Csv, cx);
+    });
+    let said = settle_export(&view, cx);
+    assert!(said.contains("2 rows"), "{said}");
+
+    let written = std::fs::read_to_string(&out.0).expect("the file was written");
+    assert_eq!(written, "id,name,team_slug\n1,Ada,core\n2,Grace,ops\n");
+}
+
+/// A query tab exports its result, and JSON keeps numbers as numbers.
+#[gpui::test]
+fn a_query_result_exports_to_json(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "export-json");
+    let out = ScratchFile::new("query.json");
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT id, name FROM members ORDER BY id", cx);
+        view.run_query(cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.export_to_path(out.0.clone(), crate::row_export::RowFormat::Json, cx);
+    });
+    settle_export(&view, cx);
+
+    let written = std::fs::read_to_string(&out.0).expect("the file was written");
+    let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+    assert_eq!(
+        parsed,
+        serde_json::json!([{"id": 1, "name": "Ada"}, {"id": 2, "name": "Grace"}])
+    );
+}
+
+/// Importing a CSV stages its rows; ⌘S writes them. A header the table does
+/// not have is ignored, and so is a repeat of one it does.
+#[gpui::test]
+fn a_csv_imports_as_staged_rows_that_commit(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "import-csv");
+    let path = db.path.clone();
+    let csv = ScratchFile::new("people.csv");
+    // A byte-order mark, as Excel writes; a quoted comma; an unknown column;
+    // and `name` twice, where the first one must win.
+    std::fs::write(
+        &csv.0,
+        "\u{feff}name,team_slug,shoe_size,name\n\"Hopper, Grace\",core,9,ignored\nLinus,ops,11,ignored\n",
+    )
+    .expect("write the csv");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| view.import_csv_from_path(&csv.0, cx));
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.active().unwrap().pending_inserts().len(), 2);
+        let said = describe(&view.status);
+        assert!(said.contains("2 column(s) ignored"), "{said}");
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    settle_column(&view, cx, 1, &["Ada", "Grace", "Hopper, Grace", "Linus"]);
+    assert_eq!(
+        read_back(&path, "SELECT name, team_slug FROM members ORDER BY id"),
+        vec![
+            vec!["Ada".to_string(), "core".to_string()],
+            vec!["Grace".to_string(), "ops".to_string()],
+            vec!["Hopper, Grace".to_string(), "core".to_string()],
+            vec!["Linus".to_string(), "ops".to_string()],
+        ],
+        "on disk, not just on screen"
+    );
+}
+
 /// A statement the engine refuses lands on the tab, not only in the footer.
 #[gpui::test]
 fn a_failing_statement_leaves_its_error_on_the_tab(cx: &mut TestAppContext) {

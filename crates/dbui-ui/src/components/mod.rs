@@ -25,6 +25,7 @@ mod tabs;
 pub(crate) mod text_field;
 mod titlebar;
 mod toolbar;
+mod transfer;
 
 pub use connection_form::{ConnectionForm, FormAction};
 pub use text_field::DetailInput;
