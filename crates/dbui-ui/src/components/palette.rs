@@ -95,6 +95,11 @@ enum ActionId {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ToggleTranslucent,
+    MoreGlassTint,
+    LessGlassTint,
+    MoreGlassBlur,
+    LessGlassBlur,
     ShowHistory,
     SqlTemplates,
     DuplicateRows,
@@ -430,6 +435,36 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::ZoomReset,
         label: "Actual Size",
         shortcut: Some("⌘0"),
+        section: "View",
+    },
+    ActionDef {
+        id: ActionId::ToggleTranslucent,
+        label: "Toggle Translucent Window",
+        shortcut: None,
+        section: "View",
+    },
+    ActionDef {
+        id: ActionId::MoreGlassTint,
+        label: "Increase Glass Tint",
+        shortcut: None,
+        section: "View",
+    },
+    ActionDef {
+        id: ActionId::LessGlassTint,
+        label: "Decrease Glass Tint",
+        shortcut: None,
+        section: "View",
+    },
+    ActionDef {
+        id: ActionId::MoreGlassBlur,
+        label: "Increase Glass Blur",
+        shortcut: None,
+        section: "View",
+    },
+    ActionDef {
+        id: ActionId::LessGlassBlur,
+        label: "Decrease Glass Blur",
+        shortcut: None,
         section: "View",
     },
 ];
@@ -913,7 +948,13 @@ impl DbUi {
             | ActionId::PrevTab
             | ActionId::ZoomIn
             | ActionId::ZoomOut
-            | ActionId::ZoomReset => true,
+            | ActionId::ZoomReset
+            | ActionId::ToggleTranslucent => true,
+            // Only while there is glass to tune, as in the settings menu.
+            ActionId::MoreGlassTint
+            | ActionId::LessGlassTint
+            | ActionId::MoreGlassBlur
+            | ActionId::LessGlassBlur => self.translucent,
             ActionId::ConnectActive => {
                 has_active
                     && self
@@ -1117,6 +1158,11 @@ impl DbUi {
             ActionId::ZoomIn => self.zoom_delta(1, cx),
             ActionId::ZoomOut => self.zoom_delta(-1, cx),
             ActionId::ZoomReset => self.zoom_delta(0, cx),
+            ActionId::ToggleTranslucent => self.toggle_translucent(cx),
+            ActionId::MoreGlassTint => self.step_glass_opacity(1, cx),
+            ActionId::LessGlassTint => self.step_glass_opacity(-1, cx),
+            ActionId::MoreGlassBlur => self.step_glass_blur(1, cx),
+            ActionId::LessGlassBlur => self.step_glass_blur(-1, cx),
         }
     }
 

@@ -6999,6 +6999,32 @@ fn cmd_p_over_an_open_table_palette_leaves_it_alone(cx: &mut TestAppContext) {
     });
 }
 
+/// The glass settings are reachable from the keyboard, not only from the
+/// settings menu: each is a palette action.
+#[gpui::test]
+fn the_glass_settings_run_from_the_palette(cx: &mut TestAppContext) {
+    use crate::components::palette::PaletteKind;
+
+    let (view, cx) = open(cx);
+    let tint = view.update(cx, |view, _| {
+        assert!(view.translucent, "on by default");
+        view.glass_opacity_pct
+    });
+
+    view.update(cx, |view, cx| view.open_palette(PaletteKind::Actions, cx));
+    cx.simulate_keystrokes(&typing("decrease glass tint"));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(view.glass_opacity_pct, tint - 5, "one notch down");
+        assert!(describe(&view.status).contains("Glass tint"), "and said so");
+    });
+
+    view.update(cx, |view, cx| view.open_palette(PaletteKind::Actions, cx));
+    cx.simulate_keystrokes(&typing("toggle translucent"));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| assert!(!view.translucent, "turned off"));
+}
+
 /// The guard behind the two tests above: `handle_palette_key`'s own Enter arm
 /// requires no ⌘, precisely so that ⌘↵ -- unregistered as an action while the
 /// palette is up -- does not fall into it and run whichever row happens to be

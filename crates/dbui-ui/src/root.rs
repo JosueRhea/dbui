@@ -20,9 +20,9 @@ use dbui_app::{
     session, store, ConnectionStatus, DbRuntime, RowUpdate, SavedConnectionTab, Session, Workspace,
 };
 use gpui::{
-    div, point, prelude::*, px, Context, FocusHandle, KeyDownEvent, MouseButton, MouseMoveEvent,
-    MouseUpEvent, Pixels, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
-    Window,
+    div, point, prelude::*, px, AnyElement, Context, FocusHandle, KeyDownEvent, MouseButton,
+    MouseMoveEvent, MouseUpEvent, Pixels, ScrollHandle, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, WindowBackgroundAppearance,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -434,6 +434,20 @@ pub struct DbUi {
     pub(crate) sidebar_drag: Option<(Pixels, f32)>,
     /// Row detail panel width, in unzoomed pixels.
     pub(crate) detail_width: f32,
+    /// The user's "Translucent Window" preference.
+    pub(crate) translucent: bool,
+    /// Whether this frame is drawn translucent: the preference, except in
+    /// full screen, where there is no desktop behind the window to blur.
+    /// Also what the window's background appearance was last set to.
+    pub(crate) glass: bool,
+    /// What the window's material was last set to: `None` for no material,
+    /// otherwise whether it was the light one. The theme picks light or dark,
+    /// so a theme change while translucent has to re-tint it.
+    vibrancy: Option<bool>,
+    /// How strongly the theme tints the glass, 0–100.
+    pub(crate) glass_opacity_pct: u32,
+    /// How far the glass blurs what is behind the window, in points.
+    pub(crate) glass_blur: u32,
     /// Live drag for the detail panel: `(pointer x, width)` at the grab.
     pub(crate) detail_drag: Option<(Pixels, f32)>,
     /// Detail fields the user has folded back down to a scrolling box, by
@@ -686,6 +700,11 @@ impl DbUi {
             titlebar_drag: false,
             sidebar_drag: None,
             detail_width: DETAIL_WIDTH_DEFAULT,
+            translucent: store::default_translucent(),
+            glass: false,
+            vibrancy: None,
+            glass_opacity_pct: store::default_glass_opacity_pct(),
+            glass_blur: store::default_glass_blur(),
             detail_drag: None,
             detail_collapsed: HashSet::new(),
             change_bubble_height: px(BUBBLE_HEIGHT_DEFAULT),
@@ -861,6 +880,88 @@ impl DbUi {
         self.theme = Theme::named(id);
     }
 
+    pub fn apply_translucent(&mut self, on: bool, opacity_pct: u32, blur: u32) {
+        self.translucent = on;
+        self.glass_opacity_pct = opacity_pct.min(100);
+        self.glass_blur = blur.min(GLASS_BLUR_MAX);
+    }
+
+    /// Step the glass tint by `direction` notches of 5%.
+    pub(crate) fn step_glass_opacity(&mut self, direction: i32, cx: &mut Context<Self>) {
+        self.glass_opacity_pct = step_setting(self.glass_opacity_pct, direction, 5, 100);
+        self.persist_prefs(cx);
+        // Said in the footer too: from the palette, which closes behind the
+        // step, the footer is the only place the new value shows.
+        self.status = Status::info(format!("Glass tint: {}%", self.glass_opacity_pct));
+    }
+
+    /// Step the glass blur by `direction` notches of 5pt.
+    pub(crate) fn step_glass_blur(&mut self, direction: i32, cx: &mut Context<Self>) {
+        self.glass_blur = step_setting(self.glass_blur, direction, 5, GLASS_BLUR_MAX);
+        self.persist_prefs(cx);
+        self.status = Status::info(format!("Glass blur: {}", self.glass_blur));
+    }
+
+    pub(crate) fn toggle_translucent(&mut self, cx: &mut Context<Self>) {
+        self.translucent = !self.translucent;
+        self.persist_prefs(cx);
+        self.status = Status::info(if self.translucent {
+            "Translucent window: on"
+        } else {
+            "Translucent window: off"
+        });
+        cx.notify();
+    }
+
+    /// The tint over the window's material. The theme's panel colour, so
+    /// each theme still colours its own chrome, but thin: AppKit's material
+    /// already tints the blur, and this is only the theme's accent on it.
+    pub(crate) fn glass_tint(&self) -> gpui::Rgba {
+        // The same setting has to mean the same amount of glass in either
+        // kind of theme, and it does not by itself: a near-white tint over
+        // the light material is almost indistinguishable from a solid panel
+        // long before a dark one over the dark material is. So a light theme
+        // lays it on at well under half strength.
+        let strength = if self.theme.is_light {
+            LIGHT_TINT_STRENGTH
+        } else {
+            1.
+        };
+        gpui::Rgba {
+            a: self.glass_opacity_pct as f32 / 100. * strength,
+            ..self.theme.panel
+        }
+    }
+
+    /// The theme the chrome on the glass draws with: its raised surfaces --
+    /// the search fields, the front tab and chip -- become a wash of the text
+    /// colour rather than a solid block, so the glass shows through them too.
+    /// Menus that drop from the chrome keep `self.theme`: they sit over the
+    /// content, not the glass, and need to be solid to be read.
+    pub(crate) fn chrome_theme(&self) -> Theme {
+        let mut theme = self.theme.clone();
+        if self.glass {
+            let wash = gpui::Rgba {
+                a: 0.08,
+                ..theme.text
+            };
+            theme.background = wash;
+            theme.elevated = wash;
+            theme.border = gpui::Rgba {
+                a: 0.12,
+                ..theme.text
+            };
+            // The dim text tones were picked against a solid panel. Over a
+            // blurred desktop that may be lighter or busier than the panel
+            // ever is, they fade out: placeholders first, then the tree.
+            // Pulled toward the full text colour, they keep their order --
+            // faint under muted under text -- but read again.
+            theme.text_muted = mix(theme.text_muted, theme.text, 0.55);
+            theme.text_faint = mix(theme.text_faint, theme.text, 0.45);
+        }
+        theme
+    }
+
     pub fn apply_zoom_pct(&mut self, pct: u32) {
         metrics::set_zoom_pct(pct);
     }
@@ -873,6 +974,9 @@ impl DbUi {
             sql_editor_height_px: f32::from(self.editor_height).round() as u32,
             sidebar_width_px: self.sidebar_width.round() as u32,
             detail_width_px: self.detail_width.round() as u32,
+            translucent: self.translucent,
+            glass_opacity_pct: self.glass_opacity_pct,
+            glass_blur: self.glass_blur,
         }
     }
 
@@ -6391,6 +6495,25 @@ impl Render for DbUi {
             window.focus(&self.focus_handle);
         }
         window.set_rem_size(metrics::rem_size());
+        let glass = self.translucent && !window.is_fullscreen();
+        let vibrancy = glass.then_some(self.theme.is_light);
+        if vibrancy != self.vibrancy {
+            if glass != self.glass {
+                window.set_background_appearance(if glass {
+                    WindowBackgroundAppearance::Transparent
+                } else {
+                    WindowBackgroundAppearance::Opaque
+                });
+            }
+            #[cfg(target_os = "macos")]
+            crate::mac_window::set_vibrancy(vibrancy);
+            self.vibrancy = vibrancy;
+        }
+        self.glass = glass;
+        #[cfg(target_os = "macos")]
+        if glass {
+            crate::mac_window::set_vibrancy_blur(f64::from(self.glass_blur));
+        }
 
         let modal = self.modal.is_some().then(|| self.render_modal(cx));
         let palette = self.render_palette(cx);
@@ -6405,7 +6528,14 @@ impl Render for DbUi {
             .size_full()
             .flex()
             .flex_col()
-            .bg(self.theme.background)
+            // Translucent, the one tint is laid here and the titlebar, rail
+            // and status bar draw nothing of their own over it, so the glass
+            // reads as one sheet rather than three panes of it.
+            .bg(if glass {
+                self.glass_tint()
+            } else {
+                self.theme.background
+            })
             .text_color(self.theme.text)
             .font_family(metrics::UI_FONT)
             .text_size(metrics::text_size())
@@ -6650,9 +6780,7 @@ impl Render for DbUi {
                     .overflow_hidden()
                     .child(self.render_sidebar(window, cx))
                     .child(self.render_sidebar_resize(cx))
-                    .child(self.render_main(window, cx))
-                    .children(self.render_detail_resize(cx))
-                    .child(self.render_detail_sidebar(cx)),
+                    .child(self.render_content_card(window, cx)),
             )
             .children(change_bubble)
             .child(self.render_status_bar(cx))
@@ -6668,6 +6796,79 @@ impl Render for DbUi {
     }
 }
 
+/// How much of the tint setting a light theme applies. See `glass_tint`.
+const LIGHT_TINT_STRENGTH: f32 = 0.4;
+
+/// `from` moved `amount` of the way to `to`.
+fn mix(from: gpui::Rgba, to: gpui::Rgba, amount: f32) -> gpui::Rgba {
+    let lerp = |a: f32, b: f32| a + (b - a) * amount;
+    gpui::Rgba {
+        r: lerp(from.r, to.r),
+        g: lerp(from.g, to.g),
+        b: lerp(from.b, to.b),
+        a: lerp(from.a, to.a),
+    }
+}
+
+/// Past this the blur stops changing anything visible: the desktop is already
+/// a wash of its average colour.
+const GLASS_BLUR_MAX: u32 = 80;
+
+/// Move a setting `direction` notches of `step`, landing on a multiple of it
+/// and staying within `0..=max`.
+fn step_setting(value: u32, direction: i32, step: u32, max: u32) -> u32 {
+    let notch = value / step;
+    let notch = if direction < 0 {
+        // A value between notches steps down to the one below it, not past it.
+        if value % step == 0 {
+            notch.saturating_sub(1)
+        } else {
+            notch
+        }
+    } else {
+        notch + 1
+    };
+    (notch * step).min(max)
+}
+
+impl DbUi {
+    /// The grid and the detail panel. Opaque, they simply fill the space
+    /// beside the rail; translucent, they sit in a rounded card on the glass.
+    fn render_content_card(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let content = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_hidden()
+            .child(self.render_main(window, cx))
+            .children(self.render_detail_resize(cx))
+            .child(self.render_detail_sidebar(cx));
+        if !self.glass {
+            return content.into_any_element();
+        }
+        // GPUI clips children to a rectangle, not to rounded corners, so the
+        // card is padded far enough that a square child's corner stays inside
+        // the curve: an inset of r·(1 − 1/√2), a little under a third of r.
+        let radius = metrics::scaled(10.);
+        div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .mr(metrics::scaled(6.))
+            .p(radius * 0.3)
+            .rounded(radius)
+            .bg(self.theme.background)
+            .border_1()
+            .border_color(self.theme.border)
+            .shadow_sm()
+            .overflow_hidden()
+            .child(content)
+            .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6680,6 +6881,16 @@ mod tests {
         assert_eq!(page_position_of(500, 500, 1400), (2, 3));
         assert_eq!(page_position_of(1000, 500, 1400), (3, 3));
         assert_eq!(page_position_of(0, 500, 1000), (1, 2), "an exact fit");
+    }
+
+    #[test]
+    fn a_setting_steps_by_notches_and_stays_in_range() {
+        assert_eq!(step_setting(35, 1, 5, 100), 40);
+        assert_eq!(step_setting(35, -1, 5, 100), 30);
+        assert_eq!(step_setting(0, -1, 5, 100), 0, "no wrap below zero");
+        assert_eq!(step_setting(100, 1, 5, 100), 100, "capped at the top");
+        assert_eq!(step_setting(33, 1, 5, 100), 35, "off-notch snaps up");
+        assert_eq!(step_setting(33, -1, 5, 100), 30, "off-notch snaps down");
     }
 
     /// An empty table is on page one of one, not page one of zero.

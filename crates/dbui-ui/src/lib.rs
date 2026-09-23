@@ -91,6 +91,9 @@ pub fn run() {
         let editor_height_px = prefs.sql_editor_height_px;
         let sidebar_width_px = prefs.sidebar_width_px;
         let detail_width_px = prefs.detail_width_px;
+        let translucent = prefs.translucent;
+        let glass_opacity_pct = prefs.glass_opacity_pct;
+        let glass_blur = prefs.glass_blur;
         let last_session = last_session.clone();
 
         cx.open_window(options, |window, cx| {
@@ -105,6 +108,7 @@ pub fn run() {
                 view.apply_editor_height_px(editor_height_px);
                 view.apply_sidebar_width_px(sidebar_width_px);
                 view.apply_detail_width_px(detail_width_px);
+                view.apply_translucent(translucent, glass_opacity_pct, glass_blur);
                 view.load_saved_queries();
                 let reopen = view.restore_session(&last_session);
                 if let Some(message) = load_error {
