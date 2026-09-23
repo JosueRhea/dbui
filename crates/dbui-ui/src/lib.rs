@@ -163,6 +163,9 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
         KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
         KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
+        // ⌘. is the Mac's "stop" -- Terminal, Xcode and Finder copies all
+        // answer to it.
+        KeyBinding::new("cmd-.", StopQuery, Some("DbUi")),
         // ⌘W is handled in `DbUi::on_key` so it isn't stolen / double-fired.
         KeyBinding::new("cmd-shift-]", NextTab, Some("DbUi")),
         KeyBinding::new("cmd-shift-[", PrevTab, Some("DbUi")),
@@ -244,6 +247,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("New SQL Tab", OpenSql),
                 MenuItem::action("Run Query", RunQuery),
                 MenuItem::action("Run All Queries", RunAllQueries),
+                MenuItem::action("Stop Query", StopQuery),
                 MenuItem::action("Refresh", Refresh),
             ],
         },
@@ -270,6 +274,7 @@ gpui::actions!(
         Refresh,
         RunQuery,
         RunAllQueries,
+        StopQuery,
         CloseTab,
         NextTab,
         PrevTab,

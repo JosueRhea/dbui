@@ -229,8 +229,9 @@ fn tab_walks_the_fields_and_wraps(cx: &mut TestAppContext) {
         assert_eq!(config.name, "New PostgreSQL", "the name was left alone");
     });
 
-    // Port, User, Password, Database, then Cancel / Test / Save, then wrap to Name.
-    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab");
+    // Port, User, Password, Database, Timeout, then Cancel / Test / Save,
+    // then wrap to Name.
+    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("wrapped"));
 
@@ -249,14 +250,45 @@ fn shift_tab_walks_backwards(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
     cx.simulate_keystrokes("cmd-n");
 
-    // From Name: Save → Test → Cancel → Database.
-    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab");
+    // From Name: Save → Test → Cancel → Timeout → Database.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("shop"));
 
     view.update(cx, |view, _| {
         let config = view.modal.as_ref().unwrap().to_config();
         assert_eq!(config.database, "shop");
+    });
+}
+
+/// The timeout field is seconds; blank, or anything that is not a number, is
+/// no limit at all.
+#[gpui::test]
+fn the_query_timeout_is_typed_in_seconds(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(
+            config.query_timeout_secs, 0,
+            "a new connection waits for ever"
+        );
+    });
+
+    // From Name: Save → Test → Cancel → Timeout.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab");
+    cx.simulate_keystrokes(&typing("30"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(config.query_timeout_secs, 30);
+    });
+
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("soon"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(config.query_timeout_secs, 0, "not a number is no limit");
     });
 }
 
@@ -3124,6 +3156,49 @@ fn create_table_says_what_it_did_and_the_tree_catches_up(cx: &mut TestAppContext
             "and the quiet refresh did not overwrite the verdict: {}",
             describe(&view.status)
         );
+    });
+}
+
+/// ⌘. stops a runaway query: the tab stops waiting, the footer says it was
+/// cancelled rather than failed, and the connection answers the next query.
+#[gpui::test]
+fn stop_ends_a_runaway_query(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "stop-query");
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+             SELECT count(*) FROM (SELECT i FROM n LIMIT 5000000000)",
+            cx,
+        );
+        view.run_query(cx);
+        assert!(
+            view.active_run_is_stoppable(),
+            "a run in flight can be stopped"
+        );
+    });
+    // Long enough for the statement to be under way on the database.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    cx.simulate_keystrokes("cmd-.");
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+
+    view.update(cx, |view, _| {
+        assert!(!view.active_run_is_stoppable(), "nothing left to stop");
+        assert_eq!(describe(&view.status), "info: Cancelled");
+        assert!(
+            view.tabs.active().and_then(|tab| tab.error()).is_none(),
+            "a Stop the user asked for is not an error on the tab"
+        );
+    });
+
+    // The one SQLite connection is free for the next statement.
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT 7 AS seven", cx);
+        view.run_query(cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert_eq!(grid_rows(view), vec![vec!["7".to_string()]]);
     });
 }
 
@@ -7273,9 +7348,15 @@ fn a_restored_tab_behind_the_front_one_loads_when_switched_to(cx: &mut TestAppCo
     view.update(cx, |view, cx| view.activate_tab(1, cx));
     settle_rows(&view, cx);
     view.update(cx, |view, _| {
-        assert!(!grid_rows(view).is_empty(), "the tab brought forward loaded");
+        assert!(
+            !grid_rows(view).is_empty(),
+            "the tab brought forward loaded"
+        );
         assert_eq!(
-            view.tabs.active().and_then(|tab| tab.table_ref()).map(|t| t.name.clone()),
+            view.tabs
+                .active()
+                .and_then(|tab| tab.table_ref())
+                .map(|t| t.name.clone()),
             Some("teams".to_string())
         );
     });

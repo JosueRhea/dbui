@@ -6,7 +6,9 @@
 //! then hunting along the bottom of the window for "Structure" was two
 //! journeys for one thought.
 
-use super::icons::{columns_icon, funnel_icon, plus_icon, table_icon, view_icon, RefreshIcon};
+use super::icons::{
+    columns_icon, funnel_icon, plus_icon, stop_icon, table_icon, view_icon, RefreshIcon,
+};
 use super::text_field::{text_field, InputTarget};
 use super::{
     caption, icon_button, menu_row, menu_surface, motion, toolbar_button, toolbar_icon_color,
@@ -113,6 +115,7 @@ impl DbUi {
         };
 
         let page_size_focused = self.focus == Focus::PageSize && self.page_size_focus;
+        let stoppable = self.active_run_is_stoppable();
         let data_active = pane == TablePane::Data;
         let structure_active = pane == TablePane::Structure;
 
@@ -192,7 +195,13 @@ impl DbUi {
             )
             // Reloading is about the result, so it sits with the controls that
             // page through it rather than in the tab strip it used to.
-            .child(
+            //
+            // Stopping shares the slot: a run in flight is the one time a
+            // reload makes no sense, and stopping it is what is wanted.
+            .child(if stoppable {
+                icon_button("stop-query", stop_icon(theme.danger), theme, false)
+                    .on_click(cx.listener(|this, _, _window, cx| this.stop_query(cx)))
+            } else {
                 icon_button(
                     "refresh-result",
                     motion::spin(
@@ -203,8 +212,8 @@ impl DbUi {
                     theme,
                     false,
                 )
-                .on_click(cx.listener(|this, _, _window, cx| this.refresh_result(cx))),
-            )
+                .on_click(cx.listener(|this, _, _window, cx| this.refresh_result(cx)))
+            })
             .when(paging, |bar| {
                 let draft = page_size_draft.expect("table tab has page size draft");
                 bar.child(page_button(

@@ -19,6 +19,8 @@ pub enum Field {
     Username,
     Password,
     Database,
+    /// Seconds before a statement is stopped. Blank for no limit.
+    Timeout,
 }
 
 impl Field {
@@ -30,17 +32,19 @@ impl Field {
         if !driver.is_file_based() {
             return true;
         }
-        matches!(self, Field::Name | Field::Database)
+        // A runaway query is as much a thing on a local file as on a server.
+        matches!(self, Field::Name | Field::Database | Field::Timeout)
     }
 
     /// Tab order, which is also the order they are drawn in.
-    pub const ORDER: [Field; 6] = [
+    pub const ORDER: [Field; 7] = [
         Field::Name,
         Field::Host,
         Field::Port,
         Field::Username,
         Field::Password,
         Field::Database,
+        Field::Timeout,
     ];
 
     pub fn label(self) -> &'static str {
@@ -51,6 +55,15 @@ impl Field {
             Field::Username => "User",
             Field::Password => "Password",
             Field::Database => "Database",
+            Field::Timeout => "Timeout",
+        }
+    }
+
+    /// Shown faint in an empty field, for the one whose empty means something.
+    fn placeholder(self) -> Option<&'static str> {
+        match self {
+            Field::Timeout => Some("None · seconds"),
+            _ => None,
         }
     }
 
@@ -166,6 +179,9 @@ impl ConnectionForm {
         config.password = self.text(Field::Password).to_string();
         config.database = self.text(Field::Database).trim().to_string();
         config.read_only = self.config.read_only;
+        // Anything that is not a whole number of seconds is no limit, which
+        // is what an empty field says too.
+        config.query_timeout_secs = self.text(Field::Timeout).trim().parse().unwrap_or(0);
         config
     }
 
@@ -285,6 +301,11 @@ fn field_value(config: &ConnectionConfig, field: Field) -> String {
         Field::Username => config.username.clone(),
         Field::Password => config.password.clone(),
         Field::Database => config.database.clone(),
+        // Blank rather than "0": the placeholder says what no limit means.
+        Field::Timeout => match config.query_timeout_secs {
+            0 => String::new(),
+            seconds => seconds.to_string(),
+        },
     }
 }
 
@@ -734,6 +755,21 @@ fn render_field_text(input: &TextInput, field: Field, focused: bool, theme: &The
     let text = input.text();
     let selection = input.selection();
     let cursor = input.cursor();
+
+    if let Some(placeholder) = field.placeholder().filter(|_| text.is_empty()) {
+        let caret_color = if focused {
+            theme.accent
+        } else {
+            gpui::rgba(0x00000000)
+        };
+        return div()
+            .flex()
+            .items_center()
+            .w_full()
+            .child(text_input::caret_element(caret_color, px(16.)))
+            .child(div().text_color(theme.text_faint).child(placeholder))
+            .into_any_element();
+    }
 
     let mask = |part: &str| -> String {
         if field.is_secret() {

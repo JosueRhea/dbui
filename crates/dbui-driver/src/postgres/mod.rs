@@ -4,7 +4,7 @@ mod catalog;
 mod decode;
 
 use crate::error::{DriverError, Result};
-use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
+use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
@@ -337,11 +337,28 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_tracked(sql, &QueryToken::new()).await
+    }
+
+    async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
+        // On a connection of its own, held for the whole statement, so the
+        // session id recorded first is the session the statement runs on.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?;
+        let session: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?;
+        let _tracking = token.track(session as u64);
+
         let started = Instant::now();
 
         let outcome = if query::returns_rows(sql) {
             let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *conn)
                 .await
                 .map_err(|error| DriverError::query(sql, &error))?;
             // A hand-written query is shown as-is: the user asked for these
@@ -351,7 +368,7 @@ impl DatabaseDriver for PostgresDriver {
             QueryOutcome::Rows(set)
         } else {
             let done = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await
                 .map_err(|error| DriverError::query(sql, &error))?;
             QueryOutcome::Affected(done.rows_affected())
@@ -364,6 +381,18 @@ impl DatabaseDriver for PostgresDriver {
                 elapsed: started.elapsed(),
             },
         })
+    }
+
+    async fn cancel(&self, token: &QueryToken) -> Result<bool> {
+        let Some(session) = token.session() else {
+            return Ok(false);
+        };
+        sqlx::query("SELECT pg_cancel_backend($1)")
+            .bind(session as i32)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| DriverError::query("pg_cancel_backend", &error))?;
+        Ok(true)
     }
 
     async fn close(&self) {

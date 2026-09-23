@@ -512,3 +512,52 @@ async fn closing_is_idempotent() {
     db.close().await;
     assert!(db.ping().await.is_err());
 }
+
+// -- stopping a statement mid-run -----------------------------------------
+
+/// Counts to a number far past anything that finishes in a test's lifetime,
+/// in one step's worth of result: exactly the shape of query that dropping a
+/// future cannot stop, because the work is all inside one `sqlite3_step`.
+const RUNAWAY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+                       SELECT count(*) FROM (SELECT i FROM n LIMIT 5000000000)";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_statement_stops_and_frees_the_connection() {
+    let db = open("cancel").await;
+    let token = dbui_driver::QueryToken::new();
+
+    let started = std::time::Instant::now();
+    let run = db.execute_tracked(RUNAWAY, &token);
+    let stop = async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.cancel(&token).await
+    };
+    let (result, told) = tokio::join!(run, stop);
+
+    assert!(told.expect("cancel"), "a running statement was told");
+    assert!(
+        result.is_err(),
+        "the statement ended with an error, not rows"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "and ended promptly, not when the count ran out: {:?}",
+        started.elapsed()
+    );
+
+    // The one connection is free again, and the stale handler left on it
+    // does not stop the next statement.
+    let after = db.execute("SELECT 1").await.expect("the next query runs");
+    assert!(matches!(after.outcome, QueryOutcome::Rows(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_finished_statement_is_a_no_op() {
+    let db = open("cancel-late").await;
+    let token = dbui_driver::QueryToken::new();
+    db.execute_tracked("SELECT 1", &token).await.expect("runs");
+    assert!(!db.cancel(&token).await.expect("cancel"));
+    db.execute("SELECT 2")
+        .await
+        .expect("and nothing after it is stopped");
+}

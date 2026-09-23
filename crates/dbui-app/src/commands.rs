@@ -10,8 +10,10 @@ use dbui_domain::{
     Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, SortKey,
     TableKind, TableRef, Value,
 };
-use dbui_driver::{DatabaseDriver, DriverError, RowBatch, RowUpdate};
+use dbui_driver::{DatabaseDriver, DriverError, QueryToken, RowBatch, RowUpdate};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
 
 pub type Outcome<T> = Result<T, DriverError>;
 
@@ -157,13 +159,88 @@ pub fn drop_relation(
     runtime.spawn(async move { driver.execute(&sql).await })
 }
 
+/// How a run in progress can be ended early: by the user, or by the clock.
+///
+/// Made alongside the [`StopHandle`] the UI keeps, and handed to the run.
+pub struct Stop {
+    signal: watch::Receiver<bool>,
+    /// The connection's query timeout, per statement. `None` waits for ever.
+    timeout: Option<Duration>,
+}
+
+/// The UI's end of a [`Stop`]: pressing Stop is [`StopHandle::stop`].
+///
+/// Dropping it stops nothing -- a tab closed mid-run lets the run finish --
+/// so it is safe to let go of without a second thought.
+pub struct StopHandle(watch::Sender<bool>);
+
+impl StopHandle {
+    pub fn stop(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+/// A fresh stop signal for one run.
+pub fn stop_signal(timeout: Option<Duration>) -> (StopHandle, Stop) {
+    let (sender, signal) = watch::channel(false);
+    (StopHandle(sender), Stop { signal, timeout })
+}
+
+/// How long a told-off statement gets to wind down on its own before it is
+/// dropped. A cancelled Postgres or MySQL statement ends with an error of its
+/// own a moment after being told; waiting for that hands the connection back
+/// to the pool clean instead of mid-conversation.
+const WIND_DOWN: Duration = Duration::from_secs(3);
+
+/// Run one statement, ending it early if `stop` fires or its timeout runs
+/// out -- on the server as well as here.
+async fn run_stoppable(
+    driver: &dyn DatabaseDriver,
+    sql: &str,
+    stop: &mut Stop,
+) -> Outcome<QueryResult> {
+    let token = QueryToken::new();
+    let run = driver.execute_tracked(sql, &token);
+    tokio::pin!(run);
+
+    let pressed = async {
+        // A dropped handle is not a press: the run goes on to its end.
+        if stop.signal.wait_for(|stopped| *stopped).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let expired = async {
+        match stop.timeout {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+
+    let why = tokio::select! {
+        result = &mut run => return result,
+        _ = pressed => DriverError::Cancelled { statement: sql.to_string() },
+        _ = expired => DriverError::TimedOut {
+            statement: sql.to_string(),
+            seconds: stop.timeout.map(|limit| limit.as_secs()).unwrap_or_default(),
+        },
+    };
+
+    // Told on the server, it ends by itself; wait for that. Not told --
+    // SQLite, or the telling failed -- dropping `run` is what stops it.
+    if matches!(driver.cancel(&token).await, Ok(true)) {
+        let _ = tokio::time::timeout(WIND_DOWN, &mut run).await;
+    }
+    Err(why)
+}
+
 /// Run the statement in the editor.
 pub fn run_query(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
     sql: String,
+    mut stop: Stop,
 ) -> Task<Outcome<QueryResult>> {
-    runtime.spawn(async move { driver.execute(&sql).await })
+    runtime.spawn(async move { run_stoppable(driver.as_ref(), &sql, &mut stop).await })
 }
 
 /// Load columns for one table (SQL autocomplete cache).
@@ -189,6 +266,7 @@ pub fn run_queries(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
     statements: Vec<String>,
+    mut stop: Stop,
 ) -> Task<Outcome<BatchQueryResult>> {
     runtime.spawn(async move {
         let attempted = statements.len();
@@ -198,7 +276,9 @@ pub fn run_queries(
         let mut failure = None;
 
         for sql in statements {
-            match driver.execute(&sql).await {
+            // Each statement gets the whole timeout, and a Stop ends the
+            // batch where it is: what already ran stays in the results.
+            match run_stoppable(driver.as_ref(), &sql, &mut stop).await {
                 Ok(result) => {
                     total_elapsed += result.stats.elapsed;
                     if matches!(result.outcome, QueryOutcome::Rows(_)) {
@@ -276,4 +356,84 @@ pub fn test_connection(runtime: &DbRuntime, config: ConnectionConfig) -> Task<Ou
 /// Close a pool without blocking the UI on it.
 pub fn disconnect(runtime: &DbRuntime, driver: Arc<dyn DatabaseDriver>) -> Task<()> {
     runtime.spawn(async move { driver.close().await })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbui_domain::{ConnectionConfig, Driver};
+
+    const RUNAWAY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+                           SELECT count(*) FROM (SELECT i FROM n LIMIT 5000000000)";
+
+    /// A SQLite file of its own, deleted on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    async fn sqlite(name: &str) -> (Scratch, Arc<dyn DatabaseDriver>) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("dbui-commands-{}-{name}.db", std::process::id()));
+        std::fs::File::create(&path).expect("create the database file");
+        let mut config = ConnectionConfig::new(Driver::Sqlite);
+        config.database = path.to_string_lossy().to_string();
+        let driver = dbui_driver::connect(&config).await.expect("connect");
+        (Scratch(path), driver)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_ends_a_run_as_cancelled() {
+        let (_file, driver) = sqlite("stop").await;
+        let (handle, mut stop) = stop_signal(None);
+
+        let started = std::time::Instant::now();
+        let run = run_stoppable(driver.as_ref(), RUNAWAY, &mut stop);
+        let press = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            handle.stop();
+        };
+        let (result, ()) = tokio::join!(run, press);
+
+        assert!(
+            matches!(result, Err(DriverError::Cancelled { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        driver
+            .execute("SELECT 1")
+            .await
+            .expect("the connection is free");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timeout_stops_a_run_by_itself() {
+        let (_file, driver) = sqlite("timeout").await;
+        let (_handle, mut stop) = stop_signal(Some(Duration::from_millis(300)));
+
+        let result = run_stoppable(driver.as_ref(), RUNAWAY, &mut stop).await;
+
+        assert!(
+            matches!(result, Err(DriverError::TimedOut { .. })),
+            "{result:?}"
+        );
+        driver
+            .execute("SELECT 1")
+            .await
+            .expect("the connection is free");
+    }
+
+    /// Letting go of the handle -- the tab closed mid-run -- is not a Stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_handle_lets_the_run_finish() {
+        let (_file, driver) = sqlite("dropped").await;
+        let (handle, mut stop) = stop_signal(None);
+        drop(handle);
+
+        let result = run_stoppable(driver.as_ref(), "SELECT 42", &mut stop).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
 }

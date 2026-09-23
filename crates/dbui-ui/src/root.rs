@@ -461,6 +461,14 @@ pub struct DbUi {
     pub(crate) column_move: Option<ColumnMove>,
     /// A tab being dragged along the strip, if one is.
     pub(crate) tab_drag: Option<TabDrag>,
+    /// Runs in flight that Stop can end, by the connection and tab that
+    /// started them -- tab ids restart per connection -- each with the id of
+    /// the run it belongs to.
+    pub(crate) running: HashMap<(Option<ConnectionId>, TabId), (u64, commands::StopHandle)>,
+    /// The id the next run gets. Only the run holding a handle may clear it:
+    /// one superseded on the same tab lands late and must leave the live
+    /// run's Stop alone.
+    pub(crate) next_run: u64,
     /// Where the pointer is while a tab or a column is in hand, for the copy
     /// of it drawn under the pointer. Window coordinates.
     pub(crate) drag_pointer: Option<gpui::Point<Pixels>>,
@@ -666,6 +674,8 @@ impl DbUi {
             column_drag: None,
             column_move: None,
             tab_drag: None,
+            running: HashMap::new(),
+            next_run: 0,
             drag_pointer: None,
             tab_indicator: None,
             context_menu: None,
@@ -2132,6 +2142,32 @@ impl DbUi {
         }
     }
 
+    /// Whether the front tab has a run that Stop would end.
+    pub(crate) fn active_run_is_stoppable(&self) -> bool {
+        self.tabs.active_id().is_some_and(|tab| {
+            self.running
+                .contains_key(&(self.workspace.active_id(), tab))
+        })
+    }
+
+    /// ⌘. -- end the front tab's run, on the server as well as here.
+    ///
+    /// The handle is taken rather than read, so a second press while the
+    /// server is still winding down is quiet instead of a second cancel.
+    pub(crate) fn stop_query(&mut self, cx: &mut Context<Self>) {
+        let connection = self.workspace.active_id();
+        let Some((_, handle)) = self
+            .tabs
+            .active_id()
+            .and_then(|tab| self.running.remove(&(connection, tab)))
+        else {
+            return;
+        };
+        handle.stop();
+        self.status = Status::busy("Cancelling…");
+        cx.notify();
+    }
+
     /// ⌘⇧↵ target: every statement in the selection, or the whole buffer.
     pub(crate) fn resolve_run_all_sql(&self) -> Option<Vec<String>> {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
@@ -2221,10 +2257,31 @@ impl DbUi {
         }
 
         let sent = statements.clone();
-        let task = commands::run_queries(&self.runtime, driver, statements);
+        let timeout = self
+            .workspace
+            .active()
+            .map(|entry| entry.config.query_timeout_secs)
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)));
+        let (stop_handle, stop) = commands::stop_signal(timeout);
+        // A second run on the same tab replaces the first's handle: that run
+        // is superseded -- its result will be dropped as stale -- and Stop
+        // now means the one the user is looking at.
+        let run = self.next_run;
+        self.next_run += 1;
+        let run_key = (self.workspace.active_id(), tab_id);
+        self.running.insert(run_key, (run, stop_handle));
+        let task = commands::run_queries(&self.runtime, driver, statements, stop);
         cx.spawn(async move |this, cx| {
             let landed = task.await;
             this.update(cx, |this, cx| {
+                if this
+                    .running
+                    .get(&run_key)
+                    .is_some_and(|(held, _)| *held == run)
+                {
+                    this.running.remove(&run_key);
+                }
                 let mut catalog_is_stale = false;
                 this.finish_tab_load(
                     tab_id,
@@ -2276,6 +2333,19 @@ impl DbUi {
 
         if !sql.is_empty() {
             self.record_history_failure(&sql);
+        }
+
+        // Asked for, so not an error: the tab keeps what it had, and the
+        // footer says where the run was when it stopped.
+        if matches!(error, dbui_app::DriverError::Cancelled { .. }) {
+            if is_active {
+                self.status = Status::info(if succeeded > 0 {
+                    format!("Cancelled after {succeeded} of {} statements", sent.len())
+                } else {
+                    "Cancelled".to_string()
+                });
+            }
+            return;
         }
 
         let failure = crate::tabs::StatementError {
@@ -5872,6 +5942,7 @@ impl Render for DbUi {
             .on_action(
                 cx.listener(|this, _: &crate::RunAllQueries, _window, cx| this.run_all_queries(cx)),
             )
+            .on_action(cx.listener(|this, _: &crate::StopQuery, _window, cx| this.stop_query(cx)))
             .on_action(
                 cx.listener(|this, _: &crate::CloseTab, _window, cx| this.close_active_tab(cx)),
             )

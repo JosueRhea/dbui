@@ -54,6 +54,7 @@ enum ActionId {
     OpenSql,
     RunQuery,
     RunAllQueries,
+    StopQuery,
     GoToTable,
     SearchTables,
     SelectAllRows,
@@ -218,6 +219,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::RunAllQueries,
         label: "Run All Queries",
         shortcut: Some("⌘⇧↵"),
+        section: "Query",
+    },
+    ActionDef {
+        id: ActionId::StopQuery,
+        label: "Stop Query",
+        shortcut: Some("⌘."),
         section: "Query",
     },
     ActionDef {
@@ -785,6 +792,7 @@ impl DbUi {
             ActionId::NextConnection | ActionId::PrevConnection => self.workspace.open_count() > 1,
             ActionId::RefreshResult => connected && (is_table || is_sql),
             ActionId::RunQuery | ActionId::RunAllQueries | ActionId::ClearSql => is_sql,
+            ActionId::StopQuery => self.active_run_is_stoppable(),
             ActionId::ToggleFilters
             | ActionId::ToggleColumns
             | ActionId::PagePrev
@@ -903,6 +911,7 @@ impl DbUi {
             ActionId::PrevTab => self.prev_tab(cx),
             ActionId::RunQuery => self.run_query(cx),
             ActionId::RunAllQueries => self.run_all_queries(cx),
+            ActionId::StopQuery => self.stop_query(cx),
             ActionId::GoToTable => self.open_palette(PaletteKind::GoToTable, cx),
             ActionId::SearchTables => self.focus_sidebar_search(cx),
             ActionId::SelectAllRows => self.select_all_rows(cx),

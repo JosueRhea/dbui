@@ -357,6 +357,18 @@ pub(crate) fn calendar_icon(color: Rgba) -> impl IntoElement {
         )
 }
 
+/// A filled square, the stop sign every media control agrees on.
+pub(crate) fn stop_icon(color: Rgba) -> impl IntoElement {
+    div()
+        .w(px(14.))
+        .h(px(14.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().w(px(9.)).h(px(9.)).rounded(px(2.)).bg(color))
+}
+
 /// Plus, for "add a row" and "new tab".
 pub(crate) fn plus_icon(color: Rgba) -> impl IntoElement {
     div()

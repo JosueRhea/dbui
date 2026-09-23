@@ -1191,3 +1191,36 @@ async fn non_finite_floats_decode_as_floats() {
     assert_eq!(row[0].to_text(), "NaN");
     assert_eq!(row[1].to_text(), "Infinity");
 }
+
+// A statement parked on the server -- the shape of a query stuck behind a
+// lock -- is stopped *on the server* by a cancel from another connection,
+// rather than left running after the app has stopped waiting for it.
+both_engines!(
+    a_cancel_stops_the_statement_on_the_server,
+    |fx: Fixture| async move {
+        let sleep = match fx.driver() {
+            Driver::Postgres => "SELECT pg_sleep(30)",
+            _ => "SELECT SLEEP(30)",
+        };
+        let token = dbui_driver::QueryToken::new();
+        let started = std::time::Instant::now();
+        let run = fx.execute_tracked(sleep, &token);
+        let stop = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            fx.cancel(&token).await
+        };
+        let (result, told) = tokio::join!(run, stop);
+
+        assert!(told.expect("cancel"), "the server was told");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the sleep ended long before its 30 s: {:?}",
+            started.elapsed()
+        );
+        // Postgres ends a cancelled statement with an error; MySQL's SLEEP()
+        // returns early with 1 instead. Either way it is over, and the pool is
+        // still good for the next one.
+        let _ = result;
+        fx.execute("SELECT 1").await.expect("the pool still works");
+    }
+);
