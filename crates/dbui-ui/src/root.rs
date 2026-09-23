@@ -894,6 +894,9 @@ impl DbUi {
         }
         self.persist_session();
         cx.notify();
+        // Launch loads only the front tab; the rest of a restored strip has
+        // no rows until it is brought forward -- which is now.
+        self.load_active_table_if_empty(cx);
     }
 
     /// Close a tab, asking first if it is holding staged changes.
@@ -944,6 +947,8 @@ impl DbUi {
         }
         self.persist_session();
         cx.notify();
+        // The tab now in front may be a restored one that has never loaded.
+        self.load_active_table_if_empty(cx);
     }
 
     /// The tabs a bulk close is aimed at, left to right.

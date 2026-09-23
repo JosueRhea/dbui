@@ -7246,6 +7246,54 @@ fn settle_column(view: &Entity<DbUi>, cx: &mut VisualTestContext, column: usize,
     });
 }
 
+/// Tabs as a relaunch leaves them: the same tables, and no rows in any.
+fn restore_two_tabs(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    let saved = view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+        view.tabs.to_saved().0
+    });
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.tabs = crate::tabs::Tabs::from_saved(&saved, 0);
+        cx.notify();
+    });
+}
+
+/// A restored tab that was not in front loads when it is brought there.
+///
+/// Launch only loads the front tab. Switching used to show the other one
+/// empty for good -- closing it and opening the table again was the only way
+/// to get its rows.
+#[gpui::test]
+fn a_restored_tab_behind_the_front_one_loads_when_switched_to(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "restored-switch");
+    restore_two_tabs(&view, cx);
+
+    view.update(cx, |view, cx| view.activate_tab(1, cx));
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert!(!grid_rows(view).is_empty(), "the tab brought forward loaded");
+        assert_eq!(
+            view.tabs.active().and_then(|tab| tab.table_ref()).map(|t| t.name.clone()),
+            Some("teams".to_string())
+        );
+    });
+}
+
+/// Same, when it comes to the front because the one before it was closed.
+#[gpui::test]
+fn a_restored_tab_loads_when_closing_the_front_one_reveals_it(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "restored-close");
+    restore_two_tabs(&view, cx);
+
+    view.update(cx, |view, cx| view.close_tab_now(0, cx));
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert!(!grid_rows(view).is_empty(), "the tab left in front loaded");
+    });
+}
+
 /// One session, connect to commit, against a real database.
 #[gpui::test]
 fn a_whole_session_from_connect_to_commit(cx: &mut TestAppContext) {
