@@ -3543,12 +3543,23 @@ impl DbUi {
     ///
     /// No `notify`: the window moves at the window-server level, and nothing
     /// this view draws has changed.
-    pub(crate) fn drag_titlebar(&mut self) {
+    ///
+    /// The move itself waits for the next turn of the main loop. Made here,
+    /// inside the mouse event, a move that carries the window onto a screen
+    /// of another scale has AppKit report the new scale on the spot -- while
+    /// gpui still holds the window for the event -- and gpui drops the report.
+    /// The drawable went to 2x, the layout stayed at 1x, and the whole app was
+    /// drawn at half size in the top-left corner of the window. `cx.defer` is
+    /// not late enough: it still runs inside the event.
+    pub(crate) fn drag_titlebar(&mut self, cx: &mut Context<Self>) {
         if !self.titlebar_drag {
             return;
         }
         #[cfg(target_os = "macos")]
-        crate::mac_window::drag_window();
+        cx.spawn(async move |_, _| crate::mac_window::drag_window())
+            .detach();
+        #[cfg(not(target_os = "macos"))]
+        let _ = cx;
     }
 
     pub(crate) fn end_titlebar_drag(&mut self) {
@@ -6624,7 +6635,7 @@ impl Render for DbUi {
                     || self.detail_drag.is_some(),
                 |root| {
                     root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                        this.drag_titlebar();
+                        this.drag_titlebar(cx);
                         // The carried copy follows every move, not just the
                         // ones that cross into a new slot.
                         let carrying = this.tab_drag.as_ref().is_some_and(|drag| drag.moved)
