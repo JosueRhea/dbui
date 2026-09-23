@@ -515,6 +515,72 @@ fn replace_all_is_one_undoable_edit(cx: &mut TestAppContext) {
     });
 }
 
+/// ⌘⇧S keeps the editor's SQL under a name; ⌘⇧O brings it back -- over
+/// whatever is in the editor, as one edit ⌘Z undoes -- and ⌘⌫ in the list
+/// forgets it.
+#[gpui::test]
+fn a_query_is_saved_by_name_and_opened_again(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    let name = format!("answer-{}", std::process::id());
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| set_sql_editor_text(view, "SELECT 42"));
+
+    cx.simulate_keystrokes("cmd-shift-s");
+    cx.simulate_keystrokes(&typing(&name));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert!(view.palette.is_none(), "saving closes the palette");
+        assert_eq!(view.saved_queries.queries[0].name, name);
+        assert_eq!(view.saved_queries.queries[0].sql, "SELECT 42");
+        let on_disk = dbui_app::saved::saved_queries_path()
+            .and_then(|path| dbui_app::saved::load(&path))
+            .expect("written");
+        assert!(
+            on_disk.queries.iter().any(|q| q.name == name),
+            "on disk too"
+        );
+    });
+
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "SELECT 1 -- scratch")
+    });
+    cx.simulate_keystrokes("cmd-shift-o");
+    cx.simulate_keystrokes(&typing(&name));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| assert_eq!(sql_editor_text(view), "SELECT 42"));
+    cx.simulate_keystrokes("cmd-z");
+    view.update(cx, |view, _| {
+        assert_eq!(
+            sql_editor_text(view),
+            "SELECT 1 -- scratch",
+            "the load undoes"
+        );
+    });
+
+    cx.simulate_keystrokes("cmd-shift-o");
+    cx.simulate_keystrokes(&typing(&name));
+    cx.simulate_keystrokes("cmd-backspace");
+    view.update(cx, |view, _| {
+        assert!(view.saved_queries.queries.iter().all(|q| q.name != name));
+    });
+}
+
+/// A saved-queries file that could not be read is never written over: it
+/// holds someone's kept work, and the empty list in its place would erase it.
+#[gpui::test]
+fn an_unreadable_saved_queries_file_is_not_overwritten(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, cx| {
+        set_sql_editor_text(view, "SELECT 1");
+        view.saved_queries_unreadable = Some("expected value at line 1".into());
+        view.save_query_as("kept", cx);
+        assert!(view.saved_queries.queries.is_empty(), "nothing was kept");
+        let said = describe(&view.status);
+        assert!(said.contains("Not saved"), "{said}");
+    });
+}
+
 #[gpui::test]
 fn run_resolves_selection_then_statement_under_caret(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);

@@ -487,6 +487,12 @@ pub struct DbUi {
     pub(crate) close_guard: Option<CloseGuard>,
     /// Every statement run, newest first. Loaded once at launch.
     pub(crate) history: dbui_app::History,
+    /// Queries kept under a name.
+    pub(crate) saved_queries: dbui_app::SavedQueries,
+    /// Why the saved-queries file could not be read, when it could not. Saving
+    /// is refused while this is set: the file on disk is someone's kept work,
+    /// and writing the empty list loaded in its place would erase it.
+    pub(crate) saved_queries_unreadable: Option<String>,
 
     /// Vertical scroll of the result grid, and horizontal scroll of the pane
     /// holding it.
@@ -702,6 +708,10 @@ impl DbUi {
             history: dbui_app::history::history_path()
                 .map(|path| dbui_app::history::load(&path))
                 .unwrap_or_default(),
+            // Read in `load_saved_queries`, at launch, not here: a view built
+            // by a test must not pick up the user's own saved queries.
+            saved_queries: Default::default(),
+            saved_queries_unreadable: None,
         }
     }
 
@@ -2016,13 +2026,89 @@ impl DbUi {
     /// user wants to look at before it goes anywhere, and some of them are the
     /// DELETE that made them open the history in the first place.
     pub(crate) fn put_sql_in_editor(&mut self, sql: &str, cx: &mut Context<Self>) {
+        self.load_sql_into_editor(sql, "Loaded from history — ⌘↵ to run", cx);
+    }
+
+    /// Put `sql` in the query tab's editor in place of what is there.
+    ///
+    /// As one edit, so ⌘Z brings back what it replaced: the tab has one
+    /// editor, and whatever was being written in it is not lost to a
+    /// mis-picked history row or saved query.
+    pub(crate) fn load_sql_into_editor(&mut self, sql: &str, said: &str, cx: &mut Context<Self>) {
         self.open_sql_tab(cx);
         if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
-            *editor = crate::text_input::TextInput::with_text(sql.to_string(), true);
+            let end = editor.text().len();
+            editor.replace_range(0..end, sql);
         }
         self.focus = Focus::Editor;
-        self.status = Status::info("Loaded from history — ⌘↵ to run");
+        self.status = Status::info(said.to_string());
         cx.notify();
+    }
+
+    /// ⌘⇧S on a query tab: name the editor's SQL to keep it.
+    pub(crate) fn open_save_query(&mut self, cx: &mut Context<Self>) {
+        let has_sql = matches!(
+            self.tabs.active(),
+            Some(WorkspaceTab::Sql { editor, .. }) if !editor.text().trim().is_empty()
+        );
+        if !has_sql {
+            self.status = Status::info("Write a query first — saving keeps the SQL tab's text");
+            cx.notify();
+            return;
+        }
+        self.open_palette(crate::components::palette::PaletteKind::SaveQuery, cx);
+    }
+
+    /// Keep the query tab's SQL under `name`.
+    pub(crate) fn save_query_as(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(problem) = &self.saved_queries_unreadable {
+            self.status = Status::error(format!(
+                "Not saved: the saved queries file could not be read ({problem})"
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+            return;
+        };
+        let sql = editor.text().trim().to_string();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        self.saved_queries.save(name, &sql, at);
+        self.status = match self.write_saved_queries() {
+            Ok(()) => Status::info(format!("Saved “{}” — ⌘⇧O to open it again", name.trim())),
+            Err(message) => Status::error(message),
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn delete_saved_query(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.saved_queries_unreadable.is_some() || !self.saved_queries.remove(name) {
+            return;
+        }
+        self.status = match self.write_saved_queries() {
+            Ok(()) => Status::info(format!("Deleted “{name}”")),
+            Err(message) => Status::error(message),
+        };
+        cx.notify();
+    }
+
+    fn write_saved_queries(&self) -> Result<(), String> {
+        dbui_app::saved::saved_queries_path()
+            .and_then(|path| dbui_app::saved::save(&path, &self.saved_queries))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Read the saved queries from disk. Called once at launch.
+    pub fn load_saved_queries(&mut self) {
+        let loaded =
+            dbui_app::saved::saved_queries_path().and_then(|path| dbui_app::saved::load(&path));
+        match loaded {
+            Ok(saved) => self.saved_queries = saved,
+            Err(error) => self.saved_queries_unreadable = Some(error.to_string()),
+        }
     }
 
     /// Drop a ready-made statement into the editor at the caret.
@@ -6027,6 +6113,12 @@ impl Render for DbUi {
                 cx.listener(|this, _: &crate::RunAllQueries, _window, cx| this.run_all_queries(cx)),
             )
             .on_action(cx.listener(|this, _: &crate::StopQuery, _window, cx| this.stop_query(cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::SaveQuery, _window, cx| this.open_save_query(cx)),
+            )
+            .on_action(cx.listener(|this, _: &crate::OpenSavedQuery, _window, cx| {
+                this.open_palette(crate::components::palette::PaletteKind::SavedQueries, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::CloseTab, _window, cx| this.close_active_tab(cx)),
             )

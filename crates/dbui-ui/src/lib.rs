@@ -105,6 +105,7 @@ pub fn run() {
                 view.apply_editor_height_px(editor_height_px);
                 view.apply_sidebar_width_px(sidebar_width_px);
                 view.apply_detail_width_px(detail_width_px);
+                view.load_saved_queries();
                 let reopen = view.restore_session(&last_session);
                 if let Some(message) = load_error {
                     view.report_startup_error(message);
@@ -167,6 +168,8 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         // ⌘. is the Mac's "stop" -- Terminal, Xcode and Finder copies all
         // answer to it.
         KeyBinding::new("cmd-.", StopQuery, Some("DbUi")),
+        KeyBinding::new("cmd-shift-s", SaveQuery, Some("DbUi")),
+        KeyBinding::new("cmd-shift-o", OpenSavedQuery, Some("DbUi")),
         // ⌘W is handled in `DbUi::on_key` so it isn't stolen / double-fired.
         KeyBinding::new("cmd-shift-]", NextTab, Some("DbUi")),
         KeyBinding::new("cmd-shift-[", PrevTab, Some("DbUi")),
@@ -255,6 +258,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Run Query", RunQuery),
                 MenuItem::action("Run All Queries", RunAllQueries),
                 MenuItem::action("Stop Query", StopQuery),
+                MenuItem::separator(),
+                MenuItem::action("Save Query…", SaveQuery),
+                MenuItem::action("Saved Queries…", OpenSavedQuery),
                 MenuItem::action("Refresh", Refresh),
             ],
         },
@@ -287,6 +293,8 @@ gpui::actions!(
         RunQuery,
         RunAllQueries,
         StopQuery,
+        SaveQuery,
+        OpenSavedQuery,
         CloseTab,
         NextTab,
         PrevTab,

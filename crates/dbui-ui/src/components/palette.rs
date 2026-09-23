@@ -19,6 +19,10 @@ pub enum PaletteKind {
     History,
     /// Ready-made statements to start from.
     Templates,
+    /// Naming the editor's SQL to keep: the query box is the name.
+    SaveQuery,
+    /// Queries kept under a name, to open again.
+    SavedQueries,
 }
 
 pub struct Palette {
@@ -55,6 +59,8 @@ enum ActionId {
     RunQuery,
     RunAllQueries,
     StopQuery,
+    SaveQuery,
+    OpenSavedQuery,
     GoToTable,
     SearchTables,
     SelectAllRows,
@@ -229,6 +235,18 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::StopQuery,
         label: "Stop Query",
         shortcut: Some("⌘."),
+        section: "Query",
+    },
+    ActionDef {
+        id: ActionId::SaveQuery,
+        label: "Save Query…",
+        shortcut: Some("⌘⇧S"),
+        section: "Query",
+    },
+    ActionDef {
+        id: ActionId::OpenSavedQuery,
+        label: "Saved Queries…",
+        shortcut: Some("⌘⇧O"),
         section: "Query",
     },
     ActionDef {
@@ -429,6 +447,16 @@ enum PaletteRow {
         about: &'static str,
         body: String,
     },
+    /// Keep the editor's SQL under `name`; `replaces` when that name is
+    /// already taken.
+    SaveAs {
+        name: String,
+        replaces: bool,
+    },
+    Saved {
+        name: String,
+        sql: String,
+    },
 }
 
 impl PaletteRow {
@@ -437,6 +465,11 @@ impl PaletteRow {
             PaletteRow::Table(_) => "Tables",
             PaletteRow::History { .. } => "History",
             PaletteRow::Template { .. } => "Templates",
+            PaletteRow::SaveAs {
+                replaces: false, ..
+            } => "Save As",
+            PaletteRow::SaveAs { replaces: true, .. } => "Replace",
+            PaletteRow::Saved { .. } => "Saved Queries",
             PaletteRow::Theme { .. } => "Themes",
             PaletteRow::Action { id, .. } => ACTIONS
                 .iter()
@@ -659,6 +692,19 @@ impl DbUi {
             cx.notify();
             return true;
         }
+        // ⌘⌫ forgets the saved query under the selection.
+        if kind == PaletteKind::SavedQueries && command && key == "backspace" {
+            let selected = self.palette.as_ref().map(|p| p.selected).unwrap_or(0);
+            if let Some(PaletteRow::Saved { name, .. }) = rows.get(selected) {
+                let name = name.clone();
+                self.delete_saved_query(&name, cx);
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.selected = palette.selected.min(len.saturating_sub(2));
+                }
+            }
+            cx.notify();
+            return true;
+        }
         if key == "enter" {
             if kind == PaletteKind::Themes {
                 let selected = self.palette.as_ref().map(|p| p.selected).unwrap_or(0);
@@ -700,6 +746,49 @@ impl DbUi {
             .unwrap_or_default();
 
         match kind {
+            PaletteKind::SaveQuery => {
+                // The name as typed, case and all -- it is what the list
+                // will show.
+                let typed = self
+                    .palette
+                    .as_ref()
+                    .map(|p| p.query.text().trim().to_string())
+                    .unwrap_or_default();
+                let mut rows = Vec::new();
+                let taken = self
+                    .saved_queries
+                    .queries
+                    .iter()
+                    .any(|saved| saved.name.eq_ignore_ascii_case(&typed));
+                if !typed.is_empty() && !taken {
+                    rows.push(PaletteRow::SaveAs {
+                        name: typed.clone(),
+                        replaces: false,
+                    });
+                }
+                // Existing names that match are offered too: saving over one
+                // on purpose is how a kept query is updated.
+                rows.extend(
+                    self.saved_queries
+                        .queries
+                        .iter()
+                        .filter(|saved| saved.name.to_lowercase().contains(&query))
+                        .map(|saved| PaletteRow::SaveAs {
+                            name: saved.name.clone(),
+                            replaces: true,
+                        }),
+                );
+                rows
+            }
+            PaletteKind::SavedQueries => self
+                .saved_queries
+                .search(&query)
+                .into_iter()
+                .map(|saved| PaletteRow::Saved {
+                    name: saved.name.clone(),
+                    sql: saved.sql.clone(),
+                })
+                .collect(),
             PaletteKind::GoToTable => {
                 let Some(entry) = self.workspace.active() else {
                     return Vec::new();
@@ -827,6 +916,8 @@ impl DbUi {
             ActionId::RefreshResult => connected && (is_table || is_sql),
             ActionId::RunQuery | ActionId::RunAllQueries | ActionId::ClearSql => is_sql,
             ActionId::StopQuery => self.active_run_is_stoppable(),
+            ActionId::SaveQuery => is_sql,
+            ActionId::OpenSavedQuery => true,
             ActionId::ToggleFilters
             | ActionId::ToggleColumns
             | ActionId::PagePrev
@@ -911,6 +1002,16 @@ impl DbUi {
                 self.close_palette(cx);
                 self.insert_sql_template(name, &body, cx);
             }
+            PaletteRow::SaveAs { name, .. } => {
+                let name = name.clone();
+                self.close_palette(cx);
+                self.save_query_as(&name, cx);
+            }
+            PaletteRow::Saved { name, sql } => {
+                let (name, sql) = (name.clone(), sql.clone());
+                self.close_palette(cx);
+                self.load_sql_into_editor(&sql, &format!("Opened “{name}” — ⌘↵ to run"), cx);
+            }
         }
     }
 
@@ -953,6 +1054,8 @@ impl DbUi {
             ActionId::RunQuery => self.run_query(cx),
             ActionId::RunAllQueries => self.run_all_queries(cx),
             ActionId::StopQuery => self.stop_query(cx),
+            ActionId::SaveQuery => self.open_save_query(cx),
+            ActionId::OpenSavedQuery => self.open_palette(PaletteKind::SavedQueries, cx),
             ActionId::GoToTable => self.open_palette(PaletteKind::GoToTable, cx),
             ActionId::SearchTables => self.focus_sidebar_search(cx),
             ActionId::SelectAllRows => self.select_all_rows(cx),
@@ -1015,6 +1118,8 @@ impl DbUi {
             PaletteKind::Themes => "Search themes…",
             PaletteKind::History => "Search history…",
             PaletteKind::Templates => "Search templates…",
+            PaletteKind::SaveQuery => "Name this query…",
+            PaletteKind::SavedQueries => "Search saved queries…",
         };
 
         let rows = self.palette_rows(kind);
@@ -1037,6 +1142,14 @@ impl DbUi {
                 PaletteKind::Actions => "No matching actions",
                 PaletteKind::History => "Nothing run yet",
                 PaletteKind::Templates => "No template matches",
+                PaletteKind::SaveQuery => "Type a name to save the editor's SQL under",
+                PaletteKind::SavedQueries => {
+                    if self.saved_queries.queries.is_empty() {
+                        "Nothing saved yet — ⌘⇧S in a query tab"
+                    } else {
+                        "No saved query matches"
+                    }
+                }
                 PaletteKind::Themes => "No matching themes",
             };
             vec![div()
@@ -1124,6 +1237,43 @@ impl DbUi {
                             cx.listener(move |this, _, _, cx| {
                                 this.close_palette(cx);
                                 this.put_sql_in_editor(&target, cx);
+                            }),
+                        )
+                    }
+                    PaletteRow::SaveAs { name, replaces } => {
+                        let target = name.clone();
+                        palette_row(
+                            index,
+                            is_sel,
+                            true,
+                            command_mark(theme.accent).into_any_element(),
+                            SharedString::from(name.clone()),
+                            Some(if *replaces { "replace" } else { "save" }),
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                this.close_palette(cx);
+                                this.save_query_as(&target, cx);
+                            }),
+                        )
+                    }
+                    PaletteRow::Saved { name, sql } => {
+                        let target = (name.clone(), sql.clone());
+                        palette_row(
+                            index,
+                            is_sel,
+                            true,
+                            command_mark(theme.text_muted).into_any_element(),
+                            SharedString::from(format!("{name}  ·  {}", one_line(sql))),
+                            None,
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                let (name, sql) = target.clone();
+                                this.close_palette(cx);
+                                this.load_sql_into_editor(
+                                    &sql,
+                                    &format!("Opened “{name}” — ⌘↵ to run"),
+                                    cx,
+                                );
                             }),
                         )
                     }
