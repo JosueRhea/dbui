@@ -278,10 +278,14 @@ dmg:
 	    echo "        hdiutil busy, retrying ($$attempt/5)"; sleep 3; \
 	done
 	@rm -rf $(BUILD)/dmgroot $(BUILD)/hdiutil.err
-	@# Sign the image too, so a tampered download fails `codesign --verify`.
-	@if [ -n "$(CODESIGN_ID)" ]; then \
-	    codesign --force --sign "$(CODESIGN_ID)" $(DMG); \
-	fi
+	@# The image is left unsigned on purpose; the app inside it is signed.
+	@# Gatekeeper assesses a *signed* disk image when it is opened, and one
+	@# signed by our self-signed, un-notarized certificate is rejected there --
+	@# the download will not even mount, so nobody reaches the Applications
+	@# shortcut. An unsigned image mounts, and Gatekeeper asks about the app on
+	@# its first launch instead, where Open Anyway lets it through. Tampering
+	@# is still caught: SHA256SUMS covers the image, and the updater verifies
+	@# the app's own signature before swapping anything in.
 	@echo "  ->    $(DMG)"
 
 # Zip whatever dbui.app is sitting in build/, without touching it. `ditto`
@@ -347,9 +351,23 @@ verify:
 	@codesign --verify --deep --strict --verbose=2 $(APP) 2>&1 | sed 's/^/        /'
 	@codesign -d -r- $(APP) 2>&1 | sed -n 's/^.*designated => /        requirement: /p'
 	@lipo -archs $(APP_BIN)/dbui | sed 's/^/        archs: /'
+	@# The image itself must stay unsigned (see `dmg`); what a user runs is
+	@# the app inside it, so that is what gets checked -- mounted read-only,
+	@# against the same requirement `publish` and the updater hold it to.
 	@if [ -f $(DMG) ]; then \
 	    echo "  VERIFY $(DMG)"; \
-	    codesign --verify --verbose=2 $(DMG) 2>&1 | sed 's/^/        /'; \
+	    if codesign -d $(DMG) >/dev/null 2>&1; then \
+	        echo "ERROR: $(DMG) is signed -- Gatekeeper will refuse to mount it"; exit 1; \
+	    fi; \
+	    echo "        image unsigned (mounts without a Gatekeeper prompt)"; \
+	    mnt=$$(mktemp -d) && \
+	    hdiutil attach -nobrowse -readonly -mountpoint "$$mnt" $(DMG) >/dev/null && \
+	    codesign --verify --deep --strict -R='$(RELEASE_REQ)' "$$mnt/dbui.app"; ok=$$?; \
+	    hdiutil detach -quiet "$$mnt"; rmdir "$$mnt"; \
+	    if [ $$ok -ne 0 ]; then \
+	        echo "ERROR: the app inside $(DMG) is not signed with '$(SIGN_CERT_NAME)'"; exit 1; \
+	    fi; \
+	    echo "        dbui.app inside: signed with $(SIGN_CERT_NAME)"; \
 	fi
 
 clean:

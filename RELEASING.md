@@ -105,7 +105,10 @@ signature the hardened runtime rejects, or a broken universal slice all look
 fine until something opens the thing Apple hands a user.
 
 Builds both slices, `lipo`s them together, bundles, signs the app, builds and
-signs the `.dmg`, and writes the `.zip` and `SHA256SUMS`.
+packs the `.dmg`, and writes the `.zip` and `SHA256SUMS`. The `.dmg` itself
+is deliberately left unsigned: Gatekeeper refuses to mount a disk image signed
+with a certificate Apple has not notarized, so a signed one would never open.
+The app inside it is signed, and `make verify` checks that.
 
 It finishes with `make verify`:
 
