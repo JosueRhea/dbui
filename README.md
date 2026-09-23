@@ -3,7 +3,7 @@
 A database editor for PostgreSQL, MySQL and SQLite — TablePlus-shaped, written in Rust,
 drawn with [GPUI](https://www.gpui.rs).
 
-![dbui demo: browsing a PostgreSQL database — the schema tree, a typed grid, tabs and the row detail panel](docs/demo.mp4)
+https://github.com/user-attachments/assets/df3a2d83-a163-4874-8ac8-a65f4bc450c8
 
 This is a **starter**: the architecture is complete and the whole path works
 end to end — connect, browse the tree, click a table, page through its rows,
