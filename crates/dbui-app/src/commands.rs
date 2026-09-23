@@ -7,8 +7,8 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ColumnInfo, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet,
-    SortKey, TableKind, TableRef, Value,
+    Catalog, Column, ColumnInfo, ConnectionConfig, Index, Page, QueryOutcome, QueryResult,
+    ResultSet, SortKey, TableKind, TableRef, Value,
 };
 use dbui_driver::{DatabaseDriver, DriverError, QueryToken, RowBatch, RowUpdate};
 use std::sync::Arc;
@@ -316,6 +316,35 @@ pub fn run_query(
     mut stop: Stop,
 ) -> Task<Outcome<QueryResult>> {
     runtime.spawn(async move { run_stoppable(driver.as_ref(), &sql, &mut stop).await })
+}
+
+/// One table's indexes, for the structure pane.
+pub fn fetch_indexes(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+) -> Task<Outcome<Vec<Index>>> {
+    runtime.spawn(async move { driver.indexes(&table).await })
+}
+
+/// Run the statements a structure change is made of, in order, stopping at
+/// the first that fails. Resolves to how many ran.
+///
+/// Not in a transaction: MySQL commits DDL implicitly, so wrapping it would
+/// promise an all-or-nothing that one of the three engines cannot keep. A
+/// change is usually one statement anyway; when it is several, the error
+/// says which one stopped it.
+pub fn run_ddl(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    statements: Vec<String>,
+) -> Task<Outcome<usize>> {
+    runtime.spawn(async move {
+        for sql in &statements {
+            driver.execute(sql).await?;
+        }
+        Ok(statements.len())
+    })
 }
 
 /// Load columns for one table (SQL autocomplete cache).

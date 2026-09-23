@@ -54,6 +54,19 @@ pub const FOREIGN_KEYS: &str = "
            ) single ON single.id = f.id
 ";
 
+/// One table's indexes, one row per indexed column, in index order.
+/// `origin` is `pk` for the primary key's own index, `u` for a UNIQUE
+/// constraint's, `c` for one made by CREATE INDEX.
+pub const INDEXES: &str = "
+    SELECT l.name        AS index_name,
+           l.\"unique\"   AS is_unique,
+           l.origin      AS origin,
+           i.name        AS column_name
+      FROM pragma_index_list(?) l
+      JOIN pragma_index_info(l.name) i
+     ORDER BY l.name, i.seqno
+";
+
 pub const SERVER_VERSION: &str = "SELECT sqlite_version()";
 
 /// `sqlite_master.type` -> the domain's [`TableKind`].

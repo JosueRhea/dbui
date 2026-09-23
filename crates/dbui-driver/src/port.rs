@@ -7,7 +7,7 @@
 use crate::error::Result;
 use async_trait::async_trait;
 use dbui_domain::{
-    Catalog, Column, Driver, Page, QueryResult, ResultSet, SortKey, TableRef, Value,
+    Catalog, Column, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef, Value,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,12 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// The columns of one table, in declaration order.
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>>;
+
+    /// One table's indexes, by name, each with its columns in index order.
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {
+        let _ = table;
+        Ok(Vec::new())
+    }
 
     /// One page of a table's rows.
     ///
@@ -233,4 +239,29 @@ impl RowBatch {
     pub fn len(&self) -> usize {
         self.inserts.len() + self.updates.len() + self.deletes.len()
     }
+}
+
+/// Fold one-row-per-column index listings into [`Index`]es, keeping the
+/// order the rows came in -- by index, then by position in it.
+pub(crate) fn group_indexes(rows: Vec<(String, bool, bool, Option<String>)>) -> Vec<Index> {
+    let mut indexes: Vec<Index> = Vec::new();
+    for (name, unique, primary, column) in rows {
+        let index = match indexes.iter_mut().position(|index| index.name == name) {
+            Some(at) => &mut indexes[at],
+            None => {
+                indexes.push(Index {
+                    name,
+                    columns: Vec::new(),
+                    unique,
+                    primary,
+                });
+                indexes.last_mut().expect("just pushed")
+            }
+        };
+        // An expression index has no column to name for that part.
+        if let Some(column) = column {
+            index.columns.push(column);
+        }
+    }
+    indexes
 }

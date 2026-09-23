@@ -255,6 +255,7 @@ fn menus() -> Vec<Menu> {
             name: "Query".into(),
             items: vec![
                 MenuItem::action("New SQL Tab", OpenSql),
+                MenuItem::action("New Table…", NewTable),
                 MenuItem::action("Run Query", RunQuery),
                 MenuItem::action("Run All Queries", RunAllQueries),
                 MenuItem::action("Stop Query", StopQuery),
@@ -295,6 +296,7 @@ gpui::actions!(
         StopQuery,
         SaveQuery,
         OpenSavedQuery,
+        NewTable,
         CloseTab,
         NextTab,
         PrevTab,

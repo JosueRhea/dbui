@@ -3484,6 +3484,270 @@ fn a_csv_imports_as_staged_rows_that_commit(cx: &mut TestAppContext) {
     );
 }
 
+/// Open `members` on its structure pane, with its indexes read.
+fn open_members_structure(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(view, cx);
+    view.update(cx, |view, cx| {
+        view.set_table_pane(crate::tabs::TablePane::Structure, cx);
+    });
+    settle(view, cx, |view| {
+        matches!(
+            view.tabs.active(),
+            Some(WorkspaceTab::Table {
+                indexes: Some(_),
+                ..
+            })
+        )
+    });
+}
+
+/// Wait for the structure sheet to finish, and fail if it did not close.
+fn settle_sheet(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    settle(view, cx, |view| view.schema_sheet.is_none());
+    view.update(cx, |view, _| {
+        assert!(
+            view.schema_sheet.is_none(),
+            "the sheet ran and closed: {:?}",
+            view.schema_sheet
+                .as_ref()
+                .and_then(|sheet| sheet.error.clone())
+        );
+    });
+}
+
+/// + Column: typed into the sheet, previewed, run -- and on disk.
+#[gpui::test]
+fn a_column_is_added_from_the_structure_pane(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "add-column");
+    let path = db.path.clone();
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| view.add_column_sheet(cx));
+    cx.simulate_keystrokes(&typing("joined"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("TEXT"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("'2024'"));
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_ref().expect("open");
+        assert_eq!(
+            sheet.statements(Driver::Sqlite).unwrap(),
+            [r#"ALTER TABLE "main"."members" ADD COLUMN "joined" TEXT DEFAULT '2024'"#],
+            "the preview is what will run"
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+
+    assert_eq!(
+        read_back(&path, "SELECT joined FROM members ORDER BY id"),
+        vec![vec!["2024".to_string()], vec!["2024".to_string()]]
+    );
+    settle(&view, cx, |view| {
+        view.tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .is_some_and(|result| result.structure.iter().any(|c| c.name == "joined"))
+    });
+    view.update(cx, |view, _| {
+        let result = view.tabs.active().and_then(|tab| tab.result()).unwrap();
+        assert!(
+            result.structure.iter().any(|c| c.name == "joined"),
+            "the pane caught up"
+        );
+    });
+}
+
+/// + Index: columns picked in order, listed back after it runs.
+#[gpui::test]
+fn an_index_is_added_and_listed(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "add-index");
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| view.add_index_sheet(cx));
+    cx.simulate_keystrokes(&typing("by_team"));
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_mut().unwrap();
+        sheet.picked = vec!["team_slug".into(), "name".into()];
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+    settle(&view, cx, |view| {
+        matches!(view.tabs.active(), Some(WorkspaceTab::Table { indexes: Some(found), .. })
+            if found.iter().any(|index| index.name == "by_team"))
+    });
+    view.update(cx, |view, _| {
+        let Some(WorkspaceTab::Table {
+            indexes: Some(found),
+            ..
+        }) = view.tabs.active()
+        else {
+            panic!("indexes read");
+        };
+        let made = found
+            .iter()
+            .find(|index| index.name == "by_team")
+            .expect("listed");
+        assert_eq!(made.columns, ["team_slug", "name"]);
+    });
+}
+
+/// SQLite cannot retype a column in place: the sheet says so where the SQL
+/// would be, and Run does nothing.
+#[gpui::test]
+fn sqlite_retyping_is_refused_before_it_runs(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "retype");
+    let path = db.path.clone();
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| {
+        let name = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|result| result.structure.iter().find(|c| c.name == "name").cloned())
+            .unwrap();
+        view.edit_column_sheet(name, cx);
+    });
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("BLOB"));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_ref().expect("still open");
+        let refused = sheet.statements(Driver::Sqlite).unwrap_err();
+        assert!(refused.contains("SQLite cannot"), "{refused}");
+        assert!(sheet
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("SQLite cannot")));
+    });
+    assert_eq!(
+        read_back(
+            &path,
+            "SELECT type FROM pragma_table_info('members') WHERE name = 'name'"
+        ),
+        vec![vec!["TEXT".to_string()]],
+        "nothing ran"
+    );
+}
+
+/// New Table…: a name, a keyed column and another, and it opens on its
+/// structure once made.
+#[gpui::test]
+fn a_table_is_created_from_the_sheet(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "create-table-sheet");
+    let path = db.path.clone();
+
+    view.update(cx, |view, cx| {
+        view.create_table_sheet(Some("main".into()), cx)
+    });
+    cx.simulate_keystrokes(&typing("tags"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("id"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("INTEGER"));
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_mut().unwrap();
+        sheet.new_columns[0].key = true;
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+
+    assert_eq!(
+        read_back(&path, "SELECT name, pk FROM pragma_table_info('tags')"),
+        vec![vec!["id".to_string(), "1".to_string()]]
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs
+                .active()
+                .and_then(|tab| tab.table_ref())
+                .map(|t| t.name.clone()),
+            Some("tags".to_string()),
+            "the new table is in front"
+        );
+    });
+}
+
+/// Drop is a sheet too: the statement is shown before it runs.
+#[gpui::test]
+fn a_column_is_dropped_after_its_statement_is_shown(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "drop-column");
+    let path = db.path.clone();
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.drop_column_sheet("team_slug".into(), cx)
+    });
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_ref().unwrap();
+        assert_eq!(
+            sheet.statements(Driver::Sqlite).unwrap(),
+            [r#"ALTER TABLE "main"."members" DROP COLUMN "team_slug""#]
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+    assert!(
+        read_back(&path, "SELECT name FROM pragma_table_info('members')")
+            .iter()
+            .all(|row| row[0] != "team_slug")
+    );
+}
+
+/// A read-only connection does not open the sheet at all.
+#[gpui::test]
+fn a_read_only_connection_will_not_change_a_table(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "ddl-read-only");
+    open_members_structure(&view, cx);
+    view.update(cx, |view, cx| {
+        let id = view.workspace.active_id().unwrap();
+        view.workspace.get_mut(id).unwrap().config.read_only = true;
+        view.add_column_sheet(cx);
+        assert!(view.schema_sheet.is_none(), "refused before it opened");
+    });
+}
+
+/// The structure pane and every kind of structure sheet paint, at every
+/// window size.
+#[gpui::test]
+fn the_structure_pane_and_its_sheets_draw(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "structure-draw");
+    open_members_structure(&view, cx);
+    draw_at_every_size(&view, cx);
+
+    let name = view.update(cx, |view, _| {
+        view.tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|result| result.structure.first().cloned())
+            .unwrap()
+    });
+    type Opener = Box<dyn Fn(&mut DbUi, &mut gpui::Context<DbUi>)>;
+    let openers: Vec<Opener> = vec![
+        Box::new(|view, cx| view.add_column_sheet(cx)),
+        Box::new(move |view, cx| view.edit_column_sheet(name.clone(), cx)),
+        Box::new(|view, cx| view.drop_column_sheet("name".into(), cx)),
+        Box::new(|view, cx| view.add_index_sheet(cx)),
+        Box::new(|view, cx| view.drop_index_sheet("by_name".into(), cx)),
+        Box::new(|view, cx| view.create_table_sheet(None, cx)),
+    ];
+    for open_sheet in openers {
+        view.update(cx, |view, cx| open_sheet(view, cx));
+        view.update(cx, |view, _| assert!(view.schema_sheet.is_some()));
+        draw_at_every_size(&view, cx);
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |view, _| {
+            assert!(view.schema_sheet.is_none(), "Esc closes it")
+        });
+    }
+}
+
 /// A statement the engine refuses lands on the tab, not only in the footer.
 #[gpui::test]
 fn a_failing_statement_leaves_its_error_on_the_tab(cx: &mut TestAppContext) {

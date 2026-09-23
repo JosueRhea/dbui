@@ -42,7 +42,17 @@ pub const COLUMNS: &str = "
     SELECT COLUMN_NAME      AS column_name,
            COLUMN_TYPE      AS data_type,
            IS_NULLABLE      AS is_nullable,
-           COLUMN_DEFAULT   AS column_default,
+           -- As SQL, not as the bare text MySQL stores: a string default
+           -- `'abc'` comes back as `abc`, which restated in a CREATE or an
+           -- ALTER is a column name, not a string. Literals are quoted back;
+           -- an expression default -- `CURRENT_TIMESTAMP`, or anything 8.0
+           -- marks DEFAULT_GENERATED -- is already SQL and left alone.
+           CASE
+             WHEN COLUMN_DEFAULT IS NULL THEN NULL
+             WHEN EXTRA LIKE '%DEFAULT_GENERATED%' THEN COLUMN_DEFAULT
+             WHEN UPPER(COLUMN_DEFAULT) LIKE 'CURRENT\\_TIMESTAMP%' THEN COLUMN_DEFAULT
+             ELSE QUOTE(COLUMN_DEFAULT)
+           END              AS column_default,
            COLUMN_KEY       AS column_key,
            ORDINAL_POSITION AS ordinal
       FROM information_schema.COLUMNS
@@ -92,3 +102,15 @@ pub fn table_kind(table_type: &str) -> dbui_domain::TableKind {
         TableKind::Table
     }
 }
+
+/// One table's indexes, one row per indexed column, in index order.
+/// `COLUMN_NAME` is NULL for an expression part of a functional index.
+pub const INDEXES: &str = "
+    SELECT INDEX_NAME                   AS index_name,
+           CAST(NON_UNIQUE AS SIGNED)   AS non_unique,
+           COLUMN_NAME                  AS column_name
+      FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = ?
+       AND TABLE_NAME = ?
+     ORDER BY INDEX_NAME, SEQ_IN_INDEX
+";

@@ -561,3 +561,74 @@ async fn cancelling_a_finished_statement_is_a_no_op() {
         .await
         .expect("and nothing after it is stopped");
 }
+
+/// The structure editor's statements on SQLite: what it can do in place --
+/// add, rename, drop, index -- runs; what it cannot is refused before it runs.
+#[tokio::test]
+async fn the_structure_editor_statements_run_on_sqlite() {
+    use dbui_domain::ddl::{self, ColumnSpec};
+    let db = open("structure-editor").await;
+    let people = TableRef::new("main", "people");
+    let run = |statements: Vec<String>| async {
+        for sql in statements {
+            db.execute(&sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql}\n{error}"));
+        }
+    };
+
+    let motto = ColumnSpec {
+        name: "motto".into(),
+        data_type: "TEXT".into(),
+        nullable: true,
+        default: Some("'hi'".into()),
+    };
+    run(ddl::add_column(Driver::Sqlite, &people, &motto).unwrap()).await;
+    let columns = db.columns(&people).await.unwrap();
+    let added = columns.iter().find(|c| c.name == "motto").expect("added");
+    assert_eq!(added.default.as_deref(), Some("'hi'"));
+
+    let mut renamed = ColumnSpec::of(added);
+    renamed.name = "slogan".into();
+    run(ddl::alter_column(Driver::Sqlite, &people, added, &renamed).unwrap()).await;
+    let columns = db.columns(&people).await.unwrap();
+    let slogan = columns
+        .iter()
+        .find(|c| c.name == "slogan")
+        .expect("renamed");
+
+    let mut retyped = ColumnSpec::of(slogan);
+    retyped.data_type = "INTEGER".into();
+    assert!(ddl::alter_column(Driver::Sqlite, &people, slogan, &retyped).is_err());
+
+    run(ddl::create_index(
+        Driver::Sqlite,
+        &people,
+        "by_slogan",
+        &["slogan".into()],
+        false,
+    )
+    .unwrap())
+    .await;
+    let indexes = db.indexes(&people).await.unwrap();
+    let made = indexes
+        .iter()
+        .find(|i| i.name == "by_slogan")
+        .expect("listed");
+    assert_eq!(made.columns, ["slogan"]);
+    run(ddl::drop_index(Driver::Sqlite, &people, "by_slogan")).await;
+    assert!(db
+        .indexes(&people)
+        .await
+        .unwrap()
+        .iter()
+        .all(|i| i.name != "by_slogan"));
+
+    run(ddl::drop_column(Driver::Sqlite, &people, "slogan")).await;
+    assert!(db
+        .columns(&people)
+        .await
+        .unwrap()
+        .iter()
+        .all(|c| c.name != "slogan"));
+}

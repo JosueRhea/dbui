@@ -67,6 +67,7 @@ pub enum MenuAction {
     CloseOtherTabs,
     CloseTabsToRight,
     CloseAllTabs,
+    NewTable,
 }
 
 impl MenuAction {
@@ -223,6 +224,10 @@ fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
             MenuRow::Item {
                 action: MenuAction::CopyName,
                 label: "Copy Name".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::NewTable,
+                label: "New Table…".into(),
             },
             MenuRow::Separator,
             MenuRow::Item {
@@ -397,6 +402,10 @@ impl DbUi {
             (ContextTarget::Schema { connection, name }, MenuAction::ToggleSchema) => {
                 let (connection, name) = (*connection, name.clone());
                 self.toggle_schema(connection, &name, cx);
+            }
+            (ContextTarget::Schema { name, .. }, MenuAction::NewTable) => {
+                let schema = name.clone();
+                self.create_table_sheet(Some(schema), cx);
             }
             (ContextTarget::Schema { name, .. }, MenuAction::CopyName) => {
                 self.copy_to_clipboard(name.clone(), "Schema name copied", cx);

@@ -8,9 +8,9 @@ use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Page, QueryOutcome,
-    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef,
-    TlsMode, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
+    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
+    TableRef, TlsMode, Value,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
@@ -334,6 +334,29 @@ impl DatabaseDriver for PostgresDriver {
             .await
             .map_err(|error| DriverError::query("COMMIT", &error))?;
         Ok(total)
+    }
+
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {
+        let rows = sqlx::query(catalog::INDEXES)
+            .bind(&table.schema)
+            .bind(&table.name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::catalog(&error))?;
+        Ok(crate::port::group_indexes(
+            rows.iter()
+                .filter_map(|row| {
+                    Some((
+                        row.try_get::<String, _>("index_name").ok()?,
+                        row.try_get::<bool, _>("is_unique").unwrap_or(false),
+                        row.try_get::<bool, _>("is_primary").unwrap_or(false),
+                        row.try_get::<Option<String>, _>("column_name")
+                            .ok()
+                            .flatten(),
+                    ))
+                })
+                .collect(),
+        ))
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {

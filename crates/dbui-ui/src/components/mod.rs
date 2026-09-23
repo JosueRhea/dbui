@@ -18,6 +18,7 @@ mod icons;
 mod main_pane;
 pub(crate) mod motion;
 pub(crate) mod palette;
+pub(crate) mod schema_sheet;
 pub(crate) mod scrollbar;
 mod sidebar;
 mod status_bar;

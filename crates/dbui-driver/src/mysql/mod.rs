@@ -8,9 +8,9 @@ use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Page, QueryOutcome,
-    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef,
-    TlsMode, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
+    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
+    TableRef, TlsMode, Value,
 };
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
@@ -338,6 +338,31 @@ impl DatabaseDriver for MySqlDriver {
             .await
             .map_err(|error| DriverError::query("COMMIT", &error))?;
         Ok(total)
+    }
+
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {
+        let rows = sqlx::query(catalog::INDEXES)
+            .bind(&table.schema)
+            .bind(&table.name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::catalog(&error))?;
+        Ok(crate::port::group_indexes(
+            rows.iter()
+                .filter_map(|row| {
+                    let name = row.try_get::<String, _>("index_name").ok()?;
+                    let primary = name == "PRIMARY";
+                    Some((
+                        name,
+                        row.try_get::<i64, _>("non_unique").unwrap_or(1) == 0,
+                        primary,
+                        row.try_get::<Option<String>, _>("column_name")
+                            .ok()
+                            .flatten(),
+                    ))
+                })
+                .collect(),
+        ))
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {

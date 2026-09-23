@@ -790,6 +790,9 @@ pub enum WorkspaceTab {
         columns_open: bool,
         /// Why the last load failed, if it did.
         error: Option<StatementError>,
+        /// The table's indexes, read when the structure pane first shows
+        /// them and again after every change made from it.
+        indexes: Option<Vec<dbui_app::domain::Index>>,
     },
     Sql {
         id: TabId,
@@ -881,6 +884,7 @@ impl WorkspaceTab {
             filters_open: false,
             columns_open: false,
             error: None,
+            indexes: None,
         }
     }
 

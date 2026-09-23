@@ -467,6 +467,8 @@ pub struct DbUi {
     /// started them -- tab ids restart per connection -- each with the id of
     /// the run it belongs to.
     pub(crate) running: HashMap<(Option<ConnectionId>, TabId), (u64, commands::StopHandle)>,
+    /// The sheet for changing a table's shape, while it is open.
+    pub(crate) schema_sheet: Option<crate::components::schema_sheet::SchemaSheet>,
     /// The find / replace bar over the SQL editor, while it is open.
     pub(crate) editor_find: Option<crate::components::editor_find::EditorFind>,
     /// The id the next run gets. Only the run holding a handle may clear it:
@@ -686,6 +688,7 @@ impl DbUi {
             tab_drag: None,
             running: HashMap::new(),
             editor_find: None,
+            schema_sheet: None,
             next_run: 0,
             drag_pointer: None,
             tab_indicator: None,
@@ -2664,8 +2667,20 @@ impl DbUi {
     }
 
     pub(crate) fn set_table_pane(&mut self, pane: crate::tabs::TablePane, cx: &mut Context<Self>) {
-        if let Some(WorkspaceTab::Table { pane: tab_pane, .. }) = self.tabs.active_mut() {
+        let mut needs_indexes = false;
+        if let Some(WorkspaceTab::Table {
+            pane: tab_pane,
+            indexes,
+            ..
+        }) = self.tabs.active_mut()
+        {
             *tab_pane = pane;
+            // Read when first asked for, not with every page of rows: most
+            // visits to a table never look at its indexes.
+            needs_indexes = pane == crate::tabs::TablePane::Structure && indexes.is_none();
+        }
+        if needs_indexes {
+            self.load_indexes(cx);
         }
         cx.notify();
     }
@@ -5184,6 +5199,13 @@ impl DbUi {
             return;
         }
 
+        // The structure sheet is modal the same way: a DDL statement is not
+        // something to be set off from underneath it.
+        if self.schema_sheet.is_some() {
+            self.handle_schema_sheet_key(keystroke, cx);
+            return;
+        }
+
         // The close guard owns it for the same reason. Enter goes through with
         // the close rather than cancelling it: the prompt is only up because
         // the user asked to close, and it names the count they are agreeing to
@@ -5968,6 +5990,7 @@ impl Render for DbUi {
         let context_menu = self.render_context_menu(window, cx);
         let confirm = self.render_confirm(cx);
         let close_guard = self.render_close_guard(cx);
+        let schema_sheet = self.render_schema_sheet(cx);
         let drag_ghost = self.render_drag_ghost();
 
         div()
@@ -6116,6 +6139,9 @@ impl Render for DbUi {
             .on_action(
                 cx.listener(|this, _: &crate::SaveQuery, _window, cx| this.open_save_query(cx)),
             )
+            .on_action(cx.listener(|this, _: &crate::NewTable, _window, cx| {
+                this.create_table_sheet(None, cx)
+            }))
             .on_action(cx.listener(|this, _: &crate::OpenSavedQuery, _window, cx| {
                 this.open_palette(crate::components::palette::PaletteKind::SavedQueries, cx)
             }))
@@ -6205,6 +6231,7 @@ impl Render for DbUi {
             .children(context_menu)
             .children(confirm)
             .children(close_guard)
+            .children(schema_sheet)
             // Over everything: it is the pointer's, and the pointer can be
             // anywhere.
             .children(drag_ghost)

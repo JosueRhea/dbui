@@ -61,6 +61,7 @@ enum ActionId {
     StopQuery,
     SaveQuery,
     OpenSavedQuery,
+    NewTable,
     GoToTable,
     SearchTables,
     SelectAllRows,
@@ -247,6 +248,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::OpenSavedQuery,
         label: "Saved Queries…",
         shortcut: Some("⌘⇧O"),
+        section: "Query",
+    },
+    ActionDef {
+        id: ActionId::NewTable,
+        label: "New Table…",
+        shortcut: None,
         section: "Query",
     },
     ActionDef {
@@ -918,6 +925,7 @@ impl DbUi {
             ActionId::StopQuery => self.active_run_is_stoppable(),
             ActionId::SaveQuery => is_sql,
             ActionId::OpenSavedQuery => true,
+            ActionId::NewTable => connected,
             ActionId::ToggleFilters
             | ActionId::ToggleColumns
             | ActionId::PagePrev
@@ -1056,6 +1064,7 @@ impl DbUi {
             ActionId::StopQuery => self.stop_query(cx),
             ActionId::SaveQuery => self.open_save_query(cx),
             ActionId::OpenSavedQuery => self.open_palette(PaletteKind::SavedQueries, cx),
+            ActionId::NewTable => self.create_table_sheet(None, cx),
             ActionId::GoToTable => self.open_palette(PaletteKind::GoToTable, cx),
             ActionId::SearchTables => self.focus_sidebar_search(cx),
             ActionId::SelectAllRows => self.select_all_rows(cx),

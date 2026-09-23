@@ -59,6 +59,8 @@ pub enum InputTarget {
     /// The find / replace bar over the SQL editor.
     FindQuery,
     FindReplacement,
+    /// One of the structure sheet's text fields, by its focus position.
+    SheetField(usize),
 }
 
 impl DbUi {
@@ -101,6 +103,10 @@ impl DbUi {
             InputTarget::FindReplacement => {
                 self.editor_find.as_mut().map(|find| &mut find.replacement)
             }
+            InputTarget::SheetField(index) => self
+                .schema_sheet
+                .as_mut()
+                .and_then(|sheet| sheet.input_mut(index)),
             InputTarget::InsertField(index) => match self.tabs.active_mut() {
                 Some(crate::tabs::WorkspaceTab::Table {
                     pending_inserts,
@@ -170,6 +176,13 @@ impl DbUi {
                 self.focus = crate::root::Focus::Detail;
                 self.filter_focus = None;
                 self.page_size_focus = false;
+            }
+            // The sheet is modal and owns the keyboard already; a click only
+            // moves which of its fields is typed into.
+            InputTarget::SheetField(index) => {
+                if let Some(sheet) = self.schema_sheet.as_mut() {
+                    sheet.focused = index;
+                }
             }
             InputTarget::FindQuery | InputTarget::FindReplacement => {
                 use crate::components::editor_find::FindField;
@@ -298,6 +311,7 @@ fn field_with_leading(
         InputTarget::DetailField(index) => ("detail-field-scroll", index).into(),
         InputTarget::FindQuery => "find-query-scroll".into(),
         InputTarget::FindReplacement => "find-replacement-scroll".into(),
+        InputTarget::SheetField(index) => ("sheet-field-scroll", index).into(),
     };
 
     if input.is_multiline() {

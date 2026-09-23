@@ -366,31 +366,74 @@ impl DbUi {
             .into_any_element()
     }
 
-    fn render_structure(&mut self, _cx: &mut Context<Self>) -> AnyElement {
-        let theme = &self.theme;
-
-        let Some(WorkspaceTab::Table { result, .. }) = self.tabs.active() else {
+    /// The table's columns and indexes, and the way to change them.
+    ///
+    /// Each change opens the structure sheet, which shows the statement it
+    /// will run before running it -- see `schema_sheet`.
+    fn render_structure(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(WorkspaceTab::Table {
+            result, indexes, ..
+        }) = self.tabs.active()
+        else {
             return self.render_empty_state().into_any_element();
         };
-
         let Some(view) = result.as_ref() else {
             return self.render_empty_state().into_any_element();
         };
-
         if view.structure.is_empty() {
             return self.render_empty_state().into_any_element();
         }
+        let structure = view.structure.clone();
+        let indexes = indexes.clone();
+        let theme = &self.theme;
 
-        let rows: Vec<AnyElement> = view
-            .structure
+        // A quiet text button: the rows are for reading, and a column of
+        // loud buttons down the right would be what the eye reads first.
+        let row_action = |id: (&'static str, usize), label: &'static str, danger: bool| {
+            div()
+                .id(id)
+                .px_1p5()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(metrics::text_size_small())
+                .text_color(theme.text_faint)
+                .hover(move |style| {
+                    style
+                        .bg(theme.hover)
+                        .text_color(if danger { theme.danger } else { theme.text })
+                })
+                .child(label)
+        };
+        let section = |label: &'static str, action: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .child(caption(label, theme))
+                .child(action)
+        };
+        let add_column = button("structure-add-column", "+ Column", theme, false)
+            .on_click(cx.listener(|this, _, _, cx| this.add_column_sheet(cx)))
+            .into_any_element();
+        let add_index = button("structure-add-index", "+ Index", theme, false)
+            .on_click(cx.listener(|this, _, _, cx| this.add_index_sheet(cx)))
+            .into_any_element();
+
+        let column_rows: Vec<AnyElement> = structure
             .iter()
-            .map(|column| {
+            .enumerate()
+            .map(|(at, column)| {
+                let edit = column.clone();
+                let drop = column.name.clone();
                 div()
                     .flex()
                     .items_center()
                     .gap_3()
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .border_b_1()
                     .border_color(theme.divider)
                     .when(column.is_primary_key, |row| row.text_color(theme.warning))
@@ -398,24 +441,119 @@ impl DbUi {
                         div()
                             .w(px(160.))
                             .flex_shrink_0()
+                            .truncate()
                             .child(SharedString::from(column.name.clone())),
                     )
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
                             .text_color(theme.text_muted)
                             .child(SharedString::from(column.data_type.clone())),
                     )
                     .child(
                         div()
-                            .w(px(48.))
+                            .w(px(64.))
+                            .flex_shrink_0()
                             .text_color(theme.text_faint)
                             .text_size(metrics::text_size_small())
                             .child(if column.nullable { "null" } else { "not null" }),
                     )
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .flex_shrink_0()
+                            .truncate()
+                            .text_color(theme.text_faint)
+                            .text_size(metrics::text_size_small())
+                            .child(SharedString::from(
+                                column
+                                    .default
+                                    .as_ref()
+                                    .map(|default| format!("= {default}"))
+                                    .unwrap_or_default(),
+                            )),
+                    )
+                    .child(row_action(("structure-edit", at), "Edit", false).on_click(
+                        cx.listener(move |this, _, _, cx| this.edit_column_sheet(edit.clone(), cx)),
+                    ))
+                    .child(row_action(("structure-drop", at), "Drop", true).on_click(
+                        cx.listener(move |this, _, _, cx| this.drop_column_sheet(drop.clone(), cx)),
+                    ))
                     .into_any_element()
             })
             .collect();
+
+        let index_rows: Vec<AnyElement> = match &indexes {
+            None => vec![div()
+                .px_3()
+                .py_1p5()
+                .text_color(theme.text_faint)
+                .child("Reading indexes…")
+                .into_any_element()],
+            Some(found) if found.is_empty() => vec![div()
+                .px_3()
+                .py_1p5()
+                .text_color(theme.text_faint)
+                .child("No indexes")
+                .into_any_element()],
+            Some(found) => found
+                .iter()
+                .enumerate()
+                .map(|(at, index)| {
+                    let drop = index.name.clone();
+                    let kind = if index.primary {
+                        "primary key"
+                    } else if index.unique {
+                        "unique"
+                    } else {
+                        ""
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_1p5()
+                        .border_b_1()
+                        .border_color(theme.divider)
+                        .child(
+                            div()
+                                .w(px(160.))
+                                .flex_shrink_0()
+                                .truncate()
+                                .child(SharedString::from(index.name.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(index.columns.join(", "))),
+                        )
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .flex_shrink_0()
+                                .text_color(theme.text_faint)
+                                .text_size(metrics::text_size_small())
+                                .child(kind),
+                        )
+                        // The key's own index goes with the key, which is a
+                        // bigger change than this pane should make in a click.
+                        .when(!index.primary, |row| {
+                            row.child(row_action(("index-drop", at), "Drop", true).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.drop_index_sheet(drop.clone(), cx)
+                                }),
+                            ))
+                        })
+                        .into_any_element()
+                })
+                .collect(),
+        };
 
         div()
             .relative()
@@ -429,7 +567,10 @@ impl DbUi {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .font_family(metrics::MONO_FONT)
-                    .children(rows),
+                    .child(section("Columns", add_column))
+                    .children(column_rows)
+                    .child(section("Indexes", add_index))
+                    .children(index_rows),
             )
             .child(scrollbar::vertical_scrollbar(
                 "structure-scrollbar",
