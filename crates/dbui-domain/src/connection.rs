@@ -123,6 +123,24 @@ impl ConnectionId {
         ConnectionId(Self::counter().fetch_add(1, Ordering::Relaxed))
     }
 
+    /// The id carried by a config that arrived without one, until the loader
+    /// has seen which numbers the rest of the file already claims.
+    ///
+    /// Minting the id while deserializing instead -- the obvious `default` --
+    /// reads a counter that nothing has primed yet, so `[{"id": 1}, {}]`
+    /// parses into two connections both numbered 1, sharing one keychain
+    /// entry; and a parse that then fails has moved the counter anyway.
+    /// Zero is safe as the marker because [`ConnectionId::next`] starts at one
+    /// and so has never handed it out.
+    pub(crate) fn unassigned() -> Self {
+        ConnectionId(0)
+    }
+
+    /// Whether this id still has to be minted (see `unassigned`).
+    pub fn is_unassigned(self) -> bool {
+        self.0 == 0
+    }
+
     /// Keep the id counter above every id already reserved (e.g. loaded from disk).
     pub fn observe(self) {
         let counter = Self::counter();
@@ -150,7 +168,9 @@ impl fmt::Display for ConnectionId {
 /// Everything needed to open a connection, plus the name shown in the sidebar.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
-    #[serde(default = "ConnectionId::next")]
+    /// `default` so a hand-written or hand-merged file that leaves the id out
+    /// still loads; the loader mints the real one once it knows what is taken.
+    #[serde(default = "ConnectionId::unassigned")]
     pub id: ConnectionId,
     pub name: String,
     pub driver: Driver,

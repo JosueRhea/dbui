@@ -505,6 +505,72 @@ async fn an_all_defaults_insert_lets_the_key_fire() {
     );
 }
 
+/// SQLite's grammar has no `DEFAULT` in a value list and no `SET c = DEFAULT`
+/// at all, so both spellings used to reach the parser as `near "DEFAULT":
+/// syntax error`. The insert now leaves the column out, and the update is
+/// refused with a reason instead of being sent.
+#[tokio::test]
+async fn a_default_valued_column_is_omitted_by_the_insert_and_refused_by_the_update() {
+    let db = open("defaulted").await;
+    db.execute(
+        "CREATE TABLE notes (
+             id   INTEGER PRIMARY KEY,
+             body TEXT NOT NULL DEFAULT 'unwritten'
+         )",
+    )
+    .await
+    .expect("create");
+    let table = TableRef::new("main", "notes");
+
+    db.apply_changes(
+        &table,
+        &RowBatch {
+            inserts: vec![
+                RowInsert {
+                    values: vec![
+                        ("id".into(), Value::Int(1)),
+                        ("body".into(), Value::Default),
+                    ],
+                },
+                // Nothing but defaults: the all-defaults spelling, which
+                // SQLite does accept.
+                RowInsert {
+                    values: vec![("body".into(), Value::Default)],
+                },
+            ],
+            updates: Vec::new(),
+            deletes: Vec::new(),
+        },
+    )
+    .await
+    .expect("the column's default fires");
+
+    let rows = db
+        .table_rows(&table, Page::first(), "body = 'unwritten'", &[])
+        .await
+        .expect("the new rows");
+    assert_eq!(rows.rows.len(), 2, "both rows took the column's default");
+
+    let error = db
+        .apply_changes(
+            &table,
+            &RowBatch::of_updates(vec![RowUpdate {
+                pk: vec![("id".into(), Value::Int(1))],
+                changes: vec![("body".into(), Value::Default)],
+            }]),
+        )
+        .await
+        .expect_err("SQLite cannot put a column's default back");
+    assert!(
+        error.to_string().contains("default"),
+        "the refusal says why, rather than quoting the parser: {error}"
+    );
+    assert!(
+        !error.to_string().contains("syntax error"),
+        "and it never reached the parser: {error}"
+    );
+}
+
 #[tokio::test]
 async fn closing_is_idempotent() {
     let db = open("closing").await;

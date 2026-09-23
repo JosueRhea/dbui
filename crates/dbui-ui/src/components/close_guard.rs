@@ -17,8 +17,18 @@ use gpui::{div, prelude::*, AnyElement, Context, MouseButton, SharedString};
 /// What a confirmed discard goes on to close.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CloseTarget {
-    /// A table or SQL tab, by index in the active connection's tab list.
-    Tab(usize),
+    /// A table or SQL tab, named by the connection it belongs to and by its
+    /// [`TabId`] within that connection.
+    ///
+    /// Neither half is spare. An index would name whatever slid into the slot,
+    /// for the reason [`TabScope`] gives below. And ids start again at zero for
+    /// each connection, so an id on its own would name a stranger's tab the
+    /// moment ⌘⌥] carries another connection's list in under a guard that is
+    /// still on screen.
+    Tab {
+        connection: Option<ConnectionId>,
+        id: TabId,
+    },
     /// Several tabs at once, from the tab bar's own menu.
     TabGroup(TabScope),
     Connection(ConnectionId),
@@ -120,8 +130,18 @@ impl DbUi {
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(body)),
                             )
+                            // ⌘S answers the question by committing the batch
+                            // instead of throwing it away -- but only when the
+                            // question is about a single tab. A group of them is
+                            // several batches, each committing in its own
+                            // transaction against its own table, and ⌘S sends one.
                             .child(caption(
-                                "⌘S commits them and keeps this open. Esc cancels.",
+                                if matches!(guard.target, CloseTarget::Tab { .. }) {
+                                    "⌘S commits them and keeps this open. Esc cancels."
+                                } else {
+                                    "⌘S commits one tab at a time, so it cannot take these. \
+                                 Esc cancels."
+                                },
                                 theme,
                             ))
                             .child(

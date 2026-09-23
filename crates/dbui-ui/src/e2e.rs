@@ -2280,7 +2280,9 @@ fn only_filled_in_columns_reach_the_insert(cx: &mut TestAppContext) {
                 crate::text_input::TextInput::with_text("Katherine", true);
         }
 
-        let staged = view.collect_batch_inserts().expect("parses");
+        let staged = view
+            .collect_batch_inserts(view.tabs.active)
+            .expect("parses");
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].values.len(), 1, "only the column that was typed");
         assert_eq!(staged[0].values[0].0, "name");
@@ -2305,7 +2307,9 @@ fn a_new_rows_values_take_their_type_from_the_column(cx: &mut TestAppContext) {
             pending_inserts[0].fields[0].1 = crate::text_input::TextInput::with_text("6", true);
         }
 
-        let staged = view.collect_batch_inserts().expect("parses");
+        let staged = view
+            .collect_batch_inserts(view.tabs.active)
+            .expect("parses");
         assert_eq!(
             staged[0].values[0],
             ("id".to_string(), Value::Int(6)),
@@ -3141,10 +3145,12 @@ impl Drop for ConnectedDb {
     }
 }
 
-fn open_connected<'a>(
-    cx: &'a mut TestAppContext,
-    name: &str,
-) -> (Entity<DbUi>, &'a mut VisualTestContext, ConnectedDb) {
+/// A seeded temporary SQLite file, and the config that opens it.
+///
+/// Split out of `open_connected` so a test can put two live connections in one
+/// window: ⌘⌥] swaps a whole tab list in for another connection's, which is
+/// something the app does while a question about a tab is still on screen.
+fn seeded_db(name: &str) -> (ConnectedDb, ConnectionConfig) {
     let mut path = std::env::temp_dir();
     path.push(format!("dbui-e2e-{}-{name}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -3181,6 +3187,14 @@ fn open_connected<'a>(
     let mut config = ConnectionConfig::new(Driver::Sqlite);
     config.name = name.to_string();
     config.database = path.to_string_lossy().to_string();
+    (ConnectedDb { path }, config)
+}
+
+fn open_connected<'a>(
+    cx: &'a mut TestAppContext,
+    name: &str,
+) -> (Entity<DbUi>, &'a mut VisualTestContext, ConnectedDb) {
+    let (db, config) = seeded_db(name);
 
     let (view, cx) = open_with(cx, Workspace::from_configs(vec![config]));
     view.update(cx, |view, cx| {
@@ -3211,7 +3225,50 @@ fn open_connected<'a>(
         );
     });
 
-    (view, cx, ConnectedDb { path })
+    (view, cx, db)
+}
+
+/// One window, two live connections, each with its own file behind it.
+fn open_two_connected<'a>(
+    cx: &'a mut TestAppContext,
+    name: &str,
+) -> (
+    Entity<DbUi>,
+    &'a mut VisualTestContext,
+    ConnectedDb,
+    ConnectedDb,
+) {
+    let (first, config_a) = seeded_db(&format!("{name}-a"));
+    let (second, config_b) = seeded_db(&format!("{name}-b"));
+
+    let (view, cx) = open_with(cx, Workspace::from_configs(vec![config_a, config_b]));
+    let ids: Vec<_> = view.update(cx, |view, _| {
+        view.workspace.entries().iter().map(|e| e.id()).collect()
+    });
+
+    // Opened back to front, so the first connection is the one left in front.
+    for id in [ids[1], ids[0]] {
+        view.update(cx, |view, cx| view.open_connection_tab(id, cx));
+        settle(&view, cx, |view| {
+            view.workspace
+                .get(id)
+                .is_some_and(|entry| entry.status.is_connected())
+        });
+    }
+
+    view.update(cx, |view, _| {
+        for id in &ids {
+            assert!(
+                view.workspace
+                    .get(*id)
+                    .is_some_and(|entry| entry.status.is_connected()),
+                "both test databases should have connected"
+            );
+        }
+        assert_eq!(view.workspace.active_id(), Some(ids[0]));
+    });
+
+    (view, cx, first, second)
 }
 
 /// The driver crate is not a direct dependency of this one; the app layer
@@ -5346,7 +5403,9 @@ fn cmd_d_duplicates_the_selected_rows(cx: &mut TestAppContext) {
     view.update(cx, |view, _| {
         assert_eq!(view.staged_insert_count(), 2, "one copy per selected row");
 
-        let staged = view.collect_batch_inserts().expect("parses");
+        let staged = view
+            .collect_batch_inserts(view.tabs.active)
+            .expect("parses");
         // `id` is a lone integer key: left out so the sequence fires.
         for row in &staged {
             assert!(
@@ -5412,7 +5471,9 @@ fn copied_rows_paste_back_as_new_rows(cx: &mut TestAppContext) {
 
     view.update(cx, |view, _| {
         assert_eq!(view.staged_insert_count(), 2);
-        let staged = view.collect_batch_inserts().expect("parses");
+        let staged = view
+            .collect_batch_inserts(view.tabs.active)
+            .expect("parses");
         // Paste is faithful: it writes back exactly what was copied, key and
         // all. ⌘D is the one that knows to leave the key out.
         let names: Vec<String> = staged
@@ -5460,7 +5521,9 @@ Katherine	ignored
     });
     view.update(cx, |view, cx| {
         view.paste_rows(cx);
-        let staged = view.collect_batch_inserts().expect("parses");
+        let staged = view
+            .collect_batch_inserts(view.tabs.active)
+            .expect("parses");
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].values.len(), 1, "only the column that matched");
         assert_eq!(staged[0].values[0].0, "name");
@@ -6731,6 +6794,928 @@ fn a_commit_that_cannot_be_sent_keeps_the_guard_up(cx: &mut TestAppContext) {
         assert!(
             view.close_guard.is_some(),
             "the batch is still staged, so the guard still has a job"
+        );
+    });
+}
+
+/// The regression: gating the actions on "no panel is up" made ⌘S silently
+/// dead under the chrome dropdowns -- nothing committed, nothing said, and the
+/// menu did not even close. A dropdown is transient chrome, not a question the
+/// user has to answer first, so a save pressed over one is still a save.
+#[gpui::test]
+fn committing_under_a_chrome_dropdown_still_commits(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "dropdown-commit");
+    let path = db.path.clone();
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        assert_eq!(view.collect_batch_edits().len(), 1, "the edit is staged");
+        view.toggle_settings_menu(cx);
+        assert!(
+            view.settings_menu_open,
+            "with a dropdown over the top of it"
+        );
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| {
+        view.tabs.items[0].pending_change_count() == 0
+    });
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            0,
+            "the save went through"
+        );
+        assert!(
+            !view.settings_menu_open,
+            "and the dropdown did not stay hanging over a commit that happened"
+        );
+    });
+
+    assert_eq!(
+        read_back(&path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+    );
+}
+
+/// The bug: ⌘↵ is bound to `RunQuery`, and a bound action runs *before*
+/// `DbUi::on_key` and stops the keystroke there. Under the close guard that
+/// meant the shortcut followed the foreign key under the cursor into a new
+/// tab behind the panel, while the panel's own Enter handling -- the thing
+/// that would have answered the question -- never ran at all.
+#[gpui::test]
+fn cmd_enter_under_the_guard_does_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+    });
+
+    cx.simulate_keystrokes("cmd-enter");
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.close_guard.is_some(),
+            "the question is still on screen"
+        );
+        assert_eq!(
+            view.tabs.items.len(),
+            1,
+            "and no foreign key was followed out from behind it"
+        );
+        assert_eq!(view.tabs.active, 0, "nothing moved under the guard");
+        assert_eq!(view.collect_batch_edits().len(), 1, "the batch is intact");
+    });
+}
+
+/// ⌘⇧↵ runs every statement in the editor. Under the guard it has exactly as
+/// little business firing as ⌘↵ does.
+#[gpui::test]
+fn cmd_shift_enter_under_the_guard_does_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+    });
+
+    cx.simulate_keystrokes("cmd-shift-enter");
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.close_guard.is_some(),
+            "the question is still on screen"
+        );
+        assert_eq!(view.tabs.items.len(), 1, "nothing else opened");
+        assert_eq!(view.tabs.active, 0, "nothing moved under the guard");
+        assert_eq!(view.collect_batch_edits().len(), 1, "the batch is intact");
+    });
+}
+
+/// The other half of the same guard: refusing the modified Enter must not cost
+/// the plain one, which is the guard's documented way of saying yes.
+#[gpui::test]
+fn plain_enter_under_the_guard_still_confirms(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+    });
+
+    cx.simulate_keystrokes("enter");
+
+    view.update(cx, |view, _| {
+        assert!(view.close_guard.is_none(), "the question was answered");
+        assert!(view.tabs.items.is_empty(), "and the tab went with it");
+    });
+}
+
+/// The bug: ⌘⇧P over an open palette rebuilt it as the action list, throwing
+/// away the query the user had typed into it. The palette owns the keyboard
+/// while it is up, and ⌘⇧P is what people press while reaching for the
+/// palette that is already in front of them.
+#[gpui::test]
+fn cmd_shift_p_over_an_open_palette_leaves_it_alone(cx: &mut TestAppContext) {
+    use crate::components::palette::PaletteKind;
+
+    let (view, cx) = with_catalog(cx, &[("users", &["id"]), ("orders", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        view.open_palette(PaletteKind::GoToTable, cx);
+    });
+    cx.simulate_keystrokes(&typing("use"));
+
+    view.update(cx, |view, _| {
+        let palette = view.palette.as_ref().expect("the palette is up");
+        assert_eq!(palette.kind, PaletteKind::GoToTable, "on the table list");
+        assert_eq!(palette.query.text(), "use", "with a query typed into it");
+    });
+
+    cx.simulate_keystrokes("cmd-shift-p");
+
+    view.update(cx, |view, _| {
+        let palette = view.palette.as_ref().expect("the palette is still up");
+        assert_eq!(
+            palette.kind,
+            PaletteKind::GoToTable,
+            "still the list the user opened"
+        );
+        assert_eq!(palette.query.text(), "use", "and the query survived");
+    });
+}
+
+/// The same bug wearing the other modifier: ⌘P over the table list the palette
+/// is *already* showing rebuilt it from scratch, which cost the typed query
+/// just as surely as ⌘⇧P did. Switching to the table list from one of the
+/// other lists is a different thing -- that is a switch the user asked for,
+/// and it still goes through.
+#[gpui::test]
+fn cmd_p_over_an_open_table_palette_leaves_it_alone(cx: &mut TestAppContext) {
+    use crate::components::palette::PaletteKind;
+
+    let (view, cx) = with_catalog(cx, &[("users", &["id"]), ("orders", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        view.open_palette(PaletteKind::GoToTable, cx);
+    });
+    cx.simulate_keystrokes(&typing("use"));
+    cx.simulate_keystrokes("cmd-p");
+
+    view.update(cx, |view, _| {
+        let palette = view.palette.as_ref().expect("the palette is still up");
+        assert_eq!(
+            palette.kind,
+            PaletteKind::GoToTable,
+            "it was already the table list"
+        );
+        assert_eq!(palette.query.text(), "use", "and the query survived");
+    });
+
+    view.update(cx, |view, cx| {
+        view.open_palette(PaletteKind::Actions, cx);
+    });
+    cx.simulate_keystrokes("cmd-p");
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.palette.as_ref().expect("still up").kind,
+            PaletteKind::GoToTable,
+            "from another list, ⌘P is still the way to the table list"
+        );
+    });
+}
+
+/// The guard behind the two tests above: `handle_palette_key`'s own Enter arm
+/// requires no ⌘, precisely so that ⌘↵ -- unregistered as an action while the
+/// palette is up -- does not fall into it and run whichever row happens to be
+/// highlighted.
+#[gpui::test]
+fn cmd_enter_over_an_open_palette_does_nothing(cx: &mut TestAppContext) {
+    use crate::components::palette::PaletteKind;
+
+    let (view, cx) = with_catalog(cx, &[("users", &["id"]), ("orders", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        view.open_palette(PaletteKind::GoToTable, cx);
+    });
+    cx.simulate_keystrokes(&typing("use"));
+
+    cx.simulate_keystrokes("cmd-enter");
+
+    view.update(cx, |view, _| {
+        let palette = view.palette.as_ref().expect("still up -- ⌘↵ did nothing");
+        assert_eq!(palette.kind, PaletteKind::GoToTable);
+        assert_eq!(palette.query.text(), "use", "query untouched");
+        assert!(view.tabs.items.is_empty(), "no row was run");
+    });
+}
+
+/// The context menu's own guard: its `"up" | "down" | "enter"` arm only
+/// dispatches unmodified, so ⌘↵ -- unregistered as `RunQuery` while the menu
+/// is up -- neither runs the highlighted row nor falls through to the
+/// shortcuts below and follows the foreign key under the cursor out from
+/// under a menu the user is still reading.
+#[gpui::test]
+fn cmd_enter_over_a_row_context_menu_does_nothing(cx: &mut TestAppContext) {
+    use crate::components::context_menu::ContextTarget;
+
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        view.focus_cell(0, 1, cx);
+        view.open_context_menu(
+            ContextTarget::Rows,
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            cx,
+        );
+        assert!(view.context_menu.is_some(), "the menu is up");
+    });
+
+    cx.simulate_keystrokes("cmd-enter");
+
+    view.update(cx, |view, _| {
+        assert!(view.context_menu.is_some(), "and stayed up");
+        assert_eq!(
+            view.tabs.items.len(),
+            1,
+            "the foreign key under the cursor was not followed"
+        );
+    });
+}
+
+/// The × on a tab pill guards a tab without bringing it forward, so the ⌘S
+/// its caption offers has to commit the tab the question is about. Committing
+/// whatever is in front instead saves the wrong table, and then takes the
+/// question -- and the work it was quoting -- away with it.
+///
+/// Driven by the key rather than by `save_pending_edits`, because the action
+/// bound to ⌘S is what fires while the guard is up, and against a real
+/// database, because a commit with nowhere to go never reaches the bug.
+#[gpui::test]
+fn committing_under_the_guard_commits_the_guarded_tab(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "guard-other-tab");
+    let path = db.path.clone();
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        // The tab in front, holding an edit of its own.
+        assert_eq!(view.tabs.active, 1, "teams is the one in front");
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Renamed Core");
+        view.finish_cell_edit(cx);
+        assert_eq!(view.collect_batch_edits().len(), 1, "teams staged one");
+
+        // And the one behind it, holding a different one.
+        view.activate_tab(0, cx);
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        assert_eq!(view.collect_batch_edits().len(), 1, "members staged one");
+        view.activate_tab(1, cx);
+
+        // The × on a background tab asks about that tab without opening it.
+        view.close_tab(0, cx);
+        assert_eq!(view.tabs.active, 1, "which leaves teams in front");
+        let guard = view.close_guard.as_ref().expect("it asked");
+        assert_eq!(guard.changes, 1);
+        assert!(
+            guard.label.to_string().contains("members"),
+            "the question is about members: {}",
+            guard.label
+        );
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| {
+        view.tabs.items[0].pending_change_count() == 0
+    });
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            0,
+            "the guarded tab's batch is the one that went"
+        );
+        assert_eq!(
+            view.tabs.items[1].pending_change_count(),
+            1,
+            "and the tab in front kept its own"
+        );
+    });
+
+    assert_eq!(
+        read_back(&path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+        "the guarded edit reached the file"
+    );
+    assert_eq!(
+        read_back(&path, "SELECT name FROM teams ORDER BY slug"),
+        vec![vec!["Core".to_string()], vec!["Operations".to_string()]],
+        "and the front tab's row was left alone"
+    );
+}
+
+/// A guard is a question about one tab on one connection, and ⌘⌥] carries a
+/// whole other connection's tabs in without bringing the question down. Tab
+/// ids start again at zero for each connection, so the tab sitting where the
+/// guarded one was is a stranger -- and ⌘S must not commit it.
+#[gpui::test]
+fn a_guard_left_behind_by_a_connection_switch_commits_nothing(cx: &mut TestAppContext) {
+    let (view, cx, first, second) = open_two_connected(cx, "guard-switch");
+    let (front, behind) = (first.path.clone(), second.path.clone());
+    let ids: Vec<_> = view.update(cx, |view, _| {
+        view.workspace.entries().iter().map(|e| e.id()).collect()
+    });
+
+    // The second connection, with an edit staged on a table tab of its own.
+    view.update(cx, |view, cx| {
+        view.open_connection_tab(ids[1], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("nobody asked about this one");
+        view.finish_cell_edit(cx);
+        assert_eq!(view.collect_batch_edits().len(), 1);
+    });
+
+    // Back to the first, and the question is raised there.
+    view.update(cx, |view, cx| {
+        view.open_connection_tab(ids[0], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+    });
+
+    // The connection switch goes through under the open question -- driven by
+    // the method rather than by ⌘⌥], which is now refused under a guard along
+    // with every other bound shortcut. The state it sets up is still one the
+    // app can reach: the connection chips in the titlebar switch on
+    // `on_mouse_down`, which never goes near `on_key` or the action
+    // dispatcher, so a click while the guard is up lands exactly here.
+    view.update(cx, |view, cx| view.cycle_connection_tab(true, cx));
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.workspace.active_id(),
+            Some(ids[1]),
+            "the other connection is in front now"
+        );
+        assert!(
+            view.close_guard.is_some(),
+            "with the question still on screen"
+        );
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| {
+        view.tabs.items[0].pending_change_count() == 0
+    });
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            1,
+            "the tab that slid into the slot is nobody's business"
+        );
+        let stashed = view
+            .stashed_tabs
+            .get(&ids[0])
+            .expect("the guarded connection's tabs were put away, not thrown away");
+        assert_eq!(
+            stashed.items[0].pending_change_count(),
+            1,
+            "and the guarded work is still staged, unsent"
+        );
+        assert!(view.close_guard.is_some(), "the question still stands");
+    });
+
+    for path in [&front, &behind] {
+        assert_eq!(
+            read_back(path, "SELECT name FROM members ORDER BY id"),
+            vec![vec!["Ada".to_string()], vec!["Grace".to_string()]],
+            "nothing reached either file"
+        );
+    }
+}
+
+/// A commit crosses to the server and back, and ⌘⌥] can carry another
+/// connection's whole tab list in while it is still in the air.
+///
+/// Tab ids start again at zero for each connection, so the answer looking its
+/// `TabId` up in whatever list is in front finds a stranger's tab of the same
+/// number. Clearing the committed batch off *that* one throws away work
+/// nobody asked to commit, tells it that it was saved, and leaves the tab
+/// that really committed marked as saving for the rest of the session.
+#[gpui::test]
+fn a_commit_landing_behind_a_connection_switch_spares_the_other_connection(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, first, second) = open_two_connected(cx, "commit-switch");
+    let (a_path, b_path) = (first.path.clone(), second.path.clone());
+    let ids: Vec<_> = view.update(cx, |view, _| {
+        view.workspace.entries().iter().map(|e| e.id()).collect()
+    });
+
+    // The second connection, with one table tab and an edit staged on it.
+    view.update(cx, |view, cx| {
+        view.open_connection_tab(ids[1], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    let b_tab = view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("nobody asked about this one");
+        view.finish_cell_edit(cx);
+        view.tabs
+            .active_id()
+            .expect("the other connection has a tab")
+    });
+
+    // And the first, with one table tab of its own. The ids collide because
+    // each connection's tab list allocates from its own counter starting at
+    // zero, and each of these lists has had exactly one tab opened on it.
+    view.update(cx, |view, cx| {
+        view.open_connection_tab(ids[0], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    let a_tab = view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        view.tabs.active_id().expect("this connection has a tab")
+    });
+    assert_eq!(a_tab, b_tab, "the two tabs really do share a numeric id");
+
+    // The commit and the switch in one turn, so the commit has not been
+    // polled once when the other connection's list arrives -- which is the
+    // window the bug lives in. Called rather than typed because
+    // `simulate_keystrokes` pumps the executor, and a commit that has already
+    // landed never reaches the switch.
+    view.update(cx, |view, cx| {
+        view.save_pending_edits(cx);
+        view.select_connection(ids[1], cx);
+    });
+    settle(&view, cx, |view| {
+        !matches!(
+            view.stashed_tabs.get(&ids[0]).map(|tabs| &tabs.items[0]),
+            Some(WorkspaceTab::Table { saving: true, .. })
+        )
+    });
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            1,
+            "the tab that slid into the slot kept its own staged work"
+        );
+        let WorkspaceTab::Table { draft, .. } = &view.tabs.items[0] else {
+            panic!("the other connection's tab is a table tab");
+        };
+        let said = draft.as_ref().and_then(|draft| draft.message.clone());
+        assert!(
+            !matches!(&said, Some((true, text)) if text == "Saved"),
+            "and was not told a commit it never sent had saved it: {said:?}"
+        );
+    });
+
+    assert_eq!(
+        read_back(&a_path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+        "the commit reached the file belonging to the connection that sent it"
+    );
+    assert_eq!(
+        read_back(&b_path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada".to_string()], vec!["Grace".to_string()]],
+        "and nothing reached the other one's"
+    );
+
+    // Back to the connection that committed. A `saving` flag left standing
+    // refuses every later ⌘S on that tab with "Already committing", for as
+    // long as the window is open.
+    view.update(cx, |view, cx| {
+        view.select_connection(ids[0], cx);
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            0,
+            "the batch that landed is no longer staged against it"
+        );
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada, again");
+        view.finish_cell_edit(cx);
+        view.save_pending_edits(cx);
+        let said = describe(&view.status);
+        assert!(
+            !said.contains("Already committing"),
+            "the tab is not stuck mid-commit: {said}"
+        );
+    });
+    settle(&view, cx, |view| {
+        view.tabs.items[0].pending_change_count() == 0
+    });
+    assert_eq!(
+        read_back(&a_path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada, again".to_string()], vec!["Grace".to_string()]],
+        "and the next commit on it goes through"
+    );
+}
+
+/// Saving a new connection moves the front to the one it just made. The tab
+/// list it moves away from has to be put away under the connection that owns
+/// it, the way a switch does -- otherwise `self.tabs` is one connection's
+/// tabs filed under another's name, and an answer still in flight for the
+/// connection that was in front cannot find its tabs at all: the batch stays
+/// staged after it has landed, and the tab goes on refusing every later ⌘S
+/// with "Already committing".
+#[gpui::test]
+fn a_commit_in_flight_survives_a_new_connection_being_added(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "commit-then-add");
+    let path = db.path.clone();
+    let first = view.update(cx, |view, _| {
+        view.workspace.active_id().expect("one connection in front")
+    });
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+    });
+
+    // A second database, saved from the connection sheet while the commit is
+    // still in the air. One turn, so the commit is never polled in between.
+    let (_second, config) = seeded_db("commit-then-add-b");
+    view.update(cx, |view, cx| {
+        view.save_pending_edits(cx);
+        view.modal = Some(crate::components::ConnectionForm::editing(config));
+        view.save_connection(cx);
+    });
+
+    view.update(cx, |view, _| {
+        assert_ne!(
+            view.workspace.active_id(),
+            Some(first),
+            "the connection that was just saved is the one in front"
+        );
+        assert!(
+            view.stashed_tabs.contains_key(&first),
+            "and the tab list it moved off is filed under the connection that owns it"
+        );
+        assert!(
+            view.tabs.items.is_empty(),
+            "the connection just made has nothing open on it"
+        );
+    });
+
+    settle(&view, cx, |view| {
+        !matches!(
+            view.stashed_tabs.get(&first).map(|tabs| &tabs.items[0]),
+            Some(WorkspaceTab::Table { saving: true, .. })
+        )
+    });
+
+    view.update(cx, |view, _| {
+        let tabs = view
+            .stashed_tabs
+            .get(&first)
+            .expect("the committing connection's tabs were put away, not lost");
+        assert_eq!(
+            tabs.items[0].pending_change_count(),
+            0,
+            "the batch that landed is no longer staged against it"
+        );
+    });
+
+    assert_eq!(
+        read_back(&path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+        "the commit reached the file it was sent on"
+    );
+
+    // And the tab is commit-able again rather than stuck mid-commit.
+    view.update(cx, |view, cx| {
+        view.select_connection(first, cx);
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada, again");
+        view.finish_cell_edit(cx);
+        view.save_pending_edits(cx);
+        let said = describe(&view.status);
+        assert!(
+            !said.contains("Already committing"),
+            "the tab is not stuck mid-commit: {said}"
+        );
+    });
+    settle(&view, cx, |view| {
+        view.tabs.items[0].pending_change_count() == 0
+    });
+    assert_eq!(
+        read_back(&path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada, again".to_string()], vec!["Grace".to_string()]],
+        "and the next commit on it goes through"
+    );
+}
+
+/// Saving a new connection takes the front, so everything keyed to the
+/// connection that held it has to go with the tab list.
+///
+/// `column_cache` above all: the key is `(schema, table)` with no connection
+/// in it, so a `users` cached against the old connection is handed straight
+/// to autocomplete as the new connection's `users`. Two connections holding
+/// a table of the same name is the ordinary case -- staging and production --
+/// and the columns offered would be the wrong server's until a real fetch
+/// landed.
+#[gpui::test]
+fn saving_a_new_connection_drops_what_belonged_to_the_last_one(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id", "email"])]);
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.column_cache
+                .contains_key(&("public".to_string(), "users".to_string())),
+            "the connection in front has columns cached for its own users table"
+        );
+    });
+
+    let (_db, config) = seeded_db("add-drops-cache");
+    view.update(cx, |view, cx| {
+        view.modal = Some(crate::components::ConnectionForm::editing(config));
+        view.save_connection(cx);
+    });
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.column_cache.is_empty(),
+            "the new connection is offered none of the last one's columns"
+        );
+        assert!(
+            view.completion.is_none(),
+            "and no popup left open over an editor that has gone"
+        );
+        assert!(view.sidebar_cursor.is_none(), "nor a cursor into its tree");
+    });
+}
+
+/// A commit that lands while its connection is behind still has to say it
+/// worked.
+///
+/// The busy line it put up is its own, so a commit that finishes without
+/// replacing it leaves the footer claiming the work is still running -- and
+/// nothing ever tells the user it succeeded. Named by tab, the way a rollback
+/// that lands off-screen is, so the answer is not read against whatever table
+/// is in front now.
+#[gpui::test]
+fn a_commit_that_lands_behind_a_switch_still_says_it_worked(cx: &mut TestAppContext) {
+    let (view, cx, first, _second) = open_two_connected(cx, "commit-speaks");
+    let a_path = first.path.clone();
+    let ids: Vec<_> = view.update(cx, |view, _| {
+        view.workspace.entries().iter().map(|e| e.id()).collect()
+    });
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+    });
+
+    // ⌘S and then away: no guard involved, just the switch.
+    view.update(cx, |view, cx| {
+        view.save_pending_edits(cx);
+        assert!(
+            describe(&view.status).contains("Committing"),
+            "the busy line went up: {}",
+            describe(&view.status)
+        );
+        view.select_connection(ids[1], cx);
+    });
+    settle(&view, cx, |view| {
+        !describe(&view.status).contains("Committing")
+    });
+
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(
+            !said.contains("Committing"),
+            "the busy line did not outlive the commit that put it up: {said}"
+        );
+        assert!(
+            said.contains("committed 1 change(s)"),
+            "and the commit said it worked: {said}"
+        );
+        assert!(
+            said.contains("members"),
+            "naming the tab it worked on, since that tab is not in front: {said}"
+        );
+    });
+
+    assert_eq!(
+        read_back(&a_path, "SELECT name FROM members ORDER BY id"),
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+        "the commit it was talking about really did land"
+    );
+}
+
+/// The question can outlive the tab it is about: dropping the table closes
+/// that tab without asking. ⌘S then has nothing to commit, and says so
+/// rather than committing whatever took its place.
+#[gpui::test]
+fn a_guard_whose_tab_has_gone_commits_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.open_table_tab(TableRef::new("public", "teams"), cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+
+        // And the tab it was asking about goes, from somewhere else.
+        view.close_tab_now(0, cx);
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+
+    view.update(cx, |view, _| {
+        assert!(view.close_guard.is_some(), "the question still stands");
+        let said = describe(&view.status);
+        assert!(
+            said.contains("users"),
+            "it names the tab it was asking about: {said}"
+        );
+        assert!(!said.contains("Committing"), "and sent nothing: {said}");
+    });
+}
+
+/// "Close 2 tabs?" is two batches, each committing in its own transaction
+/// against its own table, so there is no single one for ⌘S to send. It says
+/// which way round to do it and leaves the question standing.
+#[gpui::test]
+fn a_group_guard_refuses_the_commit_and_stays_up(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        stage_one_edit(view, cx);
+        view.open_sql_tab(cx);
+        view.close_tab_scope(crate::components::close_guard::TabScope::All, cx);
+        assert!(view.close_guard.is_some(), "it asked about the pair");
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+
+    view.update(cx, |view, _| {
+        assert!(view.close_guard.is_some(), "the question still stands");
+        assert_eq!(view.tabs.items.len(), 2, "with both tabs still open");
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            1,
+            "and the batch still staged"
+        );
+        let said = describe(&view.status);
+        assert!(
+            said.contains("one tab at a time"),
+            "it says why it cannot: {said}"
+        );
+    });
+}
+
+/// A commit sent from under the guard is in the air while the user goes on
+/// working in front of it, so it answers back only while its own
+/// "Committing…" line is still the one showing. Whatever they have been told
+/// since is the more recent news, and about the tab they are actually on.
+#[gpui::test]
+fn a_late_commit_does_not_write_over_what_the_user_was_told(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "guard-late-status");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.activate_tab(0, cx);
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        view.activate_tab(1, cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+
+    // The tab in front says something of its own while the commit is away.
+    view.update(cx, |view, cx| {
+        view.status = Status::error("something else entirely");
+        cx.notify();
+    });
+    settle(&view, cx, |view| {
+        view.tabs.items[0].pending_change_count() == 0
+    });
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            0,
+            "the commit did land"
+        );
+        assert_eq!(
+            describe(&view.status),
+            "error: something else entirely",
+            "and left the newer line alone"
+        );
+    });
+}
+
+/// A rollback is the answer to something the user asked for, so it is said
+/// whatever has reached the status line since -- silence after "Committing…"
+/// reads as the commit having worked. Named, because the tab it rolled back on
+/// is behind the one they are looking at.
+#[gpui::test]
+fn a_guarded_commit_that_rolls_back_says_so_from_behind(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "guard-rollback");
+    let path = db.path.clone();
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.activate_tab(0, cx);
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+        view.activate_tab(1, cx);
+        view.close_tab(0, cx);
+        assert!(view.close_guard.is_some(), "it asked");
+    });
+
+    // The table goes out from under the batch, on another connection to the
+    // same file, so the commit reaches the engine and comes back refused.
+    read_back(&path, "DROP TABLE members");
+
+    cx.simulate_keystrokes("cmd-s");
+
+    // And the tab in front says something of its own while it is away.
+    view.update(cx, |view, cx| {
+        view.status = Status::info("still browsing");
+        cx.notify();
+    });
+    settle(&view, cx, |view| matches!(view.status, Status::Error(_)));
+
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(said.starts_with("error:"), "the rollback speaks: {said}");
+        assert!(
+            said.contains("members"),
+            "and names the tab it rolled back on: {said}"
+        );
+        assert_eq!(
+            view.tabs.items[0].pending_change_count(),
+            1,
+            "with the batch still staged, where the user can see it"
         );
     });
 }
@@ -8159,6 +9144,800 @@ fn an_edit_under_a_filter_commits_on_cmd_s(cx: &mut TestAppContext) {
         vec![vec!["Ada".to_string()], vec!["Grace Hopper".to_string()]],
         "the commit reached the database, not just the grid"
     );
+}
+
+// -- a reload must not throw away a half-typed draft ----------------------
+//
+// Every command below reloads the page, and the load that lands sets `draft`
+// to `None`. What was typed lives only in that draft's own inputs, so a path
+// that reloads without folding it into the staged batch first destroys it
+// without a word. These need a real connection: with no driver the load stops
+// at the `active_driver()` guard, never lands, and none of it reproduces.
+
+/// Wait for every load in flight to land.
+///
+/// Stronger than "the grid has rows", which stays true right through a reload
+/// and so says nothing about whether the new page arrived.
+fn settle_loaded(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    settle(view, cx, |view| view.loads_in_flight == 0);
+}
+
+/// Type into the sidebar over a loaded `members`, run `reload`, and require
+/// what was typed to still be staged on the other side of it.
+fn a_reload_keeps_the_typed_draft(
+    cx: &mut TestAppContext,
+    name: &str,
+    setup: impl FnOnce(&mut DbUi, &mut gpui::Context<DbUi>),
+    reload: impl FnOnce(&mut DbUi, &mut gpui::Context<DbUi>),
+) {
+    let (view, cx, _db) = open_connected(cx, name);
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| setup(view, cx));
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        type_into_draft(view, 1, "Ada Lovelace");
+        assert_eq!(
+            view.collect_batch_edits().len(),
+            1,
+            "the open draft counts towards the batch before the reload"
+        );
+        reload(view, cx);
+    });
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert!(
+            matches!(
+                view.tabs.active(),
+                Some(WorkspaceTab::Table { draft: None, .. })
+            ),
+            "the reload landed -- the draft is gone, so the edit is either \
+             staged or lost"
+        );
+        let batch = view.collect_batch_edits();
+        assert_eq!(batch.len(), 1, "the typed value survived");
+        assert_eq!(batch[0].changes[0].new_text, "Ada Lovelace");
+    });
+}
+
+#[gpui::test]
+fn refreshing_keeps_the_typed_draft(cx: &mut TestAppContext) {
+    a_reload_keeps_the_typed_draft(
+        cx,
+        "reload-refresh",
+        |_, _| {},
+        |view, cx| view.refresh_result(cx),
+    );
+}
+
+/// Paging is the case the staging rule is built for: the edited row is not on
+/// the page that comes back, and it has to count anyway.
+#[gpui::test]
+fn paging_keeps_the_typed_draft(cx: &mut TestAppContext) {
+    a_reload_keeps_the_typed_draft(
+        cx,
+        "reload-page",
+        |view, cx| {
+            // One row per page, so paging forward leaves the edited row behind.
+            match view.tabs.active_mut() {
+                Some(WorkspaceTab::Table {
+                    page_size_draft, ..
+                }) => page_size_draft.set_text("1"),
+                _ => panic!("a table tab"),
+            }
+            view.apply_page_size(cx);
+        },
+        |view, cx| view.page(true, cx),
+    );
+}
+
+/// And a filter that hides the edited row does not unstage it either.
+#[gpui::test]
+fn applying_a_filter_keeps_the_typed_draft(cx: &mut TestAppContext) {
+    a_reload_keeps_the_typed_draft(
+        cx,
+        "reload-filter",
+        |_, _| {},
+        |view, cx| {
+            match view.tabs.active_mut() {
+                Some(WorkspaceTab::Table { where_draft, .. }) => {
+                    where_draft.set_text("name = 'Grace'")
+                }
+                _ => panic!("a table tab"),
+            }
+            view.apply_filters(cx);
+        },
+    );
+}
+
+#[gpui::test]
+fn clearing_a_filter_keeps_the_typed_draft(cx: &mut TestAppContext) {
+    a_reload_keeps_the_typed_draft(
+        cx,
+        "reload-unfilter",
+        |view, cx| {
+            match view.tabs.active_mut() {
+                Some(WorkspaceTab::Table { where_draft, .. }) => {
+                    where_draft.set_text("name = 'Ada'")
+                }
+                _ => panic!("a table tab"),
+            }
+            view.apply_filters(cx);
+        },
+        |view, cx| view.clear_filters(cx),
+    );
+}
+
+#[gpui::test]
+fn a_new_page_size_keeps_the_typed_draft(cx: &mut TestAppContext) {
+    a_reload_keeps_the_typed_draft(
+        cx,
+        "reload-page-size",
+        |_, _| {},
+        |view, cx| {
+            match view.tabs.active_mut() {
+                Some(WorkspaceTab::Table {
+                    page_size_draft, ..
+                }) => page_size_draft.set_text("1"),
+                _ => panic!("a table tab"),
+            }
+            view.apply_page_size(cx);
+        },
+    );
+}
+
+/// The palette's "Clear Sort" is the sibling of a third header click, which
+/// has folded the draft away since the day it was written.
+#[gpui::test]
+fn clearing_the_sort_keeps_the_typed_draft(cx: &mut TestAppContext) {
+    a_reload_keeps_the_typed_draft(
+        cx,
+        "reload-unsort",
+        |view, cx| view.toggle_sort("name", cx),
+        |view, cx| view.clear_sort(cx),
+    );
+}
+
+/// The whole way through: type, ⌘R, ⌘S, and ask the file.
+///
+/// The in-memory assertions above prove the edit is still staged; this proves
+/// the staged edit is still the typed value by the time it reaches the server.
+#[gpui::test]
+fn a_draft_refreshed_away_still_commits(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "reload-commit");
+    let path = db.path.clone();
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        type_into_draft(view, 1, "Ada Lovelace");
+    });
+    cx.simulate_keystrokes("cmd-r");
+    settle_loaded(&view, cx);
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| view.collect_batch_edits().is_empty());
+
+    let after = read_back(&path, "SELECT name FROM members ORDER BY id");
+    assert_eq!(
+        after,
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+        "what was typed before the refresh is what the commit wrote"
+    );
+}
+
+/// The cell editor is the same value by another route: it is folded into the
+/// draft, which is folded into the batch, so the reload has to do both.
+#[gpui::test]
+fn an_open_cell_editor_survives_a_refresh(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "reload-cell");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        // Left open on purpose: the refresh arrives mid-edit.
+        view.refresh_result(cx);
+    });
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, _| {
+        let batch = view.collect_batch_edits();
+        assert_eq!(batch.len(), 1, "the half-typed cell survived");
+        assert_eq!(batch[0].changes[0].new_text, "Ada Lovelace");
+    });
+}
+
+/// The hazard the hoisted `finish_cell_edit` introduced: an editor left open
+/// over one table, committed after another table has been put in front.
+///
+/// ⌘P is the keyboard route -- the palette calls `open_table_tab`, and the
+/// ⌘-block in `on_key` runs before the one that would have closed the editor,
+/// so the palette opens with the box still live. `open_first_filtered_table`
+/// (⌘⇧F, Enter) is the second. What must not happen is what the column index
+/// alone would allow: the text typed into one table being written into the
+/// other's standing draft and staged as an UPDATE against a row nobody
+/// touched.
+#[gpui::test]
+fn an_editor_left_open_does_not_stage_against_the_next_table(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "reload-crosstab");
+
+    // The tab that will be come back to, with a row selected -- so it is
+    // holding a draft when it is put in front again.
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| view.select_row(0, cx));
+
+    // The tab actually typed into.
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        // Left open, the way ⌘P leaves it, and the palette picks the other
+        // table.
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+    });
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert!(
+            matches!(
+                view.tabs.active(),
+                Some(WorkspaceTab::Table { table, .. }) if table.name == "teams"
+            ),
+            "the other table is the one in front"
+        );
+        let batch = view.collect_batch_edits();
+        assert!(
+            batch.is_empty(),
+            "nothing may be staged against the table that was only switched to: {:?}",
+            batch
+                .iter()
+                .map(|edit| edit.label.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // The other half, and the one that says the editor was committed
+        // rather than merely dropped: the text is staged on the table it was
+        // typed into.
+        let staged: Vec<String> = view
+            .tabs
+            .items
+            .iter()
+            .filter_map(|tab| match tab {
+                WorkspaceTab::Table {
+                    table,
+                    pending_edits,
+                    ..
+                } if table.name == "members" => Some(pending_edits),
+                _ => None,
+            })
+            .flatten()
+            .flat_map(|edit| edit.changes.iter().map(|change| change.new_text.clone()))
+            .collect();
+        assert_eq!(
+            staged,
+            ["Ada Lovelace"],
+            "what was typed was kept on the table it was typed into"
+        );
+    });
+}
+
+/// What a tab list has staged against a named table, as the text it would
+/// write.
+///
+/// Which tab the value landed on is the whole question when a switch is what
+/// folded it away, and a `Tabs` rather than the view so the set a connection
+/// switch put away can be asked the same thing.
+fn staged_on(tabs: &crate::tabs::Tabs, table: &str) -> Vec<String> {
+    tabs.items
+        .iter()
+        .filter_map(|tab| match tab {
+            WorkspaceTab::Table {
+                table: name,
+                pending_edits,
+                ..
+            } if name.name == table => Some(pending_edits),
+            _ => None,
+        })
+        .flatten()
+        .flat_map(|edit| edit.changes.iter().map(|change| change.new_text.clone()))
+        .collect()
+}
+
+/// `teams` at index 0, `members` in front, both holding rows.
+fn two_table_tabs(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    for table in ["teams", "members"] {
+        view.update(cx, |view, cx| {
+            view.open_table_tab(TableRef::new("main", table), cx);
+        });
+        settle_rows(view, cx);
+    }
+}
+
+/// ⌃⇥ changes which tab is in front without going through `open_table_tab`,
+/// and the editor hangs off the window rather than off the tab: switching
+/// away with the box still open dropped what was typed into it, with nothing
+/// said and nothing left to recover it from.
+///
+/// Through the keystroke rather than `next_tab`, because `on_key` claims ⌃⇥
+/// ahead of anything the editor would do with the key -- which is exactly why
+/// the switch arrives mid-edit.
+#[gpui::test]
+fn an_open_cell_editor_survives_control_tab(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "switch-ctrl-tab");
+    two_table_tabs(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+    });
+    cx.simulate_keystrokes("ctrl-tab");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.active, 0, "the other tab is the one in front now");
+        assert_eq!(
+            staged_on(&view.tabs, "members"),
+            ["Ada Lovelace"],
+            "what was typed is staged on the table it was typed into"
+        );
+        assert!(
+            staged_on(&view.tabs, "teams").is_empty(),
+            "nothing is staged against the table that was only switched to"
+        );
+    });
+}
+
+/// ⌘1..9 is the same switch by another key, and reaches `activate_tab` as an
+/// action rather than through `on_key`.
+#[gpui::test]
+fn an_open_cell_editor_survives_cmd_number(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "switch-cmd-number");
+    two_table_tabs(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+    });
+    cx.simulate_keystrokes("cmd-1");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.active, 0, "⌘1 put the first tab in front");
+        assert_eq!(
+            staged_on(&view.tabs, "members"),
+            ["Ada Lovelace"],
+            "what was typed is staged on the table it was typed into"
+        );
+        assert!(
+            staged_on(&view.tabs, "teams").is_empty(),
+            "nothing is staged against the table that was only switched to"
+        );
+    });
+}
+
+/// ⌘⌥] swaps a whole tab list out for another connection's, so the tab that
+/// was typed into is not even in `tabs` afterwards -- it is in `stashed_tabs`,
+/// which is where the value has to have landed.
+#[gpui::test]
+fn an_open_cell_editor_survives_a_connection_switch(cx: &mut TestAppContext) {
+    let (view, cx, _first, _second) = open_two_connected(cx, "switch-connection");
+    let ids: Vec<_> = view.update(cx, |view, _| {
+        view.workspace.entries().iter().map(|e| e.id()).collect()
+    });
+
+    // A table open on the connection being switched *to*, so "nothing staged
+    // over there" is a claim about a real tab rather than about an empty list.
+    view.update(cx, |view, cx| {
+        view.select_connection(ids[1], cx);
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.select_connection(ids[0], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+    });
+    cx.simulate_keystrokes("cmd-alt-]");
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.workspace.active_id(),
+            Some(ids[1]),
+            "the other connection is in front now"
+        );
+        let put_away = view
+            .stashed_tabs
+            .get(&ids[0])
+            .expect("the outgoing connection's tabs were put away");
+        assert_eq!(
+            staged_on(put_away, "members"),
+            ["Ada Lovelace"],
+            "what was typed went with the connection it was typed on"
+        );
+        assert!(
+            staged_on(&view.tabs, "teams").is_empty(),
+            "nothing is staged against the connection that was switched to"
+        );
+    });
+}
+
+/// ⌘W counts the tab's staged changes to decide whether to ask before closing
+/// it. A value still sitting in the cell editor is not counted, so the tab it
+/// was typed into was closed without a question and the value went with it.
+#[gpui::test]
+fn closing_a_tab_counts_what_is_still_in_the_cell_editor(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "switch-close-tab");
+    two_table_tabs(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+    });
+    cx.simulate_keystrokes("cmd-w");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.items.len(), 2, "the tab is still open");
+        let guard = view.close_guard.as_ref().expect("it asked before closing");
+        assert_eq!(guard.changes, 1, "and counted the half-typed cell");
+        assert_eq!(
+            staged_on(&view.tabs, "members"),
+            ["Ada Lovelace"],
+            "what was typed is staged on the table it was typed into"
+        );
+        assert!(
+            staged_on(&view.tabs, "teams").is_empty(),
+            "and nothing is staged on the tab behind it"
+        );
+    });
+}
+
+/// The whole way through: type, switch away, work on the other tab, come
+/// back, ⌘S, and ask the file.
+///
+/// The assertions above prove the value is still staged in memory. This is
+/// what proves it is still the typed value by the time it reaches the server
+/// -- and that the box opened on the tab switched to did not write its own
+/// text into this one on the way back.
+#[gpui::test]
+fn a_cell_editor_left_open_across_a_tab_switch_still_commits(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "switch-commit");
+    let path = db.path.clone();
+    two_table_tabs(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+    });
+    cx.simulate_keystrokes("ctrl-tab");
+
+    // A second edit on the tab switched to, which is what takes the first
+    // one's place in the one editor the window has.
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Core Team");
+    });
+    cx.simulate_keystrokes("cmd-2");
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| view.collect_batch_edits().is_empty());
+
+    let after = read_back(&path, "SELECT name FROM members ORDER BY id");
+    assert_eq!(
+        after,
+        vec![vec!["Ada Lovelace".to_string()], vec!["Grace".to_string()]],
+        "what was typed before the switch is what the commit wrote"
+    );
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            staged_on(&view.tabs, "teams"),
+            ["Core Team"],
+            "and the other tab kept its own"
+        );
+    });
+}
+
+/// ⌘⇧W takes a whole connection's tabs with it, and the box open over a cell
+/// was not counted before it asked: the question never came up, and the tab
+/// set was dropped with the value still in it.
+///
+/// The other connection is open and holding a draft on the same row index,
+/// which is what made the editor left behind worse than merely lost --
+/// `commit_cell_edit` compares rows, and row 0 of the promoted connection's
+/// table looks exactly like row 0 of the one that was closed.
+#[gpui::test]
+fn closing_a_connection_counts_what_is_still_in_the_cell_editor(cx: &mut TestAppContext) {
+    let (view, cx, _first, _second) = open_two_connected(cx, "close-connection");
+    let ids: Vec<_> = view.update(cx, |view, _| {
+        view.workspace.entries().iter().map(|e| e.id()).collect()
+    });
+
+    // The connection that will be promoted, with a draft standing on row 0.
+    view.update(cx, |view, cx| {
+        view.select_connection(ids[1], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| view.select_row(0, cx));
+
+    view.update(cx, |view, cx| {
+        view.select_connection(ids[0], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+    });
+    cx.simulate_keystrokes("cmd-shift-w");
+
+    view.update(cx, |view, _| {
+        let guard = view
+            .close_guard
+            .as_ref()
+            .expect("it asked before closing the connection");
+        assert_eq!(guard.changes, 1, "and counted the half-typed cell");
+        assert_eq!(view.workspace.open_count(), 2, "nothing has closed yet");
+        assert_eq!(
+            staged_on(&view.tabs, "members"),
+            ["Ada Lovelace"],
+            "what was typed is staged on the connection it was typed on"
+        );
+        let other = view
+            .stashed_tabs
+            .get(&ids[1])
+            .expect("the other connection's tabs are put away");
+        assert!(
+            staged_on(other, "members").is_empty(),
+            "nothing is staged against the connection that would be promoted"
+        );
+    });
+
+    // Answering the question goes through with the close, and what comes
+    // forward must not inherit an editor opened over the connection that went.
+    cx.simulate_keystrokes("enter");
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.workspace.active_id(),
+            Some(ids[1]),
+            "the other connection is in front now"
+        );
+        assert!(
+            view.editing_cell.is_none(),
+            "no editor outlived the connection it was opened on"
+        );
+        assert!(
+            view.collect_batch_edits().is_empty(),
+            "and none of the closed connection's typing reached this one"
+        );
+    });
+}
+
+/// The same hazard by the route that skips the question.
+///
+/// `close_connection_tab_now` resets every other piece of cursor state the
+/// promoted connection must not inherit; `editing_cell` belongs in that list,
+/// because the box is drawn from it alone and the next thing to move the
+/// focus commits it into whatever draft is now in front.
+#[gpui::test]
+fn a_connection_closed_outright_leaves_no_editor_behind(cx: &mut TestAppContext) {
+    let (view, cx, _first, _second) = open_two_connected(cx, "close-connection-now");
+    let ids: Vec<_> = view.update(cx, |view, _| {
+        view.workspace.entries().iter().map(|e| e.id()).collect()
+    });
+
+    view.update(cx, |view, cx| {
+        view.select_connection(ids[1], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| view.select_row(0, cx));
+
+    view.update(cx, |view, cx| {
+        view.select_connection(ids[0], cx);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.close_connection_tab_now(ids[0], cx);
+    });
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, cx| {
+        assert!(
+            view.editing_cell.is_none(),
+            "the editor went with the connection it was opened on"
+        );
+        // What the next click, tab or menu would do.
+        view.finish_cell_edit(cx);
+        assert!(
+            view.collect_batch_edits().is_empty(),
+            "so there is nothing left to commit into the promoted connection"
+        );
+    });
+}
+
+/// "Close All Tabs" in the command palette closes the front tab too, and ⌘⇧P
+/// is not one of the routes that folds the editor away on the way in: the
+/// half-typed cell went uncounted, every tab closed without a question, and
+/// the value was gone.
+///
+/// The context-menu route to the same command is already safe because
+/// `open_context_menu` folds first, which is why this drives the palette.
+#[gpui::test]
+fn closing_every_tab_counts_what_is_still_in_the_cell_editor(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "close-all-tabs");
+    two_table_tabs(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+    });
+
+    cx.simulate_keystrokes("cmd-shift-p");
+    view.update(cx, |view, cx| {
+        view.palette
+            .as_mut()
+            .expect("⌘⇧P opened the command palette")
+            .query
+            .set_text("close all");
+        cx.notify();
+    });
+    cx.simulate_keystrokes("enter");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.items.len(), 2, "the tabs are still open");
+        let guard = view
+            .close_guard
+            .as_ref()
+            .expect("it asked before closing every tab");
+        assert_eq!(guard.changes, 1, "and counted the half-typed cell");
+        assert_eq!(
+            staged_on(&view.tabs, "members"),
+            ["Ada Lovelace"],
+            "what was typed is staged on the table it was typed into"
+        );
+    });
+}
+
+/// A refusal belongs to the reload that raised it.
+///
+/// Left behind by a load that landed while another tab was in front, it was
+/// still there when the post-commit reload -- the one load that does not
+/// overwrite it first -- landed on a different table, and was printed against
+/// that table instead.
+#[gpui::test]
+fn a_refusal_is_not_reported_against_another_tab(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "reload-misattributed");
+
+    for sql in [
+        "CREATE TABLE notes (body TEXT, team TEXT)",
+        "INSERT INTO notes VALUES ('one','core'), ('two','ops')",
+    ] {
+        view.update(cx, |view, cx| {
+            view.put_sql_in_editor(sql, cx);
+            view.run_query(cx);
+        });
+        settle(&view, cx, |view| {
+            view.tabs.active().and_then(|tab| tab.error()).is_none()
+        });
+    }
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    let members = view.update(cx, |view, _| view.tabs.active);
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "notes"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        type_into_draft(view, 0, "EDITED");
+        view.refresh_result(cx);
+        // Away before that reload lands, so it has no status bar of its own to
+        // reach and its complaint is dropped rather than held.
+        view.activate_tab(members, cx);
+    });
+    settle_loaded(&view, cx);
+
+    // A commit on the keyed table, whose own reload lands after it.
+    view.update(cx, |view, cx| {
+        view.begin_cell_edit(0, 1, cx);
+        view.cell_editor.set_text("Ada Lovelace");
+        view.finish_cell_edit(cx);
+    });
+    cx.simulate_keystrokes("cmd-s");
+    settle(&view, cx, |view| view.collect_batch_edits().is_empty());
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(
+            !said.contains("primary key"),
+            "the other table's refusal must not be read against this one: {said}"
+        );
+    });
+}
+
+/// A table with no primary key cannot stage anything, so the reload has
+/// nowhere to fold the draft into -- and the sidebar line saying so goes with
+/// the draft. Then it has to be said where ⌘S says it.
+#[gpui::test]
+fn a_reload_that_cannot_keep_the_draft_says_so(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "reload-keyless");
+
+    // Seeded here rather than in the shared fixture: this is the only test
+    // that needs a table dbui cannot key.
+    for sql in [
+        "CREATE TABLE notes (body TEXT, team TEXT)",
+        "INSERT INTO notes VALUES ('one','core'), ('two','ops')",
+    ] {
+        view.update(cx, |view, cx| {
+            view.put_sql_in_editor(sql, cx);
+            view.run_query(cx);
+        });
+        settle(&view, cx, |view| {
+            view.tabs.active().and_then(|tab| tab.error()).is_none()
+        });
+    }
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "notes"), cx);
+    });
+    settle_rows(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        type_into_draft(view, 0, "EDITED");
+        assert!(
+            view.collect_batch_edits().is_empty(),
+            "there is no key to stage it under -- which is the whole problem"
+        );
+        view.refresh_result(cx);
+    });
+    settle_loaded(&view, cx);
+
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(
+            said.contains("primary key"),
+            "the reload says why the typed value could not be kept: {said}"
+        );
+    });
 }
 
 /// A table dbui cannot key cannot be edited -- and ⌘S has to say so.

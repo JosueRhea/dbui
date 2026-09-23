@@ -654,11 +654,14 @@ impl DbUi {
 
         if command {
             match key {
-                "p" if shift => {
-                    self.open_palette(PaletteKind::Actions, cx);
-                    return true;
-                }
-                "p" => {
+                // ⌘P from one of the other lists is a switch the user asked
+                // for, so it goes through. ⌘P over the table list already in
+                // front of them, and ⌘⇧P over anything, do not: those are the
+                // keys people press while reaching for a palette that is
+                // already open, and rebuilding it silently threw away the
+                // query they had typed into it. Falling through hands the
+                // keystroke to the query field, which ignores ⌘.
+                "p" if !shift && kind != PaletteKind::GoToTable => {
                     self.open_palette(PaletteKind::GoToTable, cx);
                     return true;
                 }
@@ -712,7 +715,10 @@ impl DbUi {
             cx.notify();
             return true;
         }
-        if key == "enter" {
+        // Unmodified only. ⌘↵ is no longer swallowed by the `RunQuery` action
+        // while the palette is up, so it arrives here, and it must not run
+        // whichever row the palette happens to have highlighted.
+        if key == "enter" && !command {
             if kind == PaletteKind::Themes {
                 let selected = self.palette.as_ref().map(|p| p.selected).unwrap_or(0);
                 let rows = self.palette_rows(PaletteKind::Themes);

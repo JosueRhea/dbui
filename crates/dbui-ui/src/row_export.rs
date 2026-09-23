@@ -8,6 +8,7 @@
 //! shapes to disk a page at a time.
 
 use dbui_app::domain::{ColumnInfo, Driver, TableRef, Value};
+use std::collections::{HashMap, HashSet};
 
 /// What a copy produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,13 +257,16 @@ pub(crate) fn cell_text(value: &Value) -> String {
 }
 
 fn json(columns: &[ColumnInfo], values: &[Vec<Value>]) -> String {
+    // The keys are a property of the columns, not of a row, so they are built
+    // once rather than re-derived for every row of the result.
+    let keys = json_keys(columns);
     let rows: Vec<serde_json::Value> = values
         .iter()
         .map(|row| {
             let mut object = serde_json::Map::new();
-            for (index, column) in columns.iter().enumerate() {
+            for (index, key) in keys.iter().enumerate() {
                 object.insert(
-                    column.name.clone(),
+                    key.clone(),
                     row.get(index)
                         .map(json_value)
                         .unwrap_or(serde_json::Value::Null),
@@ -272,6 +276,40 @@ fn json(columns: &[ColumnInfo], values: &[Vec<Value>]) -> String {
         })
         .collect();
     serde_json::to_string_pretty(&serde_json::Value::Array(rows)).unwrap_or_default()
+}
+
+/// One JSON key per column, even when two columns share a name.
+///
+/// Column names are not unique -- `SELECT a.*, b.*` brings back two `id`s --
+/// but object keys are, so keying rows on the raw name let the second `id`
+/// overwrite the first and dropped a whole column from the export with nothing
+/// in the output to say so. TSV and INSERT both keep all of them.
+///
+/// The first column to use a name keeps it, so a result with no duplicates is
+/// exported exactly as before; later ones take `_2`, `_3`, and so on. The
+/// counter skips any name a real column already answers to, so `id, id_2, id`
+/// cannot have the disambiguated key land on top of the column it collides
+/// with.
+fn json_keys(columns: &[ColumnInfo]) -> Vec<String> {
+    let mut taken: HashSet<String> = columns.iter().map(|column| column.name.clone()).collect();
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut keys = Vec::with_capacity(columns.len());
+    for column in columns {
+        let count = seen.entry(column.name.as_str()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            keys.push(column.name.clone());
+            continue;
+        }
+        let mut suffix = *count;
+        let mut candidate = format!("{}_{suffix}", column.name);
+        while !taken.insert(candidate.clone()) {
+            suffix += 1;
+            candidate = format!("{}_{suffix}", column.name);
+        }
+        keys.push(candidate);
+    }
+    keys
 }
 
 /// Numbers stay numbers and JSON columns stay structured; everything else is
@@ -528,6 +566,76 @@ mod tests {
         let out = json(&columns(&["a"]), &[vec![Value::Null]]);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(parsed[0]["a"].is_null());
+    }
+
+    /// `SELECT a.*, b.*` where both sides have an `id` used to come back with
+    /// three keys for four columns: the second `id` overwrote the first and
+    /// `a.id` was gone, with nothing in the output to say so.
+    #[test]
+    fn json_keeps_every_column_when_two_share_a_name() {
+        let out = json(
+            &columns(&["id", "name", "id", "label"]),
+            &[vec![
+                Value::Int(1),
+                Value::Text("Ada".into()),
+                Value::Int(5),
+                Value::Text("x".into()),
+            ]],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let row = parsed[0].as_object().expect("an object per row");
+        assert_eq!(row.len(), 4, "one key per column, got: {out}");
+        assert_eq!(row["id"], serde_json::json!(1), "the first id survives");
+        assert_eq!(row["id_2"], serde_json::json!(5));
+        assert_eq!(row["name"], serde_json::json!("Ada"));
+        assert_eq!(row["label"], serde_json::json!("x"));
+    }
+
+    /// The suffix has to land on a name no column already answers to, or the
+    /// disambiguation collides exactly where it was meant to help.
+    #[test]
+    fn json_skips_a_suffix_a_real_column_already_uses() {
+        let out = json(
+            &columns(&["id", "id_2", "id"]),
+            &[vec![Value::Int(1), Value::Int(2), Value::Int(3)]],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let row = parsed[0].as_object().expect("an object per row");
+        assert_eq!(row.len(), 3, "one key per column, got: {out}");
+        assert_eq!(row["id"], serde_json::json!(1));
+        assert_eq!(
+            row["id_2"],
+            serde_json::json!(2),
+            "the real id_2 column keeps its own name"
+        );
+        assert_eq!(row["id_3"], serde_json::json!(3));
+    }
+
+    /// The three formats have to agree on how many columns a result has. TSV
+    /// and INSERT already keep all four, so JSON is pinned to the same count
+    /// rather than the other two being loosened to match it.
+    #[test]
+    fn tsv_and_inserts_keep_every_column_when_two_share_a_name() {
+        let columns = columns(&["id", "name", "id", "label"]);
+        let values = vec![vec![
+            Value::Int(1),
+            Value::Text("Ada".into()),
+            Value::Int(5),
+            Value::Text("x".into()),
+        ]];
+        assert_eq!(
+            tsv(&columns, &values),
+            "id\tname\tid\tlabel\n1\tAda\t5\tx\n"
+        );
+        assert_eq!(
+            inserts(
+                &columns,
+                &values,
+                Driver::Postgres,
+                Some(&TableRef::new("s", "t"))
+            ),
+            "INSERT INTO \"s\".\"t\" (\"id\", \"name\", \"id\", \"label\") VALUES (1, 'Ada', 5, 'x');\n"
+        );
     }
 
     #[test]

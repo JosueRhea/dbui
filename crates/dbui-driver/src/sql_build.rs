@@ -118,6 +118,12 @@ pub fn update_sql(
         let col = driver.quote_identifier(name);
         match value {
             Value::Null => sets.push(format!("{col} = NULL")),
+            // SQLite has no per-column "put the default back" syntax at all,
+            // so refusing here is what puts the reason in front of the user
+            // instead of the parser's `near "DEFAULT": syntax error`.
+            Value::Default if driver == Driver::Sqlite => {
+                return Err("SQLite cannot reset a column to its default".into());
+            }
             Value::Default => sets.push(format!("{col} = DEFAULT")),
             _ => {
                 let ph = typed_placeholder(driver, param, value);
@@ -203,7 +209,31 @@ pub fn insert_sql(
     table: &TableRef,
     values: &[(String, Value)],
 ) -> Result<BoundSql, String> {
-    if values.is_empty() {
+    let mut binds = Vec::new();
+    let mut param = 1usize;
+    let mut columns = Vec::new();
+    let mut slots = Vec::new();
+
+    for (name, value) in values {
+        match value {
+            Value::Null => slots.push("NULL".to_string()),
+            // SQLite's grammar has no `DEFAULT` in a value list, so naming the
+            // column at all is what earns `near "DEFAULT": syntax error`.
+            // Naming nothing is how SQLite lets the column's default fire.
+            Value::Default if driver == Driver::Sqlite => continue,
+            Value::Default => slots.push("DEFAULT".to_string()),
+            _ => {
+                slots.push(typed_placeholder(driver, param, value));
+                param += 1;
+                binds.push(value_to_bind(value));
+            }
+        }
+        columns.push(driver.quote_identifier(name));
+    }
+
+    // Either the caller named no columns, or SQLite's skipped every one it did
+    // name -- and an INSERT naming none is not a statement.
+    if columns.is_empty() {
         return Ok(BoundSql {
             sql: match driver {
                 // SQLite spells "all defaults" the same way Postgres does.
@@ -214,24 +244,6 @@ pub fn insert_sql(
             },
             binds: Vec::new(),
         });
-    }
-
-    let mut binds = Vec::new();
-    let mut param = 1usize;
-    let mut columns = Vec::new();
-    let mut slots = Vec::new();
-
-    for (name, value) in values {
-        columns.push(driver.quote_identifier(name));
-        match value {
-            Value::Null => slots.push("NULL".to_string()),
-            Value::Default => slots.push("DEFAULT".to_string()),
-            _ => {
-                slots.push(typed_placeholder(driver, param, value));
-                param += 1;
-                binds.push(value_to_bind(value));
-            }
-        }
     }
 
     Ok(BoundSql {
@@ -314,12 +326,21 @@ fn temporal_type(text: &str) -> &'static str {
         .next()
         .is_some_and(|head| head.matches('-').count() >= 2);
     if !has_date {
-        return if trimmed.contains(':') {
-            "time"
-        } else {
-            // Not a date and not a clock: an interval is the remaining shape
-            // this variant carries.
+        // Words, not colons, are what tell an interval from a clock: Postgres
+        // renders any interval carrying a time part with colons of its own
+        // (`1 day 02:00:00`), and casting that to `time` is `invalid input
+        // syntax for type time`. A plain clock still goes over as `time` --
+        // which Postgres casts into an interval column by itself.
+        //
+        // The letter test assumes engine-rendered text, where a zone is always
+        // a numeric offset (`10:00:00+00`, never `10:00:00 UTC`): a named zone
+        // would read as an interval and take the wrong branch. So would a
+        // non-default `IntervalStyle`, whose `sql_standard` spelling
+        // (`+1-2 +3 +4:05:06`) is letter-free and colon-bearing.
+        return if trimmed.chars().any(|c| c.is_ascii_alphabetic()) || !trimmed.contains(':') {
             "interval"
+        } else {
+            "time"
         };
     }
     if trimmed.contains(':') {
@@ -524,6 +545,15 @@ mod tests {
         assert_eq!(temporal_type("2024-01-01"), "date");
         assert_eq!(temporal_type("12:30:00"), "time");
         assert_eq!(temporal_type("1 day"), "interval");
+        // Postgres renders any interval with a time component using colons,
+        // so the colon alone cannot mean "clock". Nothing feeds these shapes
+        // in yet -- `decode.rs` has no INTERVAL arm and the grid maps typed
+        // text on a temporal cell to `Value::Text`, so the only `Temporal` the
+        // UI can make is the empty token. This is the builder being right
+        // ahead of the decoder and the grid, not a bug closed.
+        assert_eq!(temporal_type("1 day 02:03:04"), "interval");
+        assert_eq!(temporal_type("-1 day 02:03:04"), "interval");
+        assert_eq!(temporal_type("1 day 02:00:00"), "interval");
     }
 
     /// Columns the user never filled in are absent from the statement, which
@@ -633,5 +663,75 @@ mod tests {
         assert!(ok.sql.contains("\"b\" = $1"));
         assert!(ok.sql.contains("\"c\" = DEFAULT"));
         assert_eq!(ok.binds, vec![Value::Text(String::new()), Value::Int(1)]);
+    }
+
+    /// SQLite's grammar has no `DEFAULT` in a value list, so naming the column
+    /// at all is what earns `near "DEFAULT": syntax error`. Leaving it out of
+    /// both lists is how SQLite lets the column's own default fire.
+    #[test]
+    fn a_sqlite_insert_omits_a_default_column_rather_than_naming_it() {
+        let bound = insert_sql(
+            Driver::Sqlite,
+            &TableRef::new("main", "t"),
+            &[
+                ("a".into(), Value::Null),
+                ("b".into(), Value::Default),
+                ("c".into(), Value::Int(1)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            bound.sql,
+            "INSERT INTO \"main\".\"t\" (\"a\", \"c\") VALUES (NULL, ?)",
+        );
+        assert!(!bound.sql.contains("DEFAULT"), "got: {}", bound.sql);
+        assert_eq!(bound.binds, vec![Value::Int(1)]);
+    }
+
+    /// Dropping every column would leave an INSERT naming none, which is not a
+    /// statement -- the all-defaults spelling is.
+    #[test]
+    fn a_sqlite_row_of_nothing_but_defaults_falls_through_to_default_values() {
+        let bound = insert_sql(
+            Driver::Sqlite,
+            &TableRef::new("main", "t"),
+            &[("b".into(), Value::Default)],
+        )
+        .unwrap();
+        assert_eq!(bound.sql, "INSERT INTO \"main\".\"t\" DEFAULT VALUES");
+        assert!(bound.binds.is_empty());
+    }
+
+    /// SQLite has no per-column "put the default back" syntax at all, so the
+    /// only honest answer is to refuse: `SET "c" = DEFAULT` reaches the parser
+    /// as `near "DEFAULT": syntax error`, which tells the user nothing.
+    #[test]
+    fn a_sqlite_update_refuses_to_reset_a_column_to_its_default() {
+        let table = TableRef::new("main", "t");
+        let refused = update_sql(
+            Driver::Sqlite,
+            &table,
+            &[("c".into(), Value::Default)],
+            &[("id".into(), Value::Int(1))],
+        );
+        let Err(message) = refused else {
+            panic!("SQLite has no syntax for this and must not invent one");
+        };
+        assert!(
+            message.contains("default"),
+            "the refusal has to say why: {message}"
+        );
+
+        let ok = update_sql(
+            Driver::Sqlite,
+            &table,
+            &[("c".into(), Value::Null), ("d".into(), Value::Int(2))],
+            &[("id".into(), Value::Int(1))],
+        )
+        .unwrap();
+        assert_eq!(
+            ok.sql, "UPDATE \"main\".\"t\" SET \"c\" = NULL, \"d\" = ? WHERE \"id\" = ?",
+            "only DEFAULT is refused, not the rest of the statement"
+        );
     }
 }
