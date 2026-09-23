@@ -9,6 +9,7 @@ mod error;
 mod mysql;
 mod port;
 mod postgres;
+mod sessions;
 mod sql_build;
 mod sqlite;
 

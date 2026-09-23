@@ -492,6 +492,15 @@ pub struct DbUi {
     /// started them -- tab ids restart per connection -- each with the id of
     /// the run it belongs to.
     pub(crate) running: HashMap<(Option<ConnectionId>, TabId), (u64, commands::StopHandle)>,
+    /// Table page loads in flight, keyed like `running`. Kept apart from it
+    /// because Stop is about the statement the user ran; these are only ever
+    /// stopped by the tab they were loading into closing.
+    pub(crate) table_loads: HashMap<(Option<ConnectionId>, TabId), (u64, commands::StopHandle)>,
+    /// Loads and runs stopped because their tab closed, by run id. Already
+    /// let go of in `loads_in_flight` when the tab closed -- the footer has
+    /// no business saying "Loading" over a tab that is gone while the server
+    /// winds down -- so their landing must not let go of them again.
+    abandoned: HashSet<u64>,
     /// The sheet for changing a table's shape, while it is open.
     pub(crate) schema_sheet: Option<crate::components::schema_sheet::SchemaSheet>,
     /// The find / replace bar over the SQL editor, while it is open.
@@ -721,6 +730,8 @@ impl DbUi {
             column_move: None,
             tab_drag: None,
             running: HashMap::new(),
+            table_loads: HashMap::new(),
+            abandoned: HashSet::new(),
             editor_find: None,
             schema_sheet: None,
             next_run: 0,
@@ -1124,6 +1135,20 @@ impl DbUi {
         // was opened on, and commits into whatever the close brings forward.
         if index == self.tabs.active {
             self.leave_front_tab(cx);
+        }
+        // Whatever the tab was waiting on has nowhere left to land, so it is
+        // stopped rather than left to hold a connection -- and a lock, and the
+        // server's time -- until it finishes on its own.
+        if let Some(tab) = self.tabs.items.get(index) {
+            let key = (self.workspace.active_id(), tab.id());
+            for (run, handle) in [self.running.remove(&key), self.table_loads.remove(&key)]
+                .into_iter()
+                .flatten()
+            {
+                handle.stop();
+                self.abandoned.insert(run);
+                self.release_load();
+            }
         }
         self.tabs.close(index);
         self.selected_cell = None;
@@ -1851,7 +1876,7 @@ impl DbUi {
     /// The cell editor is finished first for the reason it is in
     /// `save_pending_edits`: it folds into the draft, and the draft is what is
     /// folded away here, so the other order stashes the value without it.
-    fn load_active_table(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn load_active_table(&mut self, cx: &mut Context<Self>) {
         self.finish_cell_edit(cx);
         self.stash_current_draft(cx);
         // Written on every reload, refusal or not, so a complaint answered by
@@ -1899,6 +1924,22 @@ impl DbUi {
             tab.set_error(None);
         }
 
+        // No timeout: a page load has never had one, and the connection's
+        // query timeout is a promise about the statements the user types.
+        let (stop_handle, stop) = commands::stop_signal(None);
+        let run = self.next_run;
+        self.next_run += 1;
+        let load_key = (Some(connection), tab_id);
+        // The load this one replaces -- a page turned twice, or a tab brought
+        // back to the front before its first load came in -- would only be
+        // thrown away as stale when it landed. Stopped instead: on a big
+        // table its count can run for minutes, holding a connection and the
+        // footer's "Loading" all the while.
+        if let Some((old, handle)) = self.table_loads.insert(load_key, (run, stop_handle)) {
+            handle.stop();
+            self.abandoned.insert(old);
+            self.release_load();
+        }
         let task = commands::open_table(
             &self.runtime,
             driver,
@@ -1906,10 +1947,22 @@ impl DbUi {
             page,
             where_clause.clone(),
             sort,
+            stop,
         );
         cx.spawn(async move |this, cx| {
             let landed = task.await;
             this.update(cx, |this, cx| {
+                if this
+                    .table_loads
+                    .get(&load_key)
+                    .is_some_and(|(held, _)| *held == run)
+                {
+                    this.table_loads.remove(&load_key);
+                }
+                // Its tab closed and already let go of it.
+                if this.abandoned.remove(&run) {
+                    return;
+                }
                 this.finish_tab_load(
                     connection,
                     tab_id,
@@ -2014,6 +2067,17 @@ impl DbUi {
         let is_current = in_front && self.tabs.load_is_current(tab_id, load_seq);
         let is_active = in_front && self.tabs.active_id() == Some(tab_id);
         apply(self, is_current, is_active);
+        self.release_load();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abandoned_is_empty(&self) -> bool {
+        self.abandoned.is_empty()
+    }
+
+    /// One load or run fewer in flight; the footer stops saying "busy" once
+    /// none are.
+    fn release_load(&mut self) {
         self.loads_in_flight = self.loads_in_flight.saturating_sub(1);
         if self.loads_in_flight == 0 && matches!(self.status, Status::Busy(_)) {
             self.status = Status::Idle;
@@ -2660,6 +2724,10 @@ impl DbUi {
                     .is_some_and(|(held, _)| *held == run)
                 {
                     this.running.remove(&run_key);
+                }
+                // Its tab closed and already let go of it.
+                if this.abandoned.remove(&run) {
+                    return;
                 }
                 let mut catalog_is_stale = false;
                 this.finish_tab_load(

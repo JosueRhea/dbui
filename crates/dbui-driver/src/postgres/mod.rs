@@ -5,6 +5,7 @@ mod decode;
 
 use crate::error::{DriverError, Result};
 use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
+use crate::sessions::{Lease, SessionId, Sessions};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
@@ -19,6 +20,9 @@ use std::time::{Duration, Instant};
 pub struct PostgresDriver {
     pool: PgPool,
     server_version: String,
+    /// Connections kept with their session ids, for statements that may have
+    /// to be cancelled. See `sessions`.
+    sessions: Sessions<sqlx::Postgres>,
 }
 
 impl PostgresDriver {
@@ -75,6 +79,7 @@ impl PostgresDriver {
 
         Ok(Self {
             pool,
+            sessions: Sessions::new(),
             server_version: short_version(&server_version),
         })
     }
@@ -107,6 +112,15 @@ impl PostgresDriver {
 }
 
 impl PostgresDriver {
+    /// A connection for one tracked statement, from the driver's cache of
+    /// connections whose session id is already known. See `sessions`.
+    async fn lease(&self, sql: &str) -> Result<Lease<'_, sqlx::Postgres>> {
+        self.sessions
+            .acquire(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(sql, &error))
+    }
+
     /// Single-column foreign keys on `table`, for the grid's jump arrows.
     async fn foreign_keys(&self, table: &TableRef) -> Result<Vec<ForeignKey>> {
         let rows = sqlx::query(catalog::FOREIGN_KEYS)
@@ -242,6 +256,23 @@ impl DatabaseDriver for PostgresDriver {
         where_clause: &str,
         order: &[SortKey],
     ) -> Result<ResultSet> {
+        self.table_rows_tracked(table, page, where_clause, order, &QueryToken::new())
+            .await
+    }
+
+    async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64> {
+        self.row_count_tracked(table, where_clause, &QueryToken::new())
+            .await
+    }
+
+    async fn table_rows_tracked(
+        &self,
+        table: &TableRef,
+        page: Page,
+        where_clause: &str,
+        order: &[SortKey],
+        token: &QueryToken,
+    ) -> Result<ResultSet> {
         let bound = sql_build::select_page_sql(Driver::Postgres, table, where_clause, order);
         let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
         for value in &bound.binds {
@@ -249,25 +280,36 @@ impl DatabaseDriver for PostgresDriver {
         }
         query = query.bind(page.probe_limit()).bind(page.offset as i64);
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| DriverError::query(&bound.sql, &error))?;
+        let mut lease = self.lease(&bound.sql).await?;
+        let tracking = token.track(lease.session());
+        let rows = query.fetch_all(lease.conn()).await;
+        drop(tracking);
+        lease.settle(&rows);
+        let rows = rows.map_err(|error| DriverError::query(&bound.sql, &error))?;
 
         let mut set = build_result_set(rows, page.limit as usize);
         self.backfill_columns(&mut set, &bound.sql).await;
         Ok(set)
     }
 
-    async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64> {
+    async fn row_count_tracked(
+        &self,
+        table: &TableRef,
+        where_clause: &str,
+        token: &QueryToken,
+    ) -> Result<i64> {
         let bound = sql_build::count_sql(Driver::Postgres, table, where_clause);
         // The filter is freeform text spliced into the statement, so a count
         // has no parameters of its own -- the same trust model as the editor.
         debug_assert!(bound.binds.is_empty(), "count_sql binds nothing");
-        sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()))
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|error| DriverError::query(&bound.sql, &error))
+        let mut lease = self.lease(&bound.sql).await?;
+        let tracking = token.track(lease.session());
+        let count = sqlx::query_scalar(AssertSqlSafe(bound.sql.clone()))
+            .fetch_one(lease.conn())
+            .await;
+        drop(tracking);
+        lease.settle(&count);
+        count.map_err(|error| DriverError::query(&bound.sql, &error))
     }
 
     async fn update_row(
@@ -365,36 +407,39 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
         // On a connection of its own, held for the whole statement, so the
-        // session id recorded first is the session the statement runs on.
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| DriverError::query(sql, &error))?;
-        let session: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|error| DriverError::query(sql, &error))?;
-        let _tracking = token.track(session as u64);
+        // session noted in `token` is the session the statement runs on.
+        let mut lease = self.lease(sql).await?;
+        let tracking = token.track(lease.session());
 
         let started = Instant::now();
 
-        let outcome = if query::returns_rows(sql) {
-            let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(&mut *conn)
+        enum Ran {
+            Rows(Vec<sqlx::postgres::PgRow>),
+            Affected(u64),
+        }
+        let ran = if query::returns_rows(sql) {
+            sqlx::query(AssertSqlSafe(sql.to_string()))
+                .fetch_all(lease.conn())
                 .await
-                .map_err(|error| DriverError::query(sql, &error))?;
-            // A hand-written query is shown as-is: the user asked for these
-            // rows, so no probe row is added and nothing is marked truncated.
-            let mut set = build_result_set(rows, usize::MAX);
-            self.backfill_columns(&mut set, sql).await;
-            QueryOutcome::Rows(set)
+                .map(Ran::Rows)
         } else {
-            let done = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .execute(&mut *conn)
+            sqlx::query(AssertSqlSafe(sql.to_string()))
+                .execute(lease.conn())
                 .await
-                .map_err(|error| DriverError::query(sql, &error))?;
-            QueryOutcome::Affected(done.rows_affected())
+                .map(|done| Ran::Affected(done.rows_affected()))
+        };
+        drop(tracking);
+        lease.settle(&ran);
+
+        let outcome = match ran.map_err(|error| DriverError::query(sql, &error))? {
+            Ran::Rows(rows) => {
+                // A hand-written query is shown as-is: the user asked for these
+                // rows, so no probe row is added and nothing is marked truncated.
+                let mut set = build_result_set(rows, usize::MAX);
+                self.backfill_columns(&mut set, sql).await;
+                QueryOutcome::Rows(set)
+            }
+            Ran::Affected(count) => QueryOutcome::Affected(count),
         };
 
         Ok(QueryResult {
@@ -419,6 +464,7 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn close(&self) {
+        self.sessions.close().await;
         self.pool.close().await;
     }
 }
@@ -483,5 +529,20 @@ fn bind_value<'q>(
         // Decimal, Uuid, Json and Temporal ride over as text and are cast back
         // by `sql_build::typed_placeholder`; Text needs no cast at all.
         other => query.bind(other.to_text()),
+    }
+}
+
+impl SessionId for sqlx::Postgres {
+    fn session_id(
+        conn: &mut Self::Connection,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<u64, sqlx::Error>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let session: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(conn)
+                .await?;
+            Ok(session as u64)
+        })
     }
 }

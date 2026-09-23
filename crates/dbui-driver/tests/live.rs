@@ -1225,6 +1225,88 @@ both_engines!(
     }
 );
 
+// A page load is stopped on the server the same way: the tab it was loading
+// into has closed, and the read -- here one parked on a sleep -- must not go
+// on holding a connection until it finishes by itself.
+both_engines!(
+    a_cancel_stops_a_page_load_on_the_server,
+    |fx: Fixture| async move {
+        let quoted = Driver::quote_identifier(fx.driver(), &fx.schema);
+        let sleep = match fx.driver() {
+            Driver::Postgres => "pg_sleep(30)::text",
+            _ => "SLEEP(30)",
+        };
+        fx.execute(&format!(
+            "CREATE VIEW {quoted}.sleepy AS SELECT 1 AS id, {sleep} AS slept"
+        ))
+        .await
+        .expect("create the view");
+
+        let token = dbui_driver::QueryToken::new();
+        let started = std::time::Instant::now();
+        let table = TableRef::new(fx.schema.clone(), "sleepy");
+        let load = fx.table_rows_tracked(
+            &table,
+            Page {
+                limit: 10,
+                offset: 0,
+            },
+            "",
+            &[],
+            &token,
+        );
+        let stop = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            fx.cancel(&token).await
+        };
+        let (result, told) = tokio::join!(load, stop);
+
+        assert!(told.expect("cancel"), "the server was told");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the load ended long before its 30 s: {:?}",
+            started.elapsed()
+        );
+        let _ = result;
+        fx.execute("SELECT 1").await.expect("the pool still works");
+    }
+);
+
+// A statement that can be cancelled has to know its session, and learning it
+// is a round trip. It is paid once per connection, not once per statement:
+// the next tracked statement runs on the same session, id already in hand.
+both_engines!(
+    tracked_statements_reuse_a_known_session,
+    |fx: Fixture| async move {
+        let ask = match fx.driver() {
+            Driver::Postgres => "SELECT pg_backend_pid()",
+            _ => "SELECT CONNECTION_ID()",
+        };
+        let session = |result: dbui_domain::QueryResult| match result.outcome {
+            QueryOutcome::Rows(set) => set.rows[0].0[0].to_text(),
+            other => panic!("expected a row, got {other:?}"),
+        };
+        let token = dbui_driver::QueryToken::new();
+        let first = session(fx.execute_tracked(ask, &token).await.expect("first"));
+        let second = session(fx.execute_tracked(ask, &token).await.expect("second"));
+        assert_eq!(
+            first, second,
+            "the second ran on the session the first left"
+        );
+
+        // A server-side error leaves the connection fit to keep.
+        let broken = fx
+            .execute_tracked("SELECT * FROM no_such_table", &token)
+            .await;
+        assert!(broken.is_err());
+        let third = session(fx.execute_tracked(ask, &token).await.expect("third"));
+        assert_eq!(
+            first, third,
+            "an error the server sent does not cost the connection"
+        );
+    }
+);
+
 // Changing a table's shape, end to end, with the statements the structure
 // editor shows before it runs them.
 both_engines!(

@@ -57,6 +57,33 @@ pub trait DatabaseDriver: Send + Sync {
     /// Total rows matching the same WHERE as [`table_rows`].
     async fn row_count(&self, table: &TableRef, where_clause: &str) -> Result<i64>;
 
+    /// [`table_rows`](Self::table_rows), tracked in `token` the way
+    /// [`execute_tracked`](Self::execute_tracked) is, so a page load can be
+    /// stopped on the server too. The default runs it untracked.
+    async fn table_rows_tracked(
+        &self,
+        table: &TableRef,
+        page: Page,
+        where_clause: &str,
+        order: &[SortKey],
+        token: &QueryToken,
+    ) -> Result<ResultSet> {
+        let _ = token;
+        self.table_rows(table, page, where_clause, order).await
+    }
+
+    /// [`row_count`](Self::row_count), tracked in `token`. A `COUNT(*)` over
+    /// a large table is as often the slow half of a page load as the page is.
+    async fn row_count_tracked(
+        &self,
+        table: &TableRef,
+        where_clause: &str,
+        token: &QueryToken,
+    ) -> Result<i64> {
+        let _ = token;
+        self.row_count(table, where_clause).await
+    }
+
     /// Apply a whole batch of edits and deletions in one transaction.
     ///
     /// This is the primitive every write goes through: an editor that stages

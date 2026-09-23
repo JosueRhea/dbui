@@ -6059,6 +6059,113 @@ fn closing_a_tab_holding_changes_asks_first(cx: &mut TestAppContext) {
     });
 }
 
+/// A tab that closes while it is loading, or while a statement it ran is
+/// still out, stops that work instead of leaving it to run to the end.
+#[gpui::test]
+fn closing_a_tab_stops_what_it_was_waiting_on(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 2);
+
+    view.update(cx, |view, cx| {
+        let key = (view.workspace.active_id(), view.tabs.active_id().unwrap());
+        let (load_handle, load) = dbui_app::commands::stop_signal(None);
+        let (run_handle, run) = dbui_app::commands::stop_signal(None);
+        view.table_loads.insert(key, (1_000, load_handle));
+        view.running.insert(key, (1_001, run_handle));
+
+        view.close_tab(0, cx);
+
+        assert!(view.tabs.items.is_empty(), "the tab closed");
+        assert!(load.is_stopped(), "its page load was stopped");
+        assert!(run.is_stopped(), "and so was its run");
+        assert!(view.table_loads.is_empty() && view.running.is_empty());
+    });
+}
+
+/// The bug: a tab closed mid-load left the footer saying "Loading …" for
+/// good, over a tab that was no longer there.
+#[gpui::test]
+fn closing_a_loading_tab_does_not_leave_the_footer_loading(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "close-mid-load");
+    let driver = view.update(cx, |view, _| view.workspace.active_driver().unwrap());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(driver.execute(
+            "CREATE VIEW endless AS WITH RECURSIVE n(i) AS \
+             (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT i FROM n LIMIT 5000000000",
+        ))
+        .expect("create the view");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "endless"), cx);
+    });
+    // Long enough for the load to be out on the endless count.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        assert!(matches!(view.status, Status::Busy(_)), "it is loading");
+        view.close_tab(view.tabs.active, cx);
+        // At once, not when the server gets round to stopping it.
+        assert!(
+            !matches!(view.status, Status::Busy(_)),
+            "the footer lets go as the tab closes: {}",
+            describe(&view.status)
+        );
+    });
+
+    settle(&view, cx, |view| view.loads_in_flight == 0);
+    view.update(cx, |view, _| {
+        assert_eq!(view.loads_in_flight, 0, "the stopped load came back");
+        assert!(
+            !matches!(view.status, Status::Busy(_)),
+            "and the footer let go of it: {}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// A load replaced by a newer one on the same tab -- the tab left and brought
+/// back before its rows came in -- is stopped, not left running behind the
+/// new one with the footer stuck on it.
+#[gpui::test]
+fn a_replaced_load_does_not_keep_the_footer_loading(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "replaced-load");
+    let driver = view.update(cx, |view, _| view.workspace.active_driver().unwrap());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(driver.execute(
+            "CREATE VIEW endless AS WITH RECURSIVE n(i) AS \
+             (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT i FROM n LIMIT 5000000000",
+        ))
+        .expect("create the view");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "endless"), cx);
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        assert_eq!(view.loads_in_flight, 1, "the first load is out");
+        // Brought back to the front with no rows yet: a second load.
+        view.load_active_table(cx);
+        assert_eq!(view.loads_in_flight, 1, "the first one was let go of");
+        view.close_tab(view.tabs.active, cx);
+        assert!(
+            !matches!(view.status, Status::Busy(_)),
+            "{}",
+            describe(&view.status)
+        );
+    });
+    settle(&view, cx, |view| view.abandoned_is_empty());
+    view.update(cx, |view, _| {
+        assert!(view.abandoned_is_empty(), "both stopped loads came back");
+        assert_eq!(view.loads_in_flight, 0);
+    });
+}
+
 /// Answering "keep open" leaves the tab and the batch exactly as they were.
 #[gpui::test]
 fn keeping_a_tab_open_keeps_its_batch(cx: &mut TestAppContext) {
