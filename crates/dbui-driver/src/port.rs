@@ -7,8 +7,10 @@
 use crate::error::Result;
 use async_trait::async_trait;
 use dbui_domain::{
-    Catalog, Column, Driver, Page, QueryResult, ResultSet, SortKey, TableRef, Value,
+    Catalog, Column, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef, Value,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A live connection to one server.
 ///
@@ -31,6 +33,12 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// The columns of one table, in declaration order.
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>>;
+
+    /// One table's indexes, by name, each with its columns in index order.
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {
+        let _ = table;
+        Ok(Vec::new())
+    }
 
     /// One page of a table's rows.
     ///
@@ -82,8 +90,101 @@ pub trait DatabaseDriver: Send + Sync {
     /// Run one statement as typed by the user.
     async fn execute(&self, sql: &str) -> Result<QueryResult>;
 
+    /// [`execute`](Self::execute), leaving in `token` what [`cancel`] needs
+    /// to stop it from elsewhere while it runs.
+    ///
+    /// The default runs it untracked, for an engine with nothing to record.
+    ///
+    /// [`cancel`]: Self::cancel
+    async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
+        let _ = token;
+        self.execute(sql).await
+    }
+
+    /// Ask the server to stop the statement `token` is tracking.
+    ///
+    /// Dropping the future that awaits a query does not stop it: the server
+    /// keeps working -- or keeps waiting on the lock it is stuck behind --
+    /// until it next tries to write to a socket that may be minutes away.
+    /// This reaches the server on a connection of its own and tells it.
+    ///
+    /// `Ok(true)` when the server was told, and the statement will now end
+    /// by itself, with an error. `Ok(false)` when there was nothing to tell:
+    /// a statement not yet started or already finished, or an engine that
+    /// runs in-process and stops when its future is dropped -- which is then
+    /// the caller's job.
+    async fn cancel(&self, token: &QueryToken) -> Result<bool> {
+        let _ = token;
+        Ok(false)
+    }
+
     /// Close the pool. Idempotent.
     async fn close(&self);
+}
+
+/// A statement in flight, as seen from outside it.
+///
+/// Holds the server's id for the session the statement runs on -- a
+/// Postgres backend pid, a MySQL connection id -- once
+/// [`DatabaseDriver::execute_tracked`] has learned it. Cloned to whoever may
+/// want to stop it.
+#[derive(Debug, Clone, Default)]
+pub struct QueryToken {
+    session: Arc<Mutex<Option<u64>>>,
+    /// Set by a cancel on an engine that stops a statement from inside --
+    /// SQLite, whose progress handler reads it between steps.
+    interrupted: Arc<AtomicBool>,
+}
+
+impl QueryToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note the session the statement is about to run on, for as long as the
+    /// returned guard lives.
+    ///
+    /// The guard forgets it again on drop -- when the statement finishes, and
+    /// just as much when its future is dropped mid-run. The connection goes
+    /// back to the pool after that, and a late cancel aimed at the session
+    /// would stop whatever it ran next instead.
+    pub(crate) fn track(&self, session: u64) -> Tracking<'_> {
+        if let Ok(mut slot) = self.session.lock() {
+            *slot = Some(session);
+        }
+        Tracking(self)
+    }
+
+    /// The server session the statement is running on, once known.
+    pub fn session(&self) -> Option<u64> {
+        self.session.lock().ok().and_then(|slot| *slot)
+    }
+
+    pub(crate) fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the statement this tracks should stop now: it is still
+    /// running, and it has been told to.
+    ///
+    /// Both, not just the flag. A statement whose future was dropped leaves
+    /// SQLite's progress handler installed on the connection until the next
+    /// tracked run replaces it, and that handler must not go on stopping
+    /// whatever runs there next.
+    pub(crate) fn should_stop(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst) && self.session().is_some()
+    }
+}
+
+/// See [`QueryToken::track`].
+pub(crate) struct Tracking<'a>(&'a QueryToken);
+
+impl Drop for Tracking<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.0.session.lock() {
+            *slot = None;
+        }
+    }
 }
 
 /// One pending row change for [`DatabaseDriver::apply_changes`].
@@ -138,4 +239,29 @@ impl RowBatch {
     pub fn len(&self) -> usize {
         self.inserts.len() + self.updates.len() + self.deletes.len()
     }
+}
+
+/// Fold one-row-per-column index listings into [`Index`]es, keeping the
+/// order the rows came in -- by index, then by position in it.
+pub(crate) fn group_indexes(rows: Vec<(String, bool, bool, Option<String>)>) -> Vec<Index> {
+    let mut indexes: Vec<Index> = Vec::new();
+    for (name, unique, primary, column) in rows {
+        let index = match indexes.iter_mut().position(|index| index.name == name) {
+            Some(at) => &mut indexes[at],
+            None => {
+                indexes.push(Index {
+                    name,
+                    columns: Vec::new(),
+                    unique,
+                    primary,
+                });
+                indexes.last_mut().expect("just pushed")
+            }
+        };
+        // An expression index has no column to name for that part.
+        if let Some(column) = column {
+            index.columns.push(column);
+        }
+    }
+    indexes
 }

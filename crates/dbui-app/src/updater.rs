@@ -5,10 +5,16 @@
 //! verifies it into a staging directory, and [`install`] swaps the bundle and
 //! relaunches. Nothing happens without the user saying so except the check.
 //!
-//! The security boundary is [`install`]: it refuses any bundle that is not
-//! signed and notarized by the same team as the copy that is running. A
-//! download over TLS from a URL that redirects wherever GitHub likes is not on
-//! its own a reason to execute what comes back.
+//! The security boundary is [`install`]: it refuses any bundle that does not
+//! satisfy the running copy's designated requirement -- in practice, that is
+//! not signed by the same certificate. A download over TLS from a URL that
+//! redirects wherever GitHub likes is not on its own a reason to execute what
+//! comes back.
+//!
+//! Releases are signed with a self-signed certificate, not a Developer ID, so
+//! they are not notarized and Gatekeeper would reject them. That only matters
+//! for a browser download: this module fetches with reqwest, which sets no
+//! quarantine attribute, so a bundle swapped in here launches without a prompt.
 //!
 //! macOS only for now. Every other target compiles to "no updates available",
 //! which is the truthful answer until there is something to update *to*.
@@ -39,7 +45,7 @@ pub enum UpdateError {
     NoAsset { tag: String, suffix: String },
     #[error("The download did not match its published checksum")]
     Checksum,
-    #[error("The downloaded app is not signed by the team that built this one")]
+    #[error("The downloaded app is not signed by the certificate that signed this one")]
     Signature(String),
     #[error("dbui is not running from an installed .app bundle")]
     NotBundled,
@@ -327,8 +333,8 @@ async fn fetch_and_stage(update: Update) -> Result<Staged, UpdateError> {
     std::fs::write(&zip, &bytes).map_err(|e| UpdateError::Io(e.to_string()))?;
 
     // `ditto -x -k` rather than `unzip`: it is what created the archive, and it
-    // is the only extractor that restores the bundle's extended attributes --
-    // including the stapled notarization ticket.
+    // restores the bundle's symlinks and extended attributes intact, which the
+    // code signature depends on.
     run("/usr/bin/ditto", &["-x", "-k", path(&zip)?, path(&dir)?])?;
     let _ = std::fs::remove_file(&zip);
 
@@ -384,10 +390,14 @@ pub fn install(staged: &Staged) -> Result<std::convert::Infallible, UpdateError>
     std::process::exit(0);
 }
 
-/// Refuse anything not signed and notarized by the team that signed us.
+/// Refuse anything not signed by the certificate that signed us.
 ///
-/// `spctl` is the same assessment Gatekeeper runs, so this is the check a user
-/// would get on first open -- done before the swap instead of after.
+/// The running copy's designated requirement is what macOS itself uses to
+/// decide "is this the same app" -- for a certificate-signed build it reads
+/// `identifier "com.gzenit.dbui" and certificate root = H"<cert hash>"`. A
+/// bundle that satisfies it was signed with the same private key, which only
+/// the release machine holds. A valid signature on its own is not enough: it
+/// only says *somebody* signed it.
 fn verify_bundle(app: &Path) -> Result<(), UpdateError> {
     run(
         "/usr/bin/codesign",
@@ -395,42 +405,46 @@ fn verify_bundle(app: &Path) -> Result<(), UpdateError> {
     )
     .map_err(|e| UpdateError::Signature(format!("codesign rejected it: {e}")))?;
 
+    let requirement = designated_requirement(&installed_app()?)?;
     run(
-        "/usr/sbin/spctl",
-        &["--assess", "--type", "execute", path(app)?],
+        "/usr/bin/codesign",
+        &[
+            "--verify",
+            "--deep",
+            "--strict",
+            &format!("-R={requirement}"),
+            path(app)?,
+        ],
     )
-    .map_err(|e| UpdateError::Signature(format!("Gatekeeper rejected it: {e}")))?;
-
-    // A valid Developer ID signature is not enough on its own -- it only says
-    // *somebody* signed it. Require the same team as the running copy.
-    let ours = team_identifier(&installed_app()?)?;
-    let theirs = team_identifier(app)?;
-    if ours != theirs {
-        return Err(UpdateError::Signature(format!(
-            "signed by team {theirs}, expected {ours}"
-        )));
-    }
-    Ok(())
+    .map_err(|e| UpdateError::Signature(format!("signed by a different certificate: {e}")))
 }
 
-fn team_identifier(app: &Path) -> Result<String, UpdateError> {
+fn designated_requirement(app: &Path) -> Result<String, UpdateError> {
     let out = std::process::Command::new("/usr/bin/codesign")
-        .args(["-dv", "--verbose=4"])
+        .args(["-d", "-r-"])
         .arg(app)
         .output()
         .map_err(|e| UpdateError::Signature(e.to_string()))?;
-    // codesign writes its report to stderr.
-    let text = String::from_utf8_lossy(&out.stderr);
-    find_team_identifier(&text)
-        .ok_or_else(|| UpdateError::Signature("no TeamIdentifier in the signature".into()))
+    // codesign writes the requirement to stdout on some releases and stderr on
+    // others; look in both.
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    find_designated_requirement(&text).ok_or_else(|| {
+        UpdateError::Signature("this copy has no certificate signature to match against".into())
+    })
 }
 
-fn find_team_identifier(report: &str) -> Option<String> {
+fn find_designated_requirement(report: &str) -> Option<String> {
     report.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("TeamIdentifier=")
-            .filter(|id| !id.is_empty() && *id != "not set")
-            .map(str::to_string)
+        let requirement = line.split_once("designated => ")?.1.trim();
+        // An ad-hoc signature's requirement is its own hash, which no other
+        // build can satisfy. Refuse it by name rather than let it fail as a
+        // confusing mismatch -- and never treat it as an identity.
+        (requirement.contains("certificate") || requirement.contains("anchor"))
+            .then(|| requirement.to_string())
     })
 }
 
@@ -603,18 +617,26 @@ mod tests {
     }
 
     #[test]
-    fn the_team_identifier_is_read_out_of_codesigns_report() {
+    fn the_designated_requirement_is_read_out_of_codesigns_report() {
         let report = "\
 Executable=/Applications/dbui.app/Contents/MacOS/dbui
-Identifier=com.gzenit.dbui
-TeamIdentifier=D7HN42D467
-Sealed Resources version=2
+designated => identifier \"com.gzenit.dbui\" and certificate root = H\"d828fa3afb4d6c5d520e2294a4141544116c36f1\"
 ";
-        assert_eq!(find_team_identifier(report).as_deref(), Some("D7HN42D467"));
-        // An ad-hoc signature reports this literally; it must not be accepted
-        // as a team, or any locally-signed bundle would pass the check.
-        assert!(find_team_identifier("TeamIdentifier=not set").is_none());
-        assert!(find_team_identifier("no signature here").is_none());
+        assert_eq!(
+            find_designated_requirement(report).as_deref(),
+            Some(
+                "identifier \"com.gzenit.dbui\" and certificate root = \
+                 H\"d828fa3afb4d6c5d520e2294a4141544116c36f1\""
+            )
+        );
+        // An ad-hoc signature's requirement is its own hash. It must not be
+        // accepted as an identity: no future build can match it, and a check
+        // that "passes" against it would mean the check is broken.
+        assert!(find_designated_requirement(
+            "# designated => cdhash H\"822e5628755a80e91213597c65b06dd299bc3a42\""
+        )
+        .is_none());
+        assert!(find_designated_requirement("no signature here").is_none());
     }
 
     #[test]

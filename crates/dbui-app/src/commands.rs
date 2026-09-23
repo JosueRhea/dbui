@@ -7,11 +7,13 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ConnectionConfig, Page, QueryOutcome, QueryResult, ResultSet, SortKey,
-    TableKind, TableRef, Value,
+    Catalog, Column, ColumnInfo, ConnectionConfig, Index, Page, QueryOutcome, QueryResult,
+    ResultSet, SortKey, TableKind, TableRef, Value,
 };
-use dbui_driver::{DatabaseDriver, DriverError, RowBatch, RowUpdate};
+use dbui_driver::{DatabaseDriver, DriverError, QueryToken, RowBatch, RowUpdate};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
 
 pub type Outcome<T> = Result<T, DriverError>;
 
@@ -67,6 +69,81 @@ pub fn open_table(
             columns,
             total_rows,
         })
+    })
+}
+
+/// Where an export's rows go, a page at a time.
+///
+/// The app layer reads; the UI decides what the file looks like. Errors are
+/// already worded for the status bar.
+pub trait PageSink: Send + 'static {
+    fn page(&mut self, columns: &[ColumnInfo], rows: Vec<Vec<Value>>) -> Result<(), String>;
+    fn finish(&mut self) -> Result<(), String>;
+}
+
+/// How many rows an export reads per round trip: enough that the round trips
+/// are not the cost, few enough that a wide table's page is not the problem.
+const EXPORT_PAGE: u32 = 5_000;
+
+/// Read every row of `table` that `where_clause` matches, in `sort` order,
+/// and hand them to `sink` as they arrive. Resolves to how many were read.
+///
+/// Paged by the same ordering the grid uses -- the sort, then the key -- so no
+/// row is read twice or skipped between pages. A table with neither key nor
+/// sort has no order that holds still between reads, so it is read in one go
+/// instead: slower to start, but it is every row exactly once.
+pub fn export_table(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+    where_clause: String,
+    sort: Option<SortKey>,
+    mut sink: impl PageSink,
+) -> Task<Result<u64, String>> {
+    runtime.spawn(async move {
+        let columns = driver.columns(&table).await.unwrap_or_default();
+        let keys = key_columns(&columns);
+        let order = dbui_domain::order_for(sort.as_ref(), &keys);
+        let stable = sort.is_some() || !keys.is_empty();
+        let limit = if stable { EXPORT_PAGE } else { u32::MAX - 1 };
+
+        let mut offset = 0u64;
+        let mut read = 0u64;
+        loop {
+            let set = driver
+                .table_rows(&table, Page { limit, offset }, &where_clause, &order)
+                .await
+                .map_err(|error| error.to_string())?;
+            let count = set.rows.len() as u64;
+            let more = set.truncated;
+            sink.page(
+                &set.columns,
+                set.rows.into_iter().map(|row| row.0).collect(),
+            )?;
+            read += count;
+            offset += count;
+            if !more || count == 0 {
+                break;
+            }
+        }
+        sink.finish()?;
+        Ok(read)
+    })
+}
+
+/// Write rows already in hand -- a query's result -- through a sink, off the
+/// UI thread.
+pub fn export_rows(
+    runtime: &DbRuntime,
+    columns: Vec<ColumnInfo>,
+    rows: Vec<Vec<Value>>,
+    mut sink: impl PageSink,
+) -> Task<Result<u64, String>> {
+    runtime.spawn(async move {
+        let count = rows.len() as u64;
+        sink.page(&columns, rows)?;
+        sink.finish()?;
+        Ok(count)
     })
 }
 
@@ -157,13 +234,117 @@ pub fn drop_relation(
     runtime.spawn(async move { driver.execute(&sql).await })
 }
 
+/// How a run in progress can be ended early: by the user, or by the clock.
+///
+/// Made alongside the [`StopHandle`] the UI keeps, and handed to the run.
+pub struct Stop {
+    signal: watch::Receiver<bool>,
+    /// The connection's query timeout, per statement. `None` waits for ever.
+    timeout: Option<Duration>,
+}
+
+/// The UI's end of a [`Stop`]: pressing Stop is [`StopHandle::stop`].
+///
+/// Dropping it stops nothing -- a tab closed mid-run lets the run finish --
+/// so it is safe to let go of without a second thought.
+pub struct StopHandle(watch::Sender<bool>);
+
+impl StopHandle {
+    pub fn stop(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+/// A fresh stop signal for one run.
+pub fn stop_signal(timeout: Option<Duration>) -> (StopHandle, Stop) {
+    let (sender, signal) = watch::channel(false);
+    (StopHandle(sender), Stop { signal, timeout })
+}
+
+/// How long a told-off statement gets to wind down on its own before it is
+/// dropped. A cancelled Postgres or MySQL statement ends with an error of its
+/// own a moment after being told; waiting for that hands the connection back
+/// to the pool clean instead of mid-conversation.
+const WIND_DOWN: Duration = Duration::from_secs(3);
+
+/// Run one statement, ending it early if `stop` fires or its timeout runs
+/// out -- on the server as well as here.
+async fn run_stoppable(
+    driver: &dyn DatabaseDriver,
+    sql: &str,
+    stop: &mut Stop,
+) -> Outcome<QueryResult> {
+    let token = QueryToken::new();
+    let run = driver.execute_tracked(sql, &token);
+    tokio::pin!(run);
+
+    let pressed = async {
+        // A dropped handle is not a press: the run goes on to its end.
+        if stop.signal.wait_for(|stopped| *stopped).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let expired = async {
+        match stop.timeout {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+
+    let why = tokio::select! {
+        result = &mut run => return result,
+        _ = pressed => DriverError::Cancelled { statement: sql.to_string() },
+        _ = expired => DriverError::TimedOut {
+            statement: sql.to_string(),
+            seconds: stop.timeout.map(|limit| limit.as_secs()).unwrap_or_default(),
+        },
+    };
+
+    // Told on the server, it ends by itself; wait for that. Not told --
+    // SQLite, or the telling failed -- dropping `run` is what stops it.
+    if matches!(driver.cancel(&token).await, Ok(true)) {
+        let _ = tokio::time::timeout(WIND_DOWN, &mut run).await;
+    }
+    Err(why)
+}
+
 /// Run the statement in the editor.
 pub fn run_query(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
     sql: String,
+    mut stop: Stop,
 ) -> Task<Outcome<QueryResult>> {
-    runtime.spawn(async move { driver.execute(&sql).await })
+    runtime.spawn(async move { run_stoppable(driver.as_ref(), &sql, &mut stop).await })
+}
+
+/// One table's indexes, for the structure pane.
+pub fn fetch_indexes(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    table: TableRef,
+) -> Task<Outcome<Vec<Index>>> {
+    runtime.spawn(async move { driver.indexes(&table).await })
+}
+
+/// Run the statements a structure change is made of, in order, stopping at
+/// the first that fails. Resolves to how many ran.
+///
+/// Not in a transaction: MySQL commits DDL implicitly, so wrapping it would
+/// promise an all-or-nothing that one of the three engines cannot keep. A
+/// change is usually one statement anyway; when it is several, the error
+/// says which one stopped it.
+pub fn run_ddl(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    statements: Vec<String>,
+) -> Task<Outcome<usize>> {
+    runtime.spawn(async move {
+        for sql in &statements {
+            driver.execute(sql).await?;
+        }
+        Ok(statements.len())
+    })
 }
 
 /// Load columns for one table (SQL autocomplete cache).
@@ -189,6 +370,7 @@ pub fn run_queries(
     runtime: &DbRuntime,
     driver: Arc<dyn DatabaseDriver>,
     statements: Vec<String>,
+    mut stop: Stop,
 ) -> Task<Outcome<BatchQueryResult>> {
     runtime.spawn(async move {
         let attempted = statements.len();
@@ -198,7 +380,9 @@ pub fn run_queries(
         let mut failure = None;
 
         for sql in statements {
-            match driver.execute(&sql).await {
+            // Each statement gets the whole timeout, and a Stop ends the
+            // batch where it is: what already ran stays in the results.
+            match run_stoppable(driver.as_ref(), &sql, &mut stop).await {
                 Ok(result) => {
                     total_elapsed += result.stats.elapsed;
                     if matches!(result.outcome, QueryOutcome::Rows(_)) {
@@ -276,4 +460,174 @@ pub fn test_connection(runtime: &DbRuntime, config: ConnectionConfig) -> Task<Ou
 /// Close a pool without blocking the UI on it.
 pub fn disconnect(runtime: &DbRuntime, driver: Arc<dyn DatabaseDriver>) -> Task<()> {
     runtime.spawn(async move { driver.close().await })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbui_domain::{ConnectionConfig, Driver};
+
+    const RUNAWAY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+                           SELECT count(*) FROM (SELECT i FROM n LIMIT 5000000000)";
+
+    /// A SQLite file of its own, deleted on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    async fn sqlite(name: &str) -> (Scratch, Arc<dyn DatabaseDriver>) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("dbui-commands-{}-{name}.db", std::process::id()));
+        std::fs::File::create(&path).expect("create the database file");
+        let mut config = ConnectionConfig::new(Driver::Sqlite);
+        config.database = path.to_string_lossy().to_string();
+        let driver = dbui_driver::connect(&config).await.expect("connect");
+        (Scratch(path), driver)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_ends_a_run_as_cancelled() {
+        let (_file, driver) = sqlite("stop").await;
+        let (handle, mut stop) = stop_signal(None);
+
+        let started = std::time::Instant::now();
+        let run = run_stoppable(driver.as_ref(), RUNAWAY, &mut stop);
+        let press = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            handle.stop();
+        };
+        let (result, ()) = tokio::join!(run, press);
+
+        assert!(
+            matches!(result, Err(DriverError::Cancelled { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        driver
+            .execute("SELECT 1")
+            .await
+            .expect("the connection is free");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timeout_stops_a_run_by_itself() {
+        let (_file, driver) = sqlite("timeout").await;
+        let (_handle, mut stop) = stop_signal(Some(Duration::from_millis(300)));
+
+        let result = run_stoppable(driver.as_ref(), RUNAWAY, &mut stop).await;
+
+        assert!(
+            matches!(result, Err(DriverError::TimedOut { .. })),
+            "{result:?}"
+        );
+        driver
+            .execute("SELECT 1")
+            .await
+            .expect("the connection is free");
+    }
+
+    /// Letting go of the handle -- the tab closed mid-run -- is not a Stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_handle_lets_the_run_finish() {
+        let (_file, driver) = sqlite("dropped").await;
+        let (handle, mut stop) = stop_signal(None);
+        drop(handle);
+
+        let result = run_stoppable(driver.as_ref(), "SELECT 42", &mut stop).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// Collects what an export hands it.
+    struct Collect(std::sync::Arc<std::sync::Mutex<(Vec<i64>, usize, bool)>>);
+
+    impl PageSink for Collect {
+        fn page(&mut self, _: &[ColumnInfo], rows: Vec<Vec<Value>>) -> Result<(), String> {
+            let mut seen = self.0.lock().unwrap();
+            seen.1 += 1;
+            for row in rows {
+                if let Some(Value::Int(id)) = row.first() {
+                    seen.0.push(*id);
+                }
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<(), String> {
+            self.0.lock().unwrap().2 = true;
+            Ok(())
+        }
+    }
+
+    async fn export_all(
+        driver: Arc<dyn DatabaseDriver>,
+        table: &str,
+    ) -> (u64, Vec<i64>, usize, bool) {
+        let runtime = DbRuntime::new().expect("runtime");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0, false)));
+        let read = export_table(
+            &runtime,
+            driver,
+            TableRef::new("main", table),
+            String::new(),
+            None,
+            Collect(seen.clone()),
+        )
+        .await
+        .expect("the task ran")
+        .expect("the export worked");
+        let (ids, pages, finished) = seen.lock().unwrap().clone();
+        // A runtime cannot be dropped from inside another one's async
+        // context; letting it go on a blocking thread is allowed.
+        tokio::task::spawn_blocking(move || drop(runtime))
+            .await
+            .unwrap();
+        (read, ids, pages, finished)
+    }
+
+    /// More rows than one page: every one of them, once, in key order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keyed_table_exports_across_pages_without_gaps_or_repeats() {
+        let (_file, driver) = sqlite("export-keyed").await;
+        driver
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        driver
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12345) \
+                 INSERT INTO t SELECT i FROM n",
+            )
+            .await
+            .unwrap();
+
+        let (read, ids, pages, finished) = export_all(driver, "t").await;
+        assert_eq!(read, 12_345);
+        assert_eq!(ids, (1..=12_345).collect::<Vec<i64>>());
+        assert_eq!(pages, 3, "5000 + 5000 + 2345");
+        assert!(finished);
+    }
+
+    /// No key and no sort: no order holds still between pages, so it is read
+    /// in one go -- and still every row exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keyless_table_exports_in_one_read() {
+        let (_file, driver) = sqlite("export-keyless").await;
+        driver.execute("CREATE TABLE t (n INTEGER)").await.unwrap();
+        driver
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 7000) \
+                 INSERT INTO t SELECT i FROM n",
+            )
+            .await
+            .unwrap();
+
+        let (read, mut ids, pages, _) = export_all(driver, "t").await;
+        assert_eq!(read, 7_000);
+        assert_eq!(pages, 1);
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=7_000).collect::<Vec<i64>>());
+    }
 }

@@ -6,7 +6,7 @@
 //! sidebar, and closed by anything else the user does. Nothing here owns state
 //! of its own.
 
-use super::{button, caption};
+use super::{button, caption, motion};
 use crate::components::close_guard::TabScope;
 use crate::root::{DbUi, Focus, Status};
 use crate::row_export::RowFormat;
@@ -67,6 +67,7 @@ pub enum MenuAction {
     CloseOtherTabs,
     CloseTabsToRight,
     CloseAllTabs,
+    NewTable,
 }
 
 impl MenuAction {
@@ -223,6 +224,10 @@ fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
             MenuRow::Item {
                 action: MenuAction::CopyName,
                 label: "Copy Name".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::NewTable,
+                label: "New Table…".into(),
             },
             MenuRow::Separator,
             MenuRow::Item {
@@ -397,6 +402,10 @@ impl DbUi {
             (ContextTarget::Schema { connection, name }, MenuAction::ToggleSchema) => {
                 let (connection, name) = (*connection, name.clone());
                 self.toggle_schema(connection, &name, cx);
+            }
+            (ContextTarget::Schema { name, .. }, MenuAction::NewTable) => {
+                let schema = name.clone();
+                self.create_table_sheet(Some(schema), cx);
             }
             (ContextTarget::Schema { name, .. }, MenuAction::CopyName) => {
                 self.copy_to_clipboard(name.clone(), "Schema name copied", cx);
@@ -758,42 +767,45 @@ impl DbUi {
         Some(
             // A full-window catcher: clicking anywhere else dismisses, which is
             // what every other menu on the platform does.
-            div()
-                .id("context-menu-scrim")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                        this.close_context_menu(cx)
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                        this.close_context_menu(cx)
-                    }),
-                )
-                .child(
-                    div()
-                        .id("context-menu")
-                        .absolute()
-                        .left(px(left))
-                        .top(px(top))
-                        .w(px(MENU_WIDTH))
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme.elevated)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_md()
-                        .text_size(metrics::text_size())
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .children(children),
-                )
-                .into_any_element(),
+            motion::fade(
+                "context-menu-in",
+                div()
+                    .id("context-menu-scrim")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.close_context_menu(cx)
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.close_context_menu(cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("context-menu")
+                            .absolute()
+                            .left(px(left))
+                            .top(px(top))
+                            .w(px(MENU_WIDTH))
+                            .py_1()
+                            .rounded_md()
+                            .bg(theme.elevated)
+                            .border_1()
+                            .border_color(theme.border)
+                            .shadow_md()
+                            .text_size(metrics::text_size())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .children(children),
+                    ),
+            )
+            .into_any_element(),
         )
     }
 
@@ -831,76 +843,83 @@ impl DbUi {
         };
 
         Some(
-            div()
-                .id("confirm-scrim")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .justify_center()
-                // Without this the panel stretches to the full height of the
-                // window instead of hugging its own text.
-                .items_start()
-                .pt(metrics::scaled(140.))
-                .bg(scrim)
-                // Modal to the pointer as well as to the keyboard: the surfaces
-                // underneath stay visible, but a click cannot reach them. This
-                // was how a right-click still opened the tree's menu behind an
-                // unanswered "drop this table".
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .id("confirm-panel")
-                        .w(metrics::scaled(440.))
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .p_4()
-                        .rounded(px(12.))
-                        .bg(theme.elevated)
-                        .border_1()
-                        .border_color(theme.danger)
-                        .child(
-                            div()
-                                .text_color(theme.danger)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(SharedString::from(title)),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(body)),
-                        )
-                        .child(caption(format!("Type “{expected}” to confirm."), theme))
-                        .child(super::text_field::text_field(
-                            "confirm-input",
-                            input,
-                            super::text_field::InputTarget::ConfirmName,
-                            true,
-                            Some(&expected),
-                            theme,
-                            cx,
-                        ))
-                        .children(error.map(|message| {
-                            div()
-                                .text_size(metrics::text_size_small())
-                                .text_color(theme.danger)
-                                .child(message)
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
-                                .child(button("confirm-cancel", "Cancel", theme, false).on_click(
-                                    cx.listener(|this, _, _window, cx| this.close_confirm(cx)),
-                                ))
-                                .child(confirm_button),
-                        ),
-                )
-                .into_any_element(),
+            motion::dialog(
+                "confirm-in",
+                div()
+                    .id("confirm-scrim")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .justify_center()
+                    // Without this the panel stretches to the full height of the
+                    // window instead of hugging its own text.
+                    .items_start()
+                    .bg(scrim)
+                    // Modal to the pointer as well as to the keyboard: the surfaces
+                    // underneath stay visible, but a click cannot reach them. This
+                    // was how a right-click still opened the tree's menu behind an
+                    // unanswered "drop this table".
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .id("confirm-panel")
+                            .w(metrics::scaled(440.))
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_4()
+                            .rounded(px(12.))
+                            .bg(theme.elevated)
+                            .border_1()
+                            .border_color(theme.danger)
+                            .child(
+                                div()
+                                    .text_color(theme.danger)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(SharedString::from(title)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(body)),
+                            )
+                            .child(caption(format!("Type “{expected}” to confirm."), theme))
+                            .child(super::text_field::text_field(
+                                "confirm-input",
+                                input,
+                                super::text_field::InputTarget::ConfirmName,
+                                true,
+                                Some(&expected),
+                                theme,
+                                cx,
+                            ))
+                            .children(error.map(|message| {
+                                div()
+                                    .text_size(metrics::text_size_small())
+                                    .text_color(theme.danger)
+                                    .child(message)
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        button("confirm-cancel", "Cancel", theme, false).on_click(
+                                            cx.listener(|this, _, _window, cx| {
+                                                this.close_confirm(cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(confirm_button),
+                            ),
+                    ),
+                metrics::scaled(140.),
+            )
+            .into_any_element(),
         )
     }
 }

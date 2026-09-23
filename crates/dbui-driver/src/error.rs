@@ -26,6 +26,14 @@ pub enum DriverError {
 
     #[error("The connection is closed")]
     Closed,
+
+    /// The user pressed Stop.
+    #[error("Cancelled")]
+    Cancelled { statement: String },
+
+    /// The connection's query timeout ran out first.
+    #[error("Stopped after {seconds} s, this connection's query timeout")]
+    TimedOut { statement: String, seconds: u64 },
 }
 
 impl DriverError {
@@ -62,7 +70,9 @@ impl DriverError {
     /// failed, and the engine is the only thing that knows for certain.
     pub fn statement(&self) -> Option<&str> {
         match self {
-            DriverError::Query { statement, .. } => Some(statement),
+            DriverError::Query { statement, .. }
+            | DriverError::Cancelled { statement }
+            | DriverError::TimedOut { statement, .. } => Some(statement),
             _ => None,
         }
     }

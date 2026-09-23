@@ -1191,3 +1191,167 @@ async fn non_finite_floats_decode_as_floats() {
     assert_eq!(row[0].to_text(), "NaN");
     assert_eq!(row[1].to_text(), "Infinity");
 }
+
+// A statement parked on the server -- the shape of a query stuck behind a
+// lock -- is stopped *on the server* by a cancel from another connection,
+// rather than left running after the app has stopped waiting for it.
+both_engines!(
+    a_cancel_stops_the_statement_on_the_server,
+    |fx: Fixture| async move {
+        let sleep = match fx.driver() {
+            Driver::Postgres => "SELECT pg_sleep(30)",
+            _ => "SELECT SLEEP(30)",
+        };
+        let token = dbui_driver::QueryToken::new();
+        let started = std::time::Instant::now();
+        let run = fx.execute_tracked(sleep, &token);
+        let stop = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            fx.cancel(&token).await
+        };
+        let (result, told) = tokio::join!(run, stop);
+
+        assert!(told.expect("cancel"), "the server was told");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the sleep ended long before its 30 s: {:?}",
+            started.elapsed()
+        );
+        // Postgres ends a cancelled statement with an error; MySQL's SLEEP()
+        // returns early with 1 instead. Either way it is over, and the pool is
+        // still good for the next one.
+        let _ = result;
+        fx.execute("SELECT 1").await.expect("the pool still works");
+    }
+);
+
+// Changing a table's shape, end to end, with the statements the structure
+// editor shows before it runs them.
+both_engines!(
+    the_structure_editor_statements_run,
+    |fx: Fixture| async move {
+        use dbui_domain::ddl::{self, ColumnSpec};
+        let driver = fx.driver();
+        let people = fx.people();
+        let run = |statements: Vec<String>| async {
+            for sql in statements {
+                fx.execute(&sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}\n{error}"));
+            }
+        };
+        let text = match driver {
+            Driver::Postgres => "text",
+            _ => "varchar(50)",
+        };
+
+        // A column with a string default: the default has to come back as SQL,
+        // quotes and all, or restating it below would break.
+        run(ddl::add_column(
+            driver,
+            &people,
+            &ColumnSpec {
+                name: "motto".into(),
+                data_type: text.into(),
+                nullable: true,
+                default: Some("'hi there'".into()),
+            },
+        )
+        .unwrap())
+        .await;
+        let columns = fx.columns(&people).await.unwrap();
+        let motto = columns.iter().find(|c| c.name == "motto").expect("added");
+        assert!(
+            motto
+                .default
+                .as_deref()
+                .is_some_and(|d| d.contains("'hi there'")),
+            "the default reads back as a quoted literal: {:?}",
+            motto.default
+        );
+
+        // Edit only the nullability. On MySQL that is a MODIFY restating the
+        // whole column -- the default included, as read back above.
+        let mut after = ColumnSpec::of(motto);
+        after.nullable = false;
+        run(ddl::alter_column(driver, &people, motto, &after).unwrap()).await;
+        let columns = fx.columns(&people).await.unwrap();
+        let motto = columns.iter().find(|c| c.name == "motto").unwrap();
+        assert!(!motto.nullable, "now NOT NULL");
+        assert!(
+            motto
+                .default
+                .as_deref()
+                .is_some_and(|d| d.contains("'hi there'")),
+            "and the default survived: {:?}",
+            motto.default
+        );
+
+        // An index, listed back with its columns, then gone.
+        run(ddl::create_index(
+            driver,
+            &people,
+            "people_motto",
+            &["motto".into(), "id".into()],
+            true,
+        )
+        .unwrap())
+        .await;
+        let indexes = fx.indexes(&people).await.unwrap();
+        let made = indexes
+            .iter()
+            .find(|i| i.name == "people_motto")
+            .expect("listed");
+        assert_eq!(made.columns, ["motto", "id"]);
+        assert!(made.unique && !made.primary);
+        assert!(
+            indexes.iter().any(|i| i.primary),
+            "the key's own index is listed too"
+        );
+        run(ddl::drop_index(driver, &people, "people_motto")).await;
+        assert!(fx
+            .indexes(&people)
+            .await
+            .unwrap()
+            .iter()
+            .all(|i| i.name != "people_motto"));
+
+        run(ddl::drop_column(driver, &people, "motto")).await;
+        assert!(fx
+            .columns(&people)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| c.name != "motto"));
+
+        // And a table from nothing.
+        let notes = TableRef::new(&fx.schema, "notes");
+        run(ddl::create_table(
+            driver,
+            &notes,
+            &[
+                ColumnSpec {
+                    name: "id".into(),
+                    data_type: "int".into(),
+                    nullable: false,
+                    default: None,
+                },
+                ColumnSpec {
+                    name: "body".into(),
+                    data_type: text.into(),
+                    nullable: true,
+                    default: None,
+                },
+            ],
+            &["id".into()],
+        )
+        .unwrap())
+        .await;
+        let columns = fx.columns(&notes).await.unwrap();
+        assert_eq!(
+            columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["id", "body"]
+        );
+        assert!(columns[0].is_primary_key);
+    }
+);

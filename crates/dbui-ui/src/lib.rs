@@ -105,6 +105,7 @@ pub fn run() {
                 view.apply_editor_height_px(editor_height_px);
                 view.apply_sidebar_width_px(sidebar_width_px);
                 view.apply_detail_width_px(detail_width_px);
+                view.load_saved_queries();
                 let reopen = view.restore_session(&last_session);
                 if let Some(message) = load_error {
                     view.report_startup_error(message);
@@ -152,6 +153,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-p", CommandPalette, Some("DbUi")),
         KeyBinding::new("cmd-shift-t", ChooseTheme, Some("DbUi")),
         KeyBinding::new("cmd-f", Find, Some("DbUi")),
+        KeyBinding::new("cmd-alt-f", FindReplace, Some("DbUi")),
         KeyBinding::new("cmd-shift-f", SearchTables, Some("DbUi")),
         KeyBinding::new("cmd-s", CommitChanges, Some("DbUi")),
         // ⌘A, ⌘C, ⌘V, ⌘D, ⌘⌫ and ⌘Z are handled in `DbUi::on_key` rather
@@ -163,6 +165,11 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
         KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
         KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
+        // ⌘. is the Mac's "stop" -- Terminal, Xcode and Finder copies all
+        // answer to it.
+        KeyBinding::new("cmd-.", StopQuery, Some("DbUi")),
+        KeyBinding::new("cmd-shift-s", SaveQuery, Some("DbUi")),
+        KeyBinding::new("cmd-shift-o", OpenSavedQuery, Some("DbUi")),
         // ⌘W is handled in `DbUi::on_key` so it isn't stolen / double-fired.
         KeyBinding::new("cmd-shift-]", NextTab, Some("DbUi")),
         KeyBinding::new("cmd-shift-[", PrevTab, Some("DbUi")),
@@ -223,6 +230,11 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Select All Rows", SelectAllRows),
                 MenuItem::action("Duplicate Selected Rows", DuplicateRows),
                 MenuItem::action("Paste Rows", PasteRows),
+                MenuItem::separator(),
+                MenuItem::action("Export as CSV…", ExportCsv),
+                MenuItem::action("Export as JSON…", ExportJson),
+                MenuItem::action("Export as SQL INSERTs…", ExportSql),
+                MenuItem::action("Import CSV…", ImportCsv),
                 MenuItem::action("Delete Selected Rows", DeleteRows),
                 MenuItem::separator(),
                 MenuItem::action("Commit Changes", CommitChanges),
@@ -236,14 +248,20 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Command Palette…", CommandPalette),
                 MenuItem::action("Search Tables", SearchTables),
                 MenuItem::action("Find…", Find),
+                MenuItem::action("Find and Replace…", FindReplace),
             ],
         },
         Menu {
             name: "Query".into(),
             items: vec![
                 MenuItem::action("New SQL Tab", OpenSql),
+                MenuItem::action("New Table…", NewTable),
                 MenuItem::action("Run Query", RunQuery),
                 MenuItem::action("Run All Queries", RunAllQueries),
+                MenuItem::action("Stop Query", StopQuery),
+                MenuItem::separator(),
+                MenuItem::action("Save Query…", SaveQuery),
+                MenuItem::action("Saved Queries…", OpenSavedQuery),
                 MenuItem::action("Refresh", Refresh),
             ],
         },
@@ -259,17 +277,26 @@ gpui::actions!(
         CommandPalette,
         ChooseTheme,
         Find,
+        FindReplace,
         SearchTables,
         CommitChanges,
         SelectAllRows,
         DeleteRows,
         DuplicateRows,
         PasteRows,
+        ExportCsv,
+        ExportJson,
+        ExportSql,
+        ImportCsv,
         DiscardChanges,
         OpenSql,
         Refresh,
         RunQuery,
         RunAllQueries,
+        StopQuery,
+        SaveQuery,
+        OpenSavedQuery,
+        NewTable,
         CloseTab,
         NextTab,
         PrevTab,

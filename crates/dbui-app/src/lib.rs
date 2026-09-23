@@ -8,15 +8,17 @@
 pub mod commands;
 pub mod history;
 pub mod runtime;
+pub mod saved;
 pub mod session;
 pub mod store;
 pub mod tableplus;
 pub mod updater;
 pub mod workspace;
 
-pub use commands::{BatchQueryResult, Outcome, TableContents};
+pub use commands::{BatchQueryResult, Outcome, PageSink, TableContents};
 pub use history::{History, HistoryEntry};
 pub use runtime::{DbRuntime, Task};
+pub use saved::{SavedQueries, SavedQuery};
 pub use session::{SavedConnectionTab, SavedTab, Session};
 pub use tableplus::{import_from_tableplus, ImportReport, TablePlusError};
 pub use updater::{Update, UpdateError, Version};

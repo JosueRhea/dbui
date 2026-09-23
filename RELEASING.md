@@ -1,12 +1,14 @@
 # Releasing dbui
 
-A release is one universal (Intel + Apple Silicon) `.app`, signed with a
-Developer ID certificate, notarized by Apple, and stapled — so a downloaded copy
-opens with no Gatekeeper warning, no right-click, no `xattr -d`.
+A release is one universal (Intel + Apple Silicon) `.app`, signed with the
+project's own self-signed certificate. It is **not** notarized — there is no
+Apple Developer ID behind it — so a copy downloaded in a browser is stopped by
+Gatekeeper once, until the user clicks *Open Anyway* (the README walks them
+through it). Updates installed from inside the app are not quarantined and open
+without asking.
 
-Releases are cut **from a Mac**, by hand. Notarization needs the Developer ID
-certificate in a local keychain, so there is no CI here to run it: the `make`
-targets below are the whole pipeline.
+Releases are cut **from a Mac**, by hand, because the signing key lives in that
+Mac's keychain. The `make` targets below are the whole pipeline.
 
 ## What gets published
 
@@ -14,41 +16,44 @@ targets below are the whole pipeline.
 | --- | --- |
 | `dbui-<version>-universal.dmg` | what people download and drag to Applications |
 | `dbui-<version>-universal.zip` | what the in-app updater downloads |
-| `SHA256SUMS` | checked by the updater before it installs anything |
-
-Both the `.app` and the `.dmg` are notarized. They are assessed separately by
-Gatekeeper, so both need their own ticket — stapling only the app leaves a first
-open *offline* with a warning.
+| `SHA256SUMS` | checked by the updater before it expands anything |
 
 ## One-time setup
 
-### 1. A Developer ID Application certificate
-
-Xcode → Settings → Accounts → ZENIT GROUP LLC → Manage Certificates → **+** →
-*Developer ID Application*. Confirm it landed:
+### The release certificate
 
 ```sh
-security find-identity -v -p codesigning | grep "Developer ID Application"
+make signing-cert
 ```
 
-The `Makefile` picks this up automatically. With no certificate installed it
-falls back to an ad-hoc signature — fine for running locally, Gatekeeper-blocked
-for anyone who downloads it.
-
-### 2. notarytool credentials
-
-An app-specific password, not your Apple ID password: appleid.apple.com →
-Sign-In & Security → App-Specific Passwords.
+This creates a self-signed code-signing certificate named **dbui Release
+Signing**, imports it into your login keychain, and trusts it for code signing.
+It asks for a password for the backup, then for your macOS password (the trust
+change is a system prompt). Confirm it landed:
 
 ```sh
-xcrun notarytool store-credentials dbui-notary \
-  --apple-id <your-apple-id> \
-  --team-id D7HN42D467 \
-  --password <app-specific-password>
+security find-identity -v -p codesigning | grep "dbui Release Signing"
 ```
 
-This is an Apple ID + team credential, not a per-app one — if you already have a
-profile from another project, `make notarize NOTARY_PROFILE=<name>` reuses it.
+The `Makefile` picks it up by name. With no certificate installed, builds fall
+back to an ad-hoc signature — fine for running locally, and refused by both
+`release-macos` and `publish`.
+
+> **Back up `~/dbui-signing/dbui-signing.p12` and its password** somewhere
+> that is not this Mac — a password manager is ideal. Every copy of dbui in the
+> wild only accepts updates signed by *this* certificate. Lose the private key
+> and none of them can auto-update again; every user has to reinstall by hand.
+
+### A new Mac
+
+Do **not** run `make signing-cert` again — a new certificate is a new identity.
+Restore the old one instead:
+
+```sh
+security import dbui-signing.p12 -T /usr/bin/codesign
+security add-trusted-cert -r trustRoot -p codeSign \
+  -k ~/Library/Keychains/login.keychain-db dbui-signing.cer
+```
 
 ## Before you cut one
 
@@ -88,7 +93,7 @@ green `make preflight` on its own says nothing about either engine.
 ```sh
 # 1. bump [workspace.package] version in Cargo.toml, commit, push
 make preflight                # formatting + tests, including the full session
-make release-macos            # build, sign, notarize, staple, package
+make release-macos            # build, sign, package
 make smoke                    # the bundled app actually starts
 make publish TAG=v0.1.0       # create the GitHub release from build/
 ```
@@ -99,24 +104,26 @@ is not still running a few seconds later — a resource left out of the bundle, 
 signature the hardened runtime rejects, or a broken universal slice all look
 fine until something opens the thing Apple hands a user.
 
-Builds both slices, `lipo`s them together, bundles, signs, notarizes the app,
-builds the `.dmg`, notarizes *that*, staples both, and writes the `.zip`. The
-notary round-trip is a few minutes each; the whole thing is about ten.
+Builds both slices, `lipo`s them together, bundles, signs the app, builds and
+signs the `.dmg`, and writes the `.zip` and `SHA256SUMS`.
 
-It finishes with `make verify`, which is the check that matters:
+It finishes with `make verify`:
 
 ```
-build/dbui.app: accepted
-source=Notarized Developer ID
+build/dbui.app: valid on disk
+build/dbui.app: satisfies its Designated Requirement
+requirement: identifier "com.gzenit.dbui" and certificate root = H"…"
 archs: x86_64 arm64
 ```
 
-`source=Notarized Developer ID` is the line to look for. `Unnotarized Developer
-ID` means the signature is good but the notary step did not run.
+The `requirement:` line is the one to look for: it has to name a certificate.
+`cdhash H"…"` there means the build was signed ad-hoc and no installed copy
+would accept it.
 
 `make publish` then uploads the three artifacts and creates the release. It
 builds nothing — it only uploads what `release-macos` left behind, and it
-re-checks `spctl` first, so it cannot publish an unnotarized build by accident.
+re-checks the signature against the release certificate first, so it cannot
+publish an ad-hoc build by accident.
 
 Both `release-macos` and `publish` run `make check-version` first, which refuses
 a `TAG` that disagrees with `Cargo.toml` before anything expensive happens.
@@ -140,14 +147,19 @@ verifies and swaps it in.
 
 Before it swaps anything, `install` requires the downloaded bundle to:
 
-1. pass `codesign --verify --deep --strict`,
-2. pass `spctl --assess --type execute` — the same check Gatekeeper runs, so it
-   must be notarized, and
-3. carry the **same Team Identifier** as the copy that is running.
+1. pass `codesign --verify --deep --strict`, and
+2. satisfy the running copy's **designated requirement** — the bundle
+   identifier plus the hash of the certificate that signed it. Only a bundle
+   signed with the same private key passes.
 
-A release that is signed but not notarized will download and then refuse to
-install. That is the intended behaviour, and it is why `release-macos` notarizes
-rather than leaving it as a manual last step.
+There is no Gatekeeper (`spctl`) check: an unnotarized build would always fail
+it. The certificate check is what stands in for it, which is why the key has to
+be kept safe *and* kept at all.
+
+Builds up to 0.2.8 were signed with a Developer ID the project no longer has.
+Their updater checks for that team, so it refuses every release from here on:
+those users have to download one release by hand, after which updates work
+again. Say so in the release notes of the first release signed this way.
 
 The updater is inert unless the app is running from a `.app` bundle, so a
 `cargo run` build never tries to replace `target/debug/`.

@@ -1,7 +1,8 @@
 //! The result grid.
 
-use crate::root::{DbUi, ResultView};
-use crate::tabs::WorkspaceTab;
+use super::motion;
+use crate::root::{DbUi, FlashRows, ResultView};
+use crate::tabs::{pk_equal, row_pk, WorkspaceTab};
 use crate::theme::metrics;
 use dbui_app::domain::ValueKind;
 use gpui::{
@@ -73,6 +74,7 @@ impl DbUi {
             .filter(|drag| drag.moved)
             .map(|drag| drag.column);
         let header = render_header(view, &visible, &self.theme, total_width, sort, moving, cx);
+        let arrival = view.arrival;
 
         // Virtualized rows (fast). Parent H-scrolls; list only scrolls vertically.
         // `overflow_hidden` then `overflow_x_scroll` keeps Y clipped so the list
@@ -81,7 +83,7 @@ impl DbUi {
         let body = uniform_list(
             "result-rows",
             row_count,
-            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                 let active_index = this.tabs.active;
                 let Some(tab) = this.tabs.items.get(active_index) else {
                     return Vec::new();
@@ -109,6 +111,25 @@ impl DbUi {
 
                 let stored_rows = view.set.rows.len();
 
+                let tab_id = tab.id();
+                // A copied cell flares and settles to its resting tint.
+                let copy_flare = this
+                    .copied_at
+                    .and_then(|at| motion::flash(at, motion::COPY_FLASH, window))
+                    .unwrap_or(0.);
+                let cell_flash = this
+                    .cell_flash
+                    .filter(|(tab, ..)| *tab == tab_id)
+                    .and_then(|(_, row, column, at)| {
+                        motion::flash(at, motion::EDIT_FLASH, window)
+                            .map(|strength| (row, column, strength))
+                    });
+                // Checked against the longest flash, so a spent one stops
+                // costing a key comparison per row.
+                let row_flash = this.row_flash.as_ref().filter(|flash| {
+                    flash.tab == tab_id && flash.started.elapsed() < motion::COMMIT_FLASH
+                });
+
                 range
                     .map(|index| {
                         if index >= stored_rows {
@@ -127,6 +148,28 @@ impl DbUi {
                             || lead_row == Some(index);
                         let staged_delete = tab.row_is_staged_for_delete(index);
                         let staged_edit = tab.staged_edit_for_row(index, &staged);
+                        let glow = row_flash.and_then(|flash| {
+                            let (lit, color, duration) = match &flash.rows {
+                                FlashRows::Copied(rows) => {
+                                    (rows.contains(&index), theme.accent, motion::COPY_FLASH)
+                                }
+                                FlashRows::Committed(keys) => (
+                                    row_pk(&view.set.columns, &row.0, &view.structure)
+                                        .is_ok_and(|pk| keys.iter().any(|key| pk_equal(key, &pk))),
+                                    theme.success,
+                                    motion::COMMIT_FLASH,
+                                ),
+                            };
+                            if !lit {
+                                return None;
+                            }
+                            motion::flash(flash.started, duration, window).map(|strength| {
+                                gpui::Rgba {
+                                    a: 0.3 * strength,
+                                    ..color
+                                }
+                            })
+                        });
 
                         let cells: Vec<AnyElement> = visible
                             .iter()
@@ -163,6 +206,9 @@ impl DbUi {
                                 let just_copied = this.copied_cell == Some((index, column));
                                 let editing = this.editing_cell == Some((index, column));
                                 let links = this.foreign_key_at(index, column).is_some();
+                                let edit_flash = cell_flash
+                                    .filter(|(row, col, _)| *row == index && *col == column)
+                                    .map(|(_, _, strength)| strength);
 
                                 if editing {
                                     return div()
@@ -234,6 +280,16 @@ impl DbUi {
                                     .when(is_selected || row_selected, |cell| {
                                         cell.bg(theme.selection).border_color(theme.accent)
                                     })
+                                    // Over the selection, not under it: rows
+                                    // just copied are almost always the
+                                    // selected ones.
+                                    .when_some(glow, |cell, tint| cell.bg(tint))
+                                    .when_some(edit_flash, |cell, strength| {
+                                        cell.bg(gpui::Rgba {
+                                            a: 0.4 * strength,
+                                            ..theme.success
+                                        })
+                                    })
                                     // A copy answers where it was asked for.
                                     // The status bar is at the bottom of the
                                     // window, which on a wide table is
@@ -245,7 +301,7 @@ impl DbUi {
                                     // never lands on.
                                     .when(just_copied, |cell| {
                                         cell.bg(gpui::Rgba {
-                                            a: 0.22,
+                                            a: 0.22 + 0.3 * copy_flare,
                                             ..theme.success
                                         })
                                         .border_color(theme.success)
@@ -397,6 +453,7 @@ impl DbUi {
                                     .text_size(metrics::text_size_small())
                                     .border_r_1()
                                     .border_color(theme.divider)
+                                    .when_some(glow, |gutter, tint| gutter.bg(tint))
                                     .child(SharedString::from(if staged_delete {
                                         "−".to_string()
                                     } else {
@@ -414,6 +471,9 @@ impl DbUi {
         .w(px(total_width))
         .flex_1()
         .min_h(px(0.));
+        // New rows fade in under a header that stays put: the columns are the
+        // frame, and it is what fills them that changed.
+        let body = motion::fade(("result-rows-in", arrival as usize), body);
 
         // The bars are siblings of the scroller, not children of it: a child
         // would scroll away with the rows. They come after it so that their
@@ -638,7 +698,10 @@ fn render_header(
                 // The one in hand is lit, so a drag over a wide table still
                 // shows which column is moving.
                 .when(moving == Some(*index), |header| {
-                    header.bg(theme.selection).text_color(theme.text)
+                    header
+                        .bg(theme.selection)
+                        .text_color(theme.text)
+                        .opacity(0.5)
                 })
                 // A press is not a sort yet: it becomes one on release, if
                 // the pointer never travelled. Sorting on the way down would

@@ -11,7 +11,7 @@
 //! row it belongs to: "3 lines became 4" is not something a before/after pair
 //! on one line can say.
 
-use super::button;
+use super::{button, motion};
 use crate::root::DbUi;
 use crate::tabs::{FieldChange, PendingRowDelete, PendingRowEdit, WorkspaceTab};
 use crate::text_diff::{line_diff, DiffLine};
@@ -196,7 +196,7 @@ impl DbUi {
             );
         }
 
-        Some(bubble.into_any_element())
+        Some(motion::fade("change-bubble-in", bubble).into_any_element())
     }
 }
 

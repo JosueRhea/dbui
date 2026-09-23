@@ -8,12 +8,13 @@ mod catalog;
 mod decode;
 
 use crate::error::{DriverError, Result};
-use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
+use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Page, QueryOutcome,
-    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
+    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
+    TableRef, Value,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
@@ -259,24 +260,78 @@ impl DatabaseDriver for SqliteDriver {
         Ok(total)
     }
 
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {
+        let rows = sqlx::query(catalog::INDEXES)
+            .bind(&table.name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::catalog(&error))?;
+        Ok(crate::port::group_indexes(
+            rows.iter()
+                .filter_map(|row| {
+                    Some((
+                        row.try_get::<String, _>("index_name").ok()?,
+                        row.try_get::<i64, _>("is_unique").unwrap_or(0) != 0,
+                        row.try_get::<String, _>("origin")
+                            .is_ok_and(|origin| origin == "pk"),
+                        row.try_get::<Option<String>, _>("column_name")
+                            .ok()
+                            .flatten(),
+                    ))
+                })
+                .collect(),
+        ))
+    }
+
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_tracked(sql, &QueryToken::new()).await
+    }
+
+    async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
         let started = Instant::now();
 
+        // SQLite runs in-process: there is no server to ask, and dropping the
+        // future does not stop a statement mid-step -- the one connection
+        // would stay busy, and the next query would queue behind it. So the
+        // statement stops itself: SQLite calls the progress handler every so
+        // many steps, and a `false` from it ends the statement there.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?;
+        {
+            let token = token.clone();
+            conn.lock_handle()
+                .await
+                .map_err(|error| DriverError::query(sql, &error))?
+                .set_progress_handler(1_000, move || !token.should_stop());
+        }
+        let tracking = token.track(0);
+
         let outcome = if query::returns_rows(sql) {
-            let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(&self.pool)
+            sqlx::query(AssertSqlSafe(sql.to_string()))
+                .fetch_all(&mut *conn)
                 .await
-                .map_err(|error| DriverError::query(sql, &error))?;
-            let mut set = build_result_set(rows, usize::MAX);
-            self.backfill_columns(&mut set, sql).await;
-            QueryOutcome::Rows(set)
+                .map(|rows| QueryOutcome::Rows(build_result_set(rows, usize::MAX)))
         } else {
-            let done = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .execute(&self.pool)
+            sqlx::query(AssertSqlSafe(sql.to_string()))
+                .execute(&mut *conn)
                 .await
-                .map_err(|error| DriverError::query(sql, &error))?;
-            QueryOutcome::Affected(done.rows_affected())
+                .map(|done| QueryOutcome::Affected(done.rows_affected()))
         };
+        drop(tracking);
+        if let Ok(mut handle) = conn.lock_handle().await {
+            handle.remove_progress_handler();
+        }
+        // Handed back before the backfill, which needs the pool's one
+        // connection for itself.
+        drop(conn);
+
+        let mut outcome = outcome.map_err(|error| DriverError::query(sql, &error))?;
+        if let QueryOutcome::Rows(set) = &mut outcome {
+            self.backfill_columns(set, sql).await;
+        }
 
         Ok(QueryResult {
             statement: sql.to_string(),
@@ -285,6 +340,14 @@ impl DatabaseDriver for SqliteDriver {
                 elapsed: started.elapsed(),
             },
         })
+    }
+
+    async fn cancel(&self, token: &QueryToken) -> Result<bool> {
+        if token.session().is_none() {
+            return Ok(false);
+        }
+        token.interrupt();
+        Ok(true)
     }
 
     async fn close(&self) {

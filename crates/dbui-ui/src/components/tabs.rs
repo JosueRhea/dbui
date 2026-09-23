@@ -8,7 +8,7 @@
 
 use super::context_menu::ContextTarget;
 use super::icons::{plus_icon, sql_icon, table_icon};
-use super::{caption, dot};
+use super::{caption, dot, motion};
 use crate::root::DbUi;
 use crate::tabs::WorkspaceTab;
 use crate::theme::metrics;
@@ -64,7 +64,7 @@ impl DbUi {
                     .as_ref()
                     .is_some_and(|drag| drag.id == id && drag.moved);
 
-                div()
+                let pill = div()
                     // Keyed on the tab, not the slot: dragging renumbers the
                     // slots, and an id that moved with them would hand the
                     // press and the release to two different elements.
@@ -93,9 +93,10 @@ impl DbUi {
                         theme.text_muted
                     })
                     .when(!is_active, |row| row.hover(|row| row.bg(theme.hover)))
-                    // The tab in hand is lifted off the strip, so it is clear
-                    // which one the rest are making room for.
-                    .when(dragging, |row| row.bg(theme.selection))
+                    // The tab in hand is lifted off the strip -- its copy rides
+                    // the pointer -- and what stays behind is the slot the
+                    // rest are making room for.
+                    .when(dragging, |row| row.bg(theme.selection).opacity(0.4))
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.activate_tab(index, cx);
                     }))
@@ -125,21 +126,6 @@ impl DbUi {
                             this.open_context_menu(ContextTarget::Tab { id }, event.position, cx);
                         }),
                     )
-                    // The accent edge, inside the rounded corners rather than
-                    // as a border: a 2px border on one side of a rounded box
-                    // is drawn as a wedge, and this has to read as a bar.
-                    .when(is_active, |row| {
-                        row.child(
-                            div()
-                                .absolute()
-                                .left(px(6.))
-                                .right(px(6.))
-                                .top_0()
-                                .h(px(2.))
-                                .rounded_b(px(1.))
-                                .bg(theme.accent),
-                        )
-                    })
                     .child(icon)
                     .child(div().truncate().child(SharedString::from(label)))
                     // Staged work the tab is holding, marked where the user
@@ -157,8 +143,8 @@ impl DbUi {
                                 this.close_tab(index, cx);
                             }))
                             .child("×"),
-                    )
-                    .into_any_element()
+                    );
+                motion::tab(("workspace-tab-in", id as usize), pill).into_any_element()
             })
             .collect();
 
@@ -166,6 +152,74 @@ impl DbUi {
         // scroller is what makes it reachable no matter how many tabs are
         // open -- a new-tab button you have to scroll to find is one nobody
         // presses twice.
+        // The underline is aimed from the strip's own record of where each
+        // tab was laid out last frame, so it lands on the tab as drawn --
+        // whatever its label made its width -- and travels there when the
+        // front tab changes, or when the strip shuffles under it.
+        let strip_bounds = self.tab_strip_scroll.bounds();
+        // Last frame's record is only trusted if it was a strip of this many
+        // tabs plus the one trailing element (the underline, or the frame
+        // request below). Just after a close or an open it is not, and aiming
+        // by it would send the underline to whichever tab used to be there.
+        let count = tabs.len();
+        let fresh = self.tab_strip_scroll.bounds_for_item(count).is_some()
+            && self.tab_strip_scroll.bounds_for_item(count + 1).is_none();
+        let target = (count > 0 && fresh)
+            .then(|| self.tab_strip_scroll.bounds_for_item(active))
+            .flatten()
+            .map(|tab| {
+                let inset = 8.;
+                let left = f32::from(tab.left() - strip_bounds.left());
+                let right = f32::from(tab.right() - strip_bounds.left());
+                let top = tab.bottom() - strip_bounds.top();
+                (
+                    motion::Span {
+                        left: left + inset,
+                        right: (right - inset).max(left + inset),
+                    },
+                    top,
+                )
+            });
+        if let Some((span, top)) = target {
+            match self.tab_indicator.as_mut() {
+                Some((slide, at)) => {
+                    slide.aim(span);
+                    *at = top;
+                }
+                None => self.tab_indicator = Some((motion::Slide::at(span), top)),
+            }
+        }
+        // Asks for one more frame, which will have fresh bounds to aim by.
+        // Carried *inside* the underline when there is one, so the strip
+        // keeps exactly one trailing child and the underline is never swapped
+        // out -- which would restart its slide.
+        let another_frame = || {
+            gpui::canvas(
+                |_, window, _| window.request_animation_frame(),
+                |_, _, _, _| {},
+            )
+            .size_0()
+        };
+        let indicator = match (&self.tab_indicator, count > 0) {
+            (_, false) => None,
+            (Some((slide, top)), true) => Some(
+                slide
+                    .render(
+                        "tab-indicator",
+                        div()
+                            .absolute()
+                            .top(*top + px(3.))
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(self.theme.accent)
+                            .when(!fresh, |bar| bar.child(another_frame())),
+                    )
+                    .into_any_element(),
+            ),
+            (None, true) => Some(another_frame().into_any_element()),
+        };
+        let theme = &self.theme;
+
         let strip = if tabs.is_empty() {
             div()
                 .id("workspace-tab-bar-empty")
@@ -179,12 +233,17 @@ impl DbUi {
             div()
                 .id("workspace-tab-bar")
                 .track_scroll(&self.tab_strip_scroll)
+                .relative()
                 .flex()
                 .items_center()
                 .gap_1()
+                // Room below the tabs for the underline, and as much above
+                // so they stay centred in the bar.
+                .py(px(6.))
                 .min_w(px(0.))
                 .overflow_x_scroll()
                 .children(tabs)
+                .children(indicator)
                 .into_any_element()
         };
 

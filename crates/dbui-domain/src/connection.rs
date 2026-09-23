@@ -193,6 +193,11 @@ pub struct ConnectionConfig {
     /// `default` so a connections file written before it existed still loads.
     #[serde(default)]
     pub read_only: bool,
+    /// Stop a statement that runs longer than this many seconds, on the
+    /// server as well as in the app. Zero -- the default, and what a file
+    /// written before this existed loads as -- waits for as long as it takes.
+    #[serde(default)]
+    pub query_timeout_secs: u32,
 }
 
 impl ConnectionConfig {
@@ -213,6 +218,7 @@ impl ConnectionConfig {
             database: driver.default_database().into(),
             tls: TlsMode::default(),
             read_only: false,
+            query_timeout_secs: 0,
         }
     }
 

@@ -229,8 +229,9 @@ fn tab_walks_the_fields_and_wraps(cx: &mut TestAppContext) {
         assert_eq!(config.name, "New PostgreSQL", "the name was left alone");
     });
 
-    // Port, User, Password, Database, then Cancel / Test / Save, then wrap to Name.
-    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab");
+    // Port, User, Password, Database, Timeout, then Cancel / Test / Save,
+    // then wrap to Name.
+    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("wrapped"));
 
@@ -249,14 +250,45 @@ fn shift_tab_walks_backwards(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
     cx.simulate_keystrokes("cmd-n");
 
-    // From Name: Save → Test → Cancel → Database.
-    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab");
+    // From Name: Save → Test → Cancel → Timeout → Database.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("shop"));
 
     view.update(cx, |view, _| {
         let config = view.modal.as_ref().unwrap().to_config();
         assert_eq!(config.database, "shop");
+    });
+}
+
+/// The timeout field is seconds; blank, or anything that is not a number, is
+/// no limit at all.
+#[gpui::test]
+fn the_query_timeout_is_typed_in_seconds(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(
+            config.query_timeout_secs, 0,
+            "a new connection waits for ever"
+        );
+    });
+
+    // From Name: Save → Test → Cancel → Timeout.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab");
+    cx.simulate_keystrokes(&typing("30"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(config.query_timeout_secs, 30);
+    });
+
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("soon"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(config.query_timeout_secs, 0, "not a number is no limit");
     });
 }
 
@@ -376,6 +408,177 @@ fn cmd_e_opens_the_sql_tab_and_cmd_k_clears_it(cx: &mut TestAppContext) {
     view.update(cx, |view, _| set_sql_editor_text(view, "SELECT 1"));
     cx.simulate_keystrokes("cmd-k");
     view.update(cx, |view, _| assert!(sql_editor_text(view).is_empty()));
+}
+
+/// Selected text in the front SQL editor, if any.
+fn sql_editor_selection(view: &DbUi) -> Option<String> {
+    match view.tabs.active() {
+        Some(WorkspaceTab::Sql { editor, .. }) => editor.selected_text().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Brackets pair as they are typed, and a closer typed by habit is stepped
+/// over rather than doubled. Only in the SQL editor.
+#[gpui::test]
+fn the_sql_editor_pairs_brackets_as_you_type(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    cx.simulate_keystrokes(&typing("SELECT count(*) FROM t WHERE a = 'x'"));
+    view.update(cx, |view, _| {
+        assert_eq!(
+            sql_editor_text(view),
+            "SELECT count(*) FROM t WHERE a = 'x'"
+        );
+    });
+}
+
+/// ⌘/ comments the caret's line out, and a second press brings it back.
+#[gpui::test]
+fn cmd_slash_toggles_a_line_comment(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "SELECT 1\nSELECT 2")
+    });
+    cx.simulate_keystrokes("cmd-/");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "SELECT 1\n-- SELECT 2")
+    });
+    cx.simulate_keystrokes("cmd-/");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "SELECT 1\nSELECT 2")
+    });
+}
+
+/// ⌘F on a query tab searches the SQL: typing lands on the first match,
+/// Enter walks on, Esc hands the editor back with the match selected, and
+/// ⌘G carries on from the editor.
+#[gpui::test]
+fn cmd_f_finds_in_the_sql_editor(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "select a; SELECT b; select c");
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(0);
+        }
+    });
+
+    cx.simulate_keystrokes("cmd-f");
+    view.update(cx, |view, _| assert_eq!(view.focus, Focus::Find));
+    cx.simulate_keystrokes(&typing("select"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.find_matches().len(), 3, "case is ignored");
+        assert_eq!(sql_editor_selection(view).as_deref(), Some("select"));
+    });
+
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(
+            sql_editor_selection(view).as_deref(),
+            Some("SELECT"),
+            "the second"
+        );
+    });
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        assert_eq!(view.focus, Focus::Editor);
+        assert!(view.editor_find.is_none());
+        assert_eq!(sql_editor_selection(view).as_deref(), Some("SELECT"));
+    });
+}
+
+/// ⌥⌘F with a replacement: Replace All rewrites every match as one edit,
+/// which ⌘Z takes back whole.
+#[gpui::test]
+fn replace_all_is_one_undoable_edit(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "select 1; select 2")
+    });
+
+    cx.simulate_keystrokes("cmd-alt-f");
+    cx.simulate_keystrokes(&typing("select"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("SELECT"));
+    view.update(cx, |view, cx| view.replace_all(cx));
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "SELECT 1; SELECT 2")
+    });
+
+    cx.simulate_keystrokes("escape cmd-z");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "select 1; select 2")
+    });
+}
+
+/// ⌘⇧S keeps the editor's SQL under a name; ⌘⇧O brings it back -- over
+/// whatever is in the editor, as one edit ⌘Z undoes -- and ⌘⌫ in the list
+/// forgets it.
+#[gpui::test]
+fn a_query_is_saved_by_name_and_opened_again(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    let name = format!("answer-{}", std::process::id());
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, _| set_sql_editor_text(view, "SELECT 42"));
+
+    cx.simulate_keystrokes("cmd-shift-s");
+    cx.simulate_keystrokes(&typing(&name));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert!(view.palette.is_none(), "saving closes the palette");
+        assert_eq!(view.saved_queries.queries[0].name, name);
+        assert_eq!(view.saved_queries.queries[0].sql, "SELECT 42");
+        let on_disk = dbui_app::saved::saved_queries_path()
+            .and_then(|path| dbui_app::saved::load(&path))
+            .expect("written");
+        assert!(
+            on_disk.queries.iter().any(|q| q.name == name),
+            "on disk too"
+        );
+    });
+
+    view.update(cx, |view, _| {
+        set_sql_editor_text(view, "SELECT 1 -- scratch")
+    });
+    cx.simulate_keystrokes("cmd-shift-o");
+    cx.simulate_keystrokes(&typing(&name));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| assert_eq!(sql_editor_text(view), "SELECT 42"));
+    cx.simulate_keystrokes("cmd-z");
+    view.update(cx, |view, _| {
+        assert_eq!(
+            sql_editor_text(view),
+            "SELECT 1 -- scratch",
+            "the load undoes"
+        );
+    });
+
+    cx.simulate_keystrokes("cmd-shift-o");
+    cx.simulate_keystrokes(&typing(&name));
+    cx.simulate_keystrokes("cmd-backspace");
+    view.update(cx, |view, _| {
+        assert!(view.saved_queries.queries.iter().all(|q| q.name != name));
+    });
+}
+
+/// A saved-queries file that could not be read is never written over: it
+/// holds someone's kept work, and the empty list in its place would erase it.
+#[gpui::test]
+fn an_unreadable_saved_queries_file_is_not_overwritten(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-e");
+    view.update(cx, |view, cx| {
+        set_sql_editor_text(view, "SELECT 1");
+        view.saved_queries_unreadable = Some("expected value at line 1".into());
+        view.save_query_as("kept", cx);
+        assert!(view.saved_queries.queries.is_empty(), "nothing was kept");
+        let said = describe(&view.status);
+        assert!(said.contains("Not saved"), "{said}");
+    });
 }
 
 #[gpui::test]
@@ -3182,6 +3385,424 @@ fn create_table_says_what_it_did_and_the_tree_catches_up(cx: &mut TestAppContext
             describe(&view.status)
         );
     });
+}
+
+/// ⌘. stops a runaway query: the tab stops waiting, the footer says it was
+/// cancelled rather than failed, and the connection answers the next query.
+#[gpui::test]
+fn stop_ends_a_runaway_query(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "stop-query");
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+             SELECT count(*) FROM (SELECT i FROM n LIMIT 5000000000)",
+            cx,
+        );
+        view.run_query(cx);
+        assert!(
+            view.active_run_is_stoppable(),
+            "a run in flight can be stopped"
+        );
+    });
+    // Long enough for the statement to be under way on the database.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    cx.simulate_keystrokes("cmd-.");
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+
+    view.update(cx, |view, _| {
+        assert!(!view.active_run_is_stoppable(), "nothing left to stop");
+        assert_eq!(describe(&view.status), "info: Cancelled");
+        assert!(
+            view.tabs.active().and_then(|tab| tab.error()).is_none(),
+            "a Stop the user asked for is not an error on the tab"
+        );
+    });
+
+    // The one SQLite connection is free for the next statement.
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT 7 AS seven", cx);
+        view.run_query(cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert_eq!(grid_rows(view), vec![vec!["7".to_string()]]);
+    });
+}
+
+/// A scratch path for a file a test writes, removed when dropped.
+struct ScratchFile(std::path::PathBuf);
+
+impl ScratchFile {
+    fn new(name: &str) -> Self {
+        let mut path = std::env::temp_dir();
+        path.push(format!("dbui-e2e-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Wait for the footer to say an export finished, and fail if it never does.
+fn settle_export(view: &Entity<DbUi>, cx: &mut VisualTestContext) -> String {
+    settle(view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    let said = view.update(cx, |view, _| describe(&view.status));
+    assert!(said.contains("Exported"), "the export finished: {said}");
+    said
+}
+
+/// Exporting a table tab writes the table -- every row, with a header -- as
+/// CSV a spreadsheet will open.
+#[gpui::test]
+fn a_table_exports_to_csv(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "export-csv");
+    let out = ScratchFile::new("members.csv");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.export_to_path(out.0.clone(), crate::row_export::RowFormat::Csv, cx);
+    });
+    let said = settle_export(&view, cx);
+    assert!(said.contains("2 rows"), "{said}");
+
+    let written = std::fs::read_to_string(&out.0).expect("the file was written");
+    assert_eq!(written, "id,name,team_slug\n1,Ada,core\n2,Grace,ops\n");
+}
+
+/// A query tab exports its result, and JSON keeps numbers as numbers.
+#[gpui::test]
+fn a_query_result_exports_to_json(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "export-json");
+    let out = ScratchFile::new("query.json");
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT id, name FROM members ORDER BY id", cx);
+        view.run_query(cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| {
+        view.export_to_path(out.0.clone(), crate::row_export::RowFormat::Json, cx);
+    });
+    settle_export(&view, cx);
+
+    let written = std::fs::read_to_string(&out.0).expect("the file was written");
+    let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+    assert_eq!(
+        parsed,
+        serde_json::json!([{"id": 1, "name": "Ada"}, {"id": 2, "name": "Grace"}])
+    );
+}
+
+/// Importing a CSV stages its rows; ⌘S writes them. A header the table does
+/// not have is ignored, and so is a repeat of one it does.
+#[gpui::test]
+fn a_csv_imports_as_staged_rows_that_commit(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "import-csv");
+    let path = db.path.clone();
+    let csv = ScratchFile::new("people.csv");
+    // A byte-order mark, as Excel writes; a quoted comma; an unknown column;
+    // and `name` twice, where the first one must win.
+    std::fs::write(
+        &csv.0,
+        "\u{feff}name,team_slug,shoe_size,name\n\"Hopper, Grace\",core,9,ignored\nLinus,ops,11,ignored\n",
+    )
+    .expect("write the csv");
+
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, |view, cx| view.import_csv_from_path(&csv.0, cx));
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.active().unwrap().pending_inserts().len(), 2);
+        let said = describe(&view.status);
+        assert!(said.contains("2 column(s) ignored"), "{said}");
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    settle_column(&view, cx, 1, &["Ada", "Grace", "Hopper, Grace", "Linus"]);
+    assert_eq!(
+        read_back(&path, "SELECT name, team_slug FROM members ORDER BY id"),
+        vec![
+            vec!["Ada".to_string(), "core".to_string()],
+            vec!["Grace".to_string(), "ops".to_string()],
+            vec!["Hopper, Grace".to_string(), "core".to_string()],
+            vec!["Linus".to_string(), "ops".to_string()],
+        ],
+        "on disk, not just on screen"
+    );
+}
+
+/// Open `members` on its structure pane, with its indexes read.
+fn open_members_structure(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(view, cx);
+    view.update(cx, |view, cx| {
+        view.set_table_pane(crate::tabs::TablePane::Structure, cx);
+    });
+    settle(view, cx, |view| {
+        matches!(
+            view.tabs.active(),
+            Some(WorkspaceTab::Table {
+                indexes: Some(_),
+                ..
+            })
+        )
+    });
+}
+
+/// Wait for the structure sheet to finish, and fail if it did not close.
+fn settle_sheet(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    settle(view, cx, |view| view.schema_sheet.is_none());
+    view.update(cx, |view, _| {
+        assert!(
+            view.schema_sheet.is_none(),
+            "the sheet ran and closed: {:?}",
+            view.schema_sheet
+                .as_ref()
+                .and_then(|sheet| sheet.error.clone())
+        );
+    });
+}
+
+/// + Column: typed into the sheet, previewed, run -- and on disk.
+#[gpui::test]
+fn a_column_is_added_from_the_structure_pane(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "add-column");
+    let path = db.path.clone();
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| view.add_column_sheet(cx));
+    cx.simulate_keystrokes(&typing("joined"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("TEXT"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("'2024'"));
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_ref().expect("open");
+        assert_eq!(
+            sheet.statements(Driver::Sqlite).unwrap(),
+            [r#"ALTER TABLE "main"."members" ADD COLUMN "joined" TEXT DEFAULT '2024'"#],
+            "the preview is what will run"
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+
+    assert_eq!(
+        read_back(&path, "SELECT joined FROM members ORDER BY id"),
+        vec![vec!["2024".to_string()], vec!["2024".to_string()]]
+    );
+    settle(&view, cx, |view| {
+        view.tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .is_some_and(|result| result.structure.iter().any(|c| c.name == "joined"))
+    });
+    view.update(cx, |view, _| {
+        let result = view.tabs.active().and_then(|tab| tab.result()).unwrap();
+        assert!(
+            result.structure.iter().any(|c| c.name == "joined"),
+            "the pane caught up"
+        );
+    });
+}
+
+/// + Index: columns picked in order, listed back after it runs.
+#[gpui::test]
+fn an_index_is_added_and_listed(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "add-index");
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| view.add_index_sheet(cx));
+    cx.simulate_keystrokes(&typing("by_team"));
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_mut().unwrap();
+        sheet.picked = vec!["team_slug".into(), "name".into()];
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+    settle(&view, cx, |view| {
+        matches!(view.tabs.active(), Some(WorkspaceTab::Table { indexes: Some(found), .. })
+            if found.iter().any(|index| index.name == "by_team"))
+    });
+    view.update(cx, |view, _| {
+        let Some(WorkspaceTab::Table {
+            indexes: Some(found),
+            ..
+        }) = view.tabs.active()
+        else {
+            panic!("indexes read");
+        };
+        let made = found
+            .iter()
+            .find(|index| index.name == "by_team")
+            .expect("listed");
+        assert_eq!(made.columns, ["team_slug", "name"]);
+    });
+}
+
+/// SQLite cannot retype a column in place: the sheet says so where the SQL
+/// would be, and Run does nothing.
+#[gpui::test]
+fn sqlite_retyping_is_refused_before_it_runs(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "retype");
+    let path = db.path.clone();
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| {
+        let name = view
+            .tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|result| result.structure.iter().find(|c| c.name == "name").cloned())
+            .unwrap();
+        view.edit_column_sheet(name, cx);
+    });
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("BLOB"));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_ref().expect("still open");
+        let refused = sheet.statements(Driver::Sqlite).unwrap_err();
+        assert!(refused.contains("SQLite cannot"), "{refused}");
+        assert!(sheet
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("SQLite cannot")));
+    });
+    assert_eq!(
+        read_back(
+            &path,
+            "SELECT type FROM pragma_table_info('members') WHERE name = 'name'"
+        ),
+        vec![vec!["TEXT".to_string()]],
+        "nothing ran"
+    );
+}
+
+/// New Table…: a name, a keyed column and another, and it opens on its
+/// structure once made.
+#[gpui::test]
+fn a_table_is_created_from_the_sheet(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "create-table-sheet");
+    let path = db.path.clone();
+
+    view.update(cx, |view, cx| {
+        view.create_table_sheet(Some("main".into()), cx)
+    });
+    cx.simulate_keystrokes(&typing("tags"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("id"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("INTEGER"));
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_mut().unwrap();
+        sheet.new_columns[0].key = true;
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+
+    assert_eq!(
+        read_back(&path, "SELECT name, pk FROM pragma_table_info('tags')"),
+        vec![vec!["id".to_string(), "1".to_string()]]
+    );
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.tabs
+                .active()
+                .and_then(|tab| tab.table_ref())
+                .map(|t| t.name.clone()),
+            Some("tags".to_string()),
+            "the new table is in front"
+        );
+    });
+}
+
+/// Drop is a sheet too: the statement is shown before it runs.
+#[gpui::test]
+fn a_column_is_dropped_after_its_statement_is_shown(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "drop-column");
+    let path = db.path.clone();
+    open_members_structure(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.drop_column_sheet("team_slug".into(), cx)
+    });
+    view.update(cx, |view, _| {
+        let sheet = view.schema_sheet.as_ref().unwrap();
+        assert_eq!(
+            sheet.statements(Driver::Sqlite).unwrap(),
+            [r#"ALTER TABLE "main"."members" DROP COLUMN "team_slug""#]
+        );
+    });
+    cx.simulate_keystrokes("enter");
+    settle_sheet(&view, cx);
+    assert!(
+        read_back(&path, "SELECT name FROM pragma_table_info('members')")
+            .iter()
+            .all(|row| row[0] != "team_slug")
+    );
+}
+
+/// A read-only connection does not open the sheet at all.
+#[gpui::test]
+fn a_read_only_connection_will_not_change_a_table(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "ddl-read-only");
+    open_members_structure(&view, cx);
+    view.update(cx, |view, cx| {
+        let id = view.workspace.active_id().unwrap();
+        view.workspace.get_mut(id).unwrap().config.read_only = true;
+        view.add_column_sheet(cx);
+        assert!(view.schema_sheet.is_none(), "refused before it opened");
+    });
+}
+
+/// The structure pane and every kind of structure sheet paint, at every
+/// window size.
+#[gpui::test]
+fn the_structure_pane_and_its_sheets_draw(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "structure-draw");
+    open_members_structure(&view, cx);
+    draw_at_every_size(&view, cx);
+
+    let name = view.update(cx, |view, _| {
+        view.tabs
+            .active()
+            .and_then(|tab| tab.result())
+            .and_then(|result| result.structure.first().cloned())
+            .unwrap()
+    });
+    type Opener = Box<dyn Fn(&mut DbUi, &mut gpui::Context<DbUi>)>;
+    let openers: Vec<Opener> = vec![
+        Box::new(|view, cx| view.add_column_sheet(cx)),
+        Box::new(move |view, cx| view.edit_column_sheet(name.clone(), cx)),
+        Box::new(|view, cx| view.drop_column_sheet("name".into(), cx)),
+        Box::new(|view, cx| view.add_index_sheet(cx)),
+        Box::new(|view, cx| view.drop_index_sheet("by_name".into(), cx)),
+        Box::new(|view, cx| view.create_table_sheet(None, cx)),
+    ];
+    for open_sheet in openers {
+        view.update(cx, |view, cx| open_sheet(view, cx));
+        view.update(cx, |view, _| assert!(view.schema_sheet.is_some()));
+        draw_at_every_size(&view, cx);
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |view, _| {
+            assert!(view.schema_sheet.is_none(), "Esc closes it")
+        });
+    }
 }
 
 /// A statement the engine refuses lands on the tab, not only in the footer.
@@ -8228,6 +8849,60 @@ fn settle_column(view: &Entity<DbUi>, cx: &mut VisualTestContext, column: usize,
             .filter_map(|row| row.get(column).cloned())
             .collect();
         got == want
+    });
+}
+
+/// Tabs as a relaunch leaves them: the same tables, and no rows in any.
+fn restore_two_tabs(view: &Entity<DbUi>, cx: &mut VisualTestContext) {
+    let saved = view.update(cx, |view, cx| {
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+        view.open_table_tab(TableRef::new("main", "teams"), cx);
+        view.tabs.to_saved().0
+    });
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.tabs = crate::tabs::Tabs::from_saved(&saved, 0);
+        cx.notify();
+    });
+}
+
+/// A restored tab that was not in front loads when it is brought there.
+///
+/// Launch only loads the front tab. Switching used to show the other one
+/// empty for good -- closing it and opening the table again was the only way
+/// to get its rows.
+#[gpui::test]
+fn a_restored_tab_behind_the_front_one_loads_when_switched_to(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "restored-switch");
+    restore_two_tabs(&view, cx);
+
+    view.update(cx, |view, cx| view.activate_tab(1, cx));
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert!(
+            !grid_rows(view).is_empty(),
+            "the tab brought forward loaded"
+        );
+        assert_eq!(
+            view.tabs
+                .active()
+                .and_then(|tab| tab.table_ref())
+                .map(|t| t.name.clone()),
+            Some("teams".to_string())
+        );
+    });
+}
+
+/// Same, when it comes to the front because the one before it was closed.
+#[gpui::test]
+fn a_restored_tab_loads_when_closing_the_front_one_reveals_it(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "restored-close");
+    restore_two_tabs(&view, cx);
+
+    view.update(cx, |view, cx| view.close_tab_now(0, cx));
+    settle_rows(&view, cx);
+    view.update(cx, |view, _| {
+        assert!(!grid_rows(view).is_empty(), "the tab left in front loaded");
     });
 }
 

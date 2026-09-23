@@ -4,13 +4,13 @@ mod catalog;
 mod decode;
 
 use crate::error::{DriverError, Result};
-use crate::port::{DatabaseDriver, RowBatch, RowUpdate};
+use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Page, QueryOutcome,
-    QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table, TableRef,
-    TlsMode, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
+    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
+    TableRef, TlsMode, Value,
 };
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
@@ -340,12 +340,54 @@ impl DatabaseDriver for MySqlDriver {
         Ok(total)
     }
 
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {
+        let rows = sqlx::query(catalog::INDEXES)
+            .bind(&table.schema)
+            .bind(&table.name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::catalog(&error))?;
+        Ok(crate::port::group_indexes(
+            rows.iter()
+                .filter_map(|row| {
+                    let name = row.try_get::<String, _>("index_name").ok()?;
+                    let primary = name == "PRIMARY";
+                    Some((
+                        name,
+                        row.try_get::<i64, _>("non_unique").unwrap_or(1) == 0,
+                        primary,
+                        row.try_get::<Option<String>, _>("column_name")
+                            .ok()
+                            .flatten(),
+                    ))
+                })
+                .collect(),
+        ))
+    }
+
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_tracked(sql, &QueryToken::new()).await
+    }
+
+    async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
+        // On a connection of its own, held for the whole statement, so the
+        // session id recorded first is the session the statement runs on.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?;
+        let session: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?;
+        let _tracking = token.track(session as u64);
+
         let started = Instant::now();
 
         let outcome = if query::returns_rows(sql) {
             let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *conn)
                 .await
                 .map_err(|error| DriverError::query(sql, &error))?;
             let mut set = build_result_set(rows, usize::MAX);
@@ -353,7 +395,7 @@ impl DatabaseDriver for MySqlDriver {
             QueryOutcome::Rows(set)
         } else {
             let done = sqlx::query(AssertSqlSafe(sql.to_string()))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await
                 .map_err(|error| DriverError::query(sql, &error))?;
             QueryOutcome::Affected(done.rows_affected())
@@ -366,6 +408,21 @@ impl DatabaseDriver for MySqlDriver {
                 elapsed: started.elapsed(),
             },
         })
+    }
+
+    async fn cancel(&self, token: &QueryToken) -> Result<bool> {
+        let Some(session) = token.session() else {
+            return Ok(false);
+        };
+        // `KILL` takes a literal, not a parameter. The id is a number this
+        // driver read back from the server itself, so there is nothing here
+        // for a statement to be smuggled in through.
+        let kill = format!("KILL QUERY {session}");
+        sqlx::query(AssertSqlSafe(kill.clone()))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(kill, &error))?;
+        Ok(true)
     }
 
     async fn close(&self) {

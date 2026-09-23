@@ -1,15 +1,15 @@
-# dbui — build, bundle, sign, notarize, release.
+# dbui — build, bundle, sign, release.
 #
 # The short version:
 #
 #   make run                 debug build, straight to a window
 #   make test                the whole workspace
-#   make bundle              build/dbui.app (universal, signed if a cert exists)
-#   make release-macos       bundle + notarize + .dmg + .zip, all stapled
+#   make signing-cert        one-time: create the release signing certificate
+#   make bundle              build/dbui.app (universal, signed if the cert exists)
+#   make release-macos       bundle + .dmg + .zip + SHA256SUMS
 #
-# `release-macos` is the one that produces GitHub release assets. It needs a
-# "Developer ID Application" certificate and notarytool credentials; see
-# `notarize` below and RELEASING.md.
+# `release-macos` is the one that produces GitHub release assets. It needs the
+# self-signed release certificate from `signing-cert`; see RELEASING.md.
 
 SHELL := /bin/bash
 
@@ -31,31 +31,32 @@ ZIP      := $(BUILD)/dbui-$(VERSION)-universal.zip
 TARGETS  := aarch64-apple-darwin x86_64-apple-darwin
 SLICES   := $(foreach t,$(TARGETS),target/$(t)/release/dbui)
 
-# Signing + notarization (ZENIT GROUP LLC, same identity as edui). CODESIGN_ID
-# auto-selects the "Developer ID Application" identity if one is installed, else
-# falls back to an ad-hoc signature -- runnable locally, Gatekeeper-blocked when
-# downloaded.
-TEAM_ID        := D7HN42D467
-NOTARY_PROFILE ?= dbui-notary
+# Signing. Releases are signed with a self-signed certificate rather than an
+# Apple Developer ID, so they are *not* notarized: a browser download is
+# Gatekeeper-blocked until the user picks "Open Anyway" once (see README.md).
+# What the certificate buys is a stable identity -- the in-app updater only
+# installs a bundle signed by the same certificate as the running copy, and the
+# keychain keeps its "Always Allow" across releases.
+#
+# CODESIGN_ID is the certificate's SHA-1, auto-selected from the keychain by
+# name; with none installed it falls back to an ad-hoc signature, which runs
+# locally but can never be published (see `publish`).
+SIGN_CERT_NAME := dbui Release Signing
+# Where `signing-cert` leaves the password-protected backup of the private key.
+SIGNING_DIR    ?= $(HOME)/dbui-signing
 # Must match CFBundleIdentifier in packaging/Info.plist.in: signing debug builds
 # under the same identifier gives them the same code identity as the shipped
 # app, so both are the same "application" as far as the keychain is concerned.
 BUNDLE_ID      := com.gzenit.dbui
 CODESIGN_ID    ?= $(shell security find-identity -v -p codesigning 2>/dev/null \
-                    | awk -F'"' '/Developer ID Application/{print $$2; exit}')
-
-# notarytool takes either a stored keychain profile (local, what a developer
-# sets up once) or an Apple ID + app-specific password (CI, where there is no
-# login keychain to store anything in). Passing APPLE_ID switches to the latter.
-ifdef APPLE_ID
-NOTARY_AUTH := --apple-id "$(APPLE_ID)" --team-id "$(TEAM_ID)" --password "$(APPLE_APP_PASSWORD)"
-else
-NOTARY_AUTH := --keychain-profile "$(NOTARY_PROFILE)"
-endif
+                    | awk '/"$(SIGN_CERT_NAME)"/{print $$2; exit}')
+# What a release bundle has to satisfy: our identifier, signed by our
+# certificate. This is the same requirement the updater checks on the far end.
+RELEASE_REQ    := identifier "$(BUNDLE_ID)" and certificate root = H"$(CODESIGN_ID)"
 
 .PHONY: all run sign-dev test preflight smoke fmt clippy check-version icon \
-        universal bundle sign \
-        notarize dmg notarize-dmg zip-app checksums release-macos publish \
+        signing-cert universal bundle sign \
+        dmg zip-app checksums release-macos publish \
         verify clean
 
 all: bundle
@@ -70,8 +71,8 @@ run: sign-dev
 # on every rebuild. The keychain matches that requirement when deciding whether
 # an app may read a secret, so each rebuild looks like a different application
 # and re-prompts for every saved connection password. Re-signing with the
-# Developer ID identity under a fixed identifier makes the requirement
-# identity-based, and one "Always Allow" then holds across rebuilds.
+# release certificate (`make signing-cert`) under a fixed identifier makes the
+# requirement identity-based, and one "Always Allow" then holds across rebuilds.
 #
 # The first run after switching still prompts once per existing secret, because
 # those ACLs were granted to the old ad-hoc hashes.
@@ -82,7 +83,7 @@ sign-dev:
 	    codesign --force --identifier $(BUNDLE_ID) \
 	        --sign "$(CODESIGN_ID)" target/debug/dbui; \
 	else \
-	    echo "  SIGN  skipped (no Developer ID cert -- expect keychain prompts every rebuild)"; \
+	    echo "  SIGN  skipped (no '$(SIGN_CERT_NAME)' cert -- expect keychain prompts every rebuild)"; \
 	fi
 
 test:
@@ -164,6 +165,51 @@ icon:
 	@iconutil -c icns $(BUILD)/dbui.iconset -o packaging/dbui.icns
 	@rm -rf $(BUILD)/dbui.iconset
 
+# -- signing certificate --------------------------------------------------
+
+# Create the self-signed release certificate, import it into the login
+# keychain, and trust it for code signing. Run once, on the release machine.
+#
+# It asks for two things: a password for the backup .p12 it writes to
+# $(SIGNING_DIR), and your macOS password (the trust change is a system prompt).
+#
+# BACK UP THE .p12. The updater in every shipped copy only accepts bundles
+# signed by this exact certificate; lose the private key and those copies can
+# never auto-update again -- their users have to reinstall by hand.
+signing-cert:
+	@if [ -n "$(CODESIGN_ID)" ]; then \
+	    echo "ERROR: '$(SIGN_CERT_NAME)' already exists ($(CODESIGN_ID)) -- a second"; \
+	    echo "       one would break updates for every copy signed with the first."; \
+	    exit 1; \
+	fi
+	@test ! -e "$(SIGNING_DIR)/dbui-signing.p12" || \
+	    (echo "ERROR: $(SIGNING_DIR)/dbui-signing.p12 exists -- import it instead of"; \
+	     echo "       making a new one (RELEASING.md, 'A new Mac')."; \
+	     exit 1)
+	@mkdir -p "$(SIGNING_DIR)" && chmod 700 "$(SIGNING_DIR)"
+	@work=$$(mktemp -d) && trap 'rm -rf "$$work"' EXIT && \
+	printf '%s\n' '[req]' 'distinguished_name=dn' 'prompt=no' \
+	    '[dn]' 'CN=$(SIGN_CERT_NAME)' \
+	    '[ext]' 'basicConstraints=critical,CA:false' \
+	    'keyUsage=critical,digitalSignature' 'extendedKeyUsage=critical,codeSigning' \
+	    > "$$work/cfg" && \
+	openssl req -x509 -newkey rsa:3072 -nodes -days 7300 -config "$$work/cfg" \
+	    -extensions ext -keyout "$$work/key.pem" -out "$(SIGNING_DIR)/dbui-signing.cer" \
+	    2>/dev/null && \
+	read -rsp "  Password for the backup .p12: " pw && echo && \
+	{ test -n "$$pw" || { echo "ERROR: empty password"; exit 1; }; } && \
+	PW="$$pw" openssl pkcs12 -export -inkey "$$work/key.pem" \
+	    -in "$(SIGNING_DIR)/dbui-signing.cer" -name "$(SIGN_CERT_NAME)" \
+	    -out "$(SIGNING_DIR)/dbui-signing.p12" -passout env:PW && \
+	chmod 600 "$(SIGNING_DIR)/dbui-signing.p12" && \
+	security import "$(SIGNING_DIR)/dbui-signing.p12" -P "$$pw" -T /usr/bin/codesign && \
+	echo "  TRUST (macOS will ask for your password)" && \
+	security add-trusted-cert -r trustRoot -p codeSign \
+	    -k ~/Library/Keychains/login.keychain-db "$(SIGNING_DIR)/dbui-signing.cer"
+	@security find-identity -v -p codesigning | grep "$(SIGN_CERT_NAME)" || \
+	    (echo "ERROR: the certificate is not a valid signing identity"; exit 1)
+	@echo "  ->    BACK UP $(SIGNING_DIR)/dbui-signing.p12 and its password somewhere safe"
+
 # -- build ----------------------------------------------------------------
 
 # One release build per architecture, then `lipo` them into a fat binary.
@@ -194,60 +240,23 @@ bundle: universal
 	@touch $(APP)
 	@$(MAKE) --no-print-directory sign
 
-# Sign inside-out. With a Developer ID identity, enable the hardened runtime and
-# a secure timestamp -- both are required for notarization; otherwise ad-hoc.
+# Sign inside-out, with the hardened runtime. No secure timestamp: Apple's
+# timestamp service is for Developer ID signatures, and nothing here checks one.
 sign:
 	@if [ -n "$(CODESIGN_ID)" ]; then \
-	    echo "  SIGN  $(CODESIGN_ID) (hardened runtime)"; \
-	    codesign --force --options runtime --timestamp \
+	    echo "  SIGN  $(SIGN_CERT_NAME) (hardened runtime)"; \
+	    codesign --force --options runtime --identifier $(BUNDLE_ID) \
 	        --sign "$(CODESIGN_ID)" $(APP_BIN)/dbui; \
-	    codesign --force --options runtime --timestamp \
+	    codesign --force --options runtime --identifier $(BUNDLE_ID) \
 	        --sign "$(CODESIGN_ID)" $(APP); \
 	else \
-	    echo "  SIGN  ad-hoc (no Developer ID cert -- downloads will be Gatekeeper-blocked)"; \
+	    echo "  SIGN  ad-hoc (no '$(SIGN_CERT_NAME)' cert -- not publishable)"; \
 	    codesign --force --deep --sign - $(APP) >/dev/null 2>&1 || true; \
 	fi
 
-# -- notarize -------------------------------------------------------------
-
-# Submit the Developer ID-signed app to Apple's notary service and staple the
-# ticket onto dbui.app, so a downloaded copy opens with no Gatekeeper warning --
-# no right-click, no xattr. Requires:
-#   1. A "Developer ID Application" cert (Xcode > Settings > Accounts >
-#      ZENIT GROUP LLC > Manage Certificates > + > Developer ID Application).
-#   2. A stored notarytool credential named $(NOTARY_PROFILE), one-time:
-#        xcrun notarytool store-credentials $(NOTARY_PROFILE) \
-#          --apple-id <apple-id> --team-id $(TEAM_ID) \
-#          --password <app-specific-password>   # appleid.apple.com > Sign-In & Security
-#      In CI there is no keychain: pass APPLE_ID + APPLE_APP_PASSWORD instead.
-notarize:
-	@if [ -z "$(CODESIGN_ID)" ]; then \
-	    echo "ERROR: no Developer ID Application cert found -- cannot notarize."; exit 1; \
-	fi
-	@echo "  NOTARIZE submitting $(APP)"
-	@/usr/bin/ditto -c -k --keepParent $(APP) $(BUILD)/notarize.zip
-	@xcrun notarytool submit $(BUILD)/notarize.zip $(NOTARY_AUTH) --wait
-	@xcrun stapler staple $(APP)
-	@rm -f $(BUILD)/notarize.zip
-	@echo "  ->    stapled $(APP)"
-
-# Notarize the .dmg itself and staple the ticket to it.
-#
-# Stapling the app is not enough for a .dmg download: Gatekeeper assesses the
-# disk image too, and without its own ticket that check needs the network -- so
-# a first open offline, or behind a blocked notary endpoint, warns.
-notarize-dmg:
-	@test -f $(DMG) || (echo "ERROR: no $(DMG) -- run 'make dmg' first"; exit 1)
-	@echo "  NOTARIZE $(DMG)"
-	@xcrun notarytool submit $(DMG) $(NOTARY_AUTH) --wait
-	@xcrun stapler staple $(DMG)
-	@xcrun stapler validate $(DMG)
-	@echo "  ->    stapled $(DMG)"
-
 # -- package --------------------------------------------------------------
 
-# A drag-to-Applications disk image. Run after `notarize` so the app inside
-# carries its own stapled ticket too.
+# A drag-to-Applications disk image.
 dmg:
 	@echo "  DMG   $(DMG)"
 	@rm -rf $(BUILD)/dmgroot $(DMG)
@@ -269,17 +278,15 @@ dmg:
 	    echo "        hdiutil busy, retrying ($$attempt/5)"; sleep 3; \
 	done
 	@rm -rf $(BUILD)/dmgroot $(BUILD)/hdiutil.err
-	@# Sign the image itself. Stapling alone puts a ticket on it, but Gatekeeper
-	@# also wants a signature to assess -- without one `spctl --assess` reports
-	@# "no usable signature" even though the app inside is notarized.
+	@# Sign the image too, so a tampered download fails `codesign --verify`.
 	@if [ -n "$(CODESIGN_ID)" ]; then \
-	    codesign --force --timestamp --sign "$(CODESIGN_ID)" $(DMG); \
+	    codesign --force --sign "$(CODESIGN_ID)" $(DMG); \
 	fi
 	@echo "  ->    $(DMG)"
 
 # Zip whatever dbui.app is sitting in build/, without touching it. `ditto`
 # rather than `zip` because it preserves the bundle's symlinks and extended
-# attributes -- including the stapled notarization ticket.
+# attributes, which the code signature depends on.
 #
 # This is the asset the in-app updater downloads: a .zip can be expanded and
 # swapped in place, where a .dmg would have to be mounted first.
@@ -289,21 +296,21 @@ zip-app:
 	@cd $(BUILD) && /usr/bin/ditto -c -k --keepParent dbui.app $(notdir $(ZIP))
 	@echo "  ->    $(ZIP)"
 
-# Full notarized macOS release: build + sign + notarize + staple the app, then a
-# .dmg that is itself notarized + stapled, then the .zip for the updater. Two
-# notary submissions, because the app and the disk image are assessed
-# separately -- the result opens offline, with no warnings.
-release-macos: check-version bundle
-	@$(MAKE) --no-print-directory notarize
+# Full macOS release: build + sign the app, then the .dmg people download and
+# the .zip the updater downloads. Refuses to start without the release
+# certificate -- an ad-hoc build is one no installed copy would accept.
+release-macos: check-version
+	@test -n "$(CODESIGN_ID)" || \
+	    (echo "ERROR: no '$(SIGN_CERT_NAME)' certificate -- see 'make signing-cert'"; exit 1)
+	@$(MAKE) --no-print-directory bundle
 	@$(MAKE) --no-print-directory dmg
-	@$(MAKE) --no-print-directory notarize-dmg
 	@$(MAKE) --no-print-directory zip-app
 	@$(MAKE) --no-print-directory checksums
 	@$(MAKE) --no-print-directory verify
-	@echo "  DONE  $(DMG) + $(ZIP) (notarized + stapled, universal)"
+	@echo "  DONE  $(DMG) + $(ZIP) (signed, not notarized, universal)"
 
 # The updater checks the download against this before it installs anything, so
-# a release without it downgrades to signature-checking alone.
+# a corrupted download is caught before it is ever expanded.
 checksums:
 	@echo "  SUMS  $(BUILD)/SHA256SUMS"
 	@cd $(BUILD) && shasum -a 256 $(notdir $(DMG)) $(notdir $(ZIP)) > SHA256SUMS
@@ -311,8 +318,8 @@ checksums:
 
 # Publish the artifacts already sitting in build/ as a GitHub release, from
 # here rather than from a runner. `release-macos` has to have run first --
-# this uploads, it does not build, so it cannot publish something unnotarized
-# by accident.
+# this uploads, it does not build, so it cannot publish an unsigned build by
+# accident.
 #
 #   make publish TAG=v0.1.0
 publish:
@@ -320,27 +327,27 @@ publish:
 	@$(MAKE) --no-print-directory check-version TAG=$(TAG)
 	@test -f $(DMG) && test -f $(ZIP) && test -f $(BUILD)/SHA256SUMS || \
 	    (echo "ERROR: no release artifacts -- run 'make release-macos' first"; exit 1)
-	@# Refuse to publish a build Gatekeeper would reject. Catching it here is
+	@# Refuse to publish a build the updater would reject. Catching it here is
 	@# the difference between a bad release and no release.
-	@spctl --assess --type execute $(APP) >/dev/null 2>&1 || \
-	    (echo "ERROR: $(APP) is not notarized -- run 'make release-macos'"; exit 1)
+	@{ test -n "$(CODESIGN_ID)" && \
+	    codesign --verify --deep --strict -R='=$(RELEASE_REQ)' $(APP) 2>/dev/null; } || \
+	    (echo "ERROR: $(APP) is not signed with '$(SIGN_CERT_NAME)' -- run 'make release-macos'"; exit 1)
 	@echo "  PUBLISH $(TAG)"
 	@gh release create $(TAG) $(DMG) $(ZIP) $(BUILD)/SHA256SUMS \
 	    --title "dbui $(TAG)" --generate-notes
 	@echo "  ->    $$(gh release view $(TAG) --json url -q .url)"
 
-# What a user's machine will conclude about the build. `spctl` is the same
-# assessment Gatekeeper runs on first open, so a pass here means a pass there.
+# What the updater in an installed copy will conclude about the build: a sound
+# signature, and a designated requirement naming our certificate. (`spctl`
+# would say "rejected" -- expected, since nothing here is notarized.)
 verify:
 	@echo "  VERIFY $(APP)"
 	@codesign --verify --deep --strict --verbose=2 $(APP) 2>&1 | sed 's/^/        /'
-	@spctl --assess --type execute --verbose=4 $(APP) 2>&1 | sed 's/^/        /'
+	@codesign -d -r- $(APP) 2>&1 | sed -n 's/^.*designated => /        requirement: /p'
 	@lipo -archs $(APP_BIN)/dbui | sed 's/^/        archs: /'
-	@# The disk image is assessed separately from the app inside it.
 	@if [ -f $(DMG) ]; then \
 	    echo "  VERIFY $(DMG)"; \
-	    spctl --assess --type open --context context:primary-signature -v $(DMG) 2>&1 \
-	        | sed 's/^/        /'; \
+	    codesign --verify --verbose=2 $(DMG) 2>&1 | sed 's/^/        /'; \
 	fi
 
 clean:

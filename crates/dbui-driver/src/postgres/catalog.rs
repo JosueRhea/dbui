@@ -113,3 +113,25 @@ pub fn table_kind(relkind: &str) -> dbui_domain::TableKind {
         _ => TableKind::Table,
     }
 }
+
+/// One table's indexes, one row per indexed column, in index order.
+///
+/// `indkey` lists the table's attribute numbers; `WITH ORDINALITY` keeps
+/// their order, and a zero -- an expression, not a column -- drops out of
+/// the join rather than naming nothing.
+pub const INDEXES: &str = "
+    SELECT i.relname::text     AS index_name,
+           ix.indisunique      AS is_unique,
+           ix.indisprimary     AS is_primary,
+           a.attname::text     AS column_name
+      FROM pg_catalog.pg_index ix
+      JOIN pg_catalog.pg_class i     ON i.oid = ix.indexrelid
+      JOIN pg_catalog.pg_class t     ON t.oid = ix.indrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+      CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, position)
+      LEFT JOIN pg_catalog.pg_attribute a
+             ON a.attrelid = t.oid AND a.attnum = k.attnum
+     WHERE n.nspname = $1
+       AND t.relname = $2
+     ORDER BY i.relname, k.position
+";

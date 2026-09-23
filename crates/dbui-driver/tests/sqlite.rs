@@ -578,3 +578,123 @@ async fn closing_is_idempotent() {
     db.close().await;
     assert!(db.ping().await.is_err());
 }
+
+// -- stopping a statement mid-run -----------------------------------------
+
+/// Counts to a number far past anything that finishes in a test's lifetime,
+/// in one step's worth of result: exactly the shape of query that dropping a
+/// future cannot stop, because the work is all inside one `sqlite3_step`.
+const RUNAWAY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+                       SELECT count(*) FROM (SELECT i FROM n LIMIT 5000000000)";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_statement_stops_and_frees_the_connection() {
+    let db = open("cancel").await;
+    let token = dbui_driver::QueryToken::new();
+
+    let started = std::time::Instant::now();
+    let run = db.execute_tracked(RUNAWAY, &token);
+    let stop = async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.cancel(&token).await
+    };
+    let (result, told) = tokio::join!(run, stop);
+
+    assert!(told.expect("cancel"), "a running statement was told");
+    assert!(
+        result.is_err(),
+        "the statement ended with an error, not rows"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "and ended promptly, not when the count ran out: {:?}",
+        started.elapsed()
+    );
+
+    // The one connection is free again, and the stale handler left on it
+    // does not stop the next statement.
+    let after = db.execute("SELECT 1").await.expect("the next query runs");
+    assert!(matches!(after.outcome, QueryOutcome::Rows(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_finished_statement_is_a_no_op() {
+    let db = open("cancel-late").await;
+    let token = dbui_driver::QueryToken::new();
+    db.execute_tracked("SELECT 1", &token).await.expect("runs");
+    assert!(!db.cancel(&token).await.expect("cancel"));
+    db.execute("SELECT 2")
+        .await
+        .expect("and nothing after it is stopped");
+}
+
+/// The structure editor's statements on SQLite: what it can do in place --
+/// add, rename, drop, index -- runs; what it cannot is refused before it runs.
+#[tokio::test]
+async fn the_structure_editor_statements_run_on_sqlite() {
+    use dbui_domain::ddl::{self, ColumnSpec};
+    let db = open("structure-editor").await;
+    let people = TableRef::new("main", "people");
+    let run = |statements: Vec<String>| async {
+        for sql in statements {
+            db.execute(&sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql}\n{error}"));
+        }
+    };
+
+    let motto = ColumnSpec {
+        name: "motto".into(),
+        data_type: "TEXT".into(),
+        nullable: true,
+        default: Some("'hi'".into()),
+    };
+    run(ddl::add_column(Driver::Sqlite, &people, &motto).unwrap()).await;
+    let columns = db.columns(&people).await.unwrap();
+    let added = columns.iter().find(|c| c.name == "motto").expect("added");
+    assert_eq!(added.default.as_deref(), Some("'hi'"));
+
+    let mut renamed = ColumnSpec::of(added);
+    renamed.name = "slogan".into();
+    run(ddl::alter_column(Driver::Sqlite, &people, added, &renamed).unwrap()).await;
+    let columns = db.columns(&people).await.unwrap();
+    let slogan = columns
+        .iter()
+        .find(|c| c.name == "slogan")
+        .expect("renamed");
+
+    let mut retyped = ColumnSpec::of(slogan);
+    retyped.data_type = "INTEGER".into();
+    assert!(ddl::alter_column(Driver::Sqlite, &people, slogan, &retyped).is_err());
+
+    run(ddl::create_index(
+        Driver::Sqlite,
+        &people,
+        "by_slogan",
+        &["slogan".into()],
+        false,
+    )
+    .unwrap())
+    .await;
+    let indexes = db.indexes(&people).await.unwrap();
+    let made = indexes
+        .iter()
+        .find(|i| i.name == "by_slogan")
+        .expect("listed");
+    assert_eq!(made.columns, ["slogan"]);
+    run(ddl::drop_index(Driver::Sqlite, &people, "by_slogan")).await;
+    assert!(db
+        .indexes(&people)
+        .await
+        .unwrap()
+        .iter()
+        .all(|i| i.name != "by_slogan"));
+
+    run(ddl::drop_column(Driver::Sqlite, &people, "slogan")).await;
+    assert!(db
+        .columns(&people)
+        .await
+        .unwrap()
+        .iter()
+        .all(|c| c.name != "slogan"));
+}

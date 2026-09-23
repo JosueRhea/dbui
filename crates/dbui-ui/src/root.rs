@@ -10,11 +10,11 @@ use crate::components::context_menu::{ConfirmPrompt, ContextMenu};
 use crate::components::palette::{Palette, PaletteKind};
 use crate::components::{ConnectionForm, DetailInput, FormAction};
 use crate::sql_complete::CompletionPopup;
-use crate::tabs::{RowDraft, Tabs, WorkspaceTab};
+use crate::tabs::{RowDraft, TabId, Tabs, WorkspaceTab};
 use crate::theme::{metrics, Theme};
 use dbui_app::commands;
 use dbui_app::domain::{
-    Catalog, Column, ColumnInfo, ConnectionId, Page, QueryOutcome, ResultSet, TableRef,
+    Catalog, Column, ColumnInfo, ConnectionId, Page, QueryOutcome, ResultSet, TableRef, Value,
 };
 use dbui_app::{
     session, store, ConnectionStatus, DbRuntime, RowUpdate, SavedConnectionTab, Session, Workspace,
@@ -25,6 +25,8 @@ use gpui::{
     Window,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Which surface the keyboard is talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,8 @@ pub enum Focus {
     /// The table filter box above the tree.
     SidebarSearch,
     Editor,
+    /// The find / replace bar over the SQL editor.
+    Find,
     Grid,
     Detail,
     Filter,
@@ -119,6 +123,10 @@ pub struct ResultView {
     /// touching the rows, which still store their values in the order the
     /// server sent them.
     pub order: Vec<usize>,
+    /// Which arrival this is, unique for the life of the process. The grid
+    /// keys its fade-in on it, so a new page or a re-run fades in and a
+    /// sort or a column drag -- the same rows, rearranged -- does not.
+    pub arrival: u64,
 }
 
 impl ResultView {
@@ -138,6 +146,10 @@ impl ResultView {
             structure,
             origin: Vec::new(),
             order: (0..column_count).collect(),
+            arrival: {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
         }
     }
 
@@ -304,6 +316,22 @@ impl Status {
     }
 }
 
+/// Rows the grid lights up for a moment -- see
+/// [`motion::flash`](crate::components::motion::flash).
+pub(crate) struct RowFlash {
+    pub tab: TabId,
+    pub rows: FlashRows,
+    pub started: Instant,
+}
+
+pub(crate) enum FlashRows {
+    /// Copied: named by position, since the page they sit on stays put.
+    Copied(Vec<usize>),
+    /// Committed: named by key, since the reload that follows a commit moves
+    /// rows around -- and the flash is meant to be seen on the reloaded page.
+    Committed(Vec<Vec<(String, Value)>>),
+}
+
 pub struct DbUi {
     pub(crate) runtime: DbRuntime,
     pub(crate) workspace: Workspace,
@@ -347,6 +375,18 @@ pub struct DbUi {
     /// bottom of the window, and a copy answered only there reads as nothing
     /// having happened.
     pub(crate) copied_cell: Option<(usize, usize)>,
+    /// When [`Self::copied_cell`] was copied: the tint flares and settles
+    /// rather than simply switching on.
+    pub(crate) copied_at: Option<Instant>,
+    /// A grid cell just staged by editing it in place, lit for a moment so
+    /// the eye finds what changed: `(tab, row, column, when)`.
+    pub(crate) cell_flash: Option<(TabId, usize, usize, Instant)>,
+    /// Rows lit for a moment after something happened to them.
+    pub(crate) row_flash: Option<RowFlash>,
+    /// Presses of the two reload buttons. Each spins its icon once, keyed on
+    /// the count so a press mid-spin starts a fresh turn.
+    pub(crate) catalog_refreshes: usize,
+    pub(crate) result_refreshes: usize,
     /// The detail field whose copy button was last pressed.
     ///
     /// The status bar is at the far bottom of the window, and a sidebar
@@ -434,6 +474,24 @@ pub struct DbUi {
     pub(crate) column_move: Option<ColumnMove>,
     /// A tab being dragged along the strip, if one is.
     pub(crate) tab_drag: Option<TabDrag>,
+    /// Runs in flight that Stop can end, by the connection and tab that
+    /// started them -- tab ids restart per connection -- each with the id of
+    /// the run it belongs to.
+    pub(crate) running: HashMap<(Option<ConnectionId>, TabId), (u64, commands::StopHandle)>,
+    /// The sheet for changing a table's shape, while it is open.
+    pub(crate) schema_sheet: Option<crate::components::schema_sheet::SchemaSheet>,
+    /// The find / replace bar over the SQL editor, while it is open.
+    pub(crate) editor_find: Option<crate::components::editor_find::EditorFind>,
+    /// The id the next run gets. Only the run holding a handle may clear it:
+    /// one superseded on the same tab lands late and must leave the live
+    /// run's Stop alone.
+    pub(crate) next_run: u64,
+    /// Where the pointer is while a tab or a column is in hand, for the copy
+    /// of it drawn under the pointer. Window coordinates.
+    pub(crate) drag_pointer: Option<gpui::Point<Pixels>>,
+    /// The underline under the front tab, where it is sliding to, and how
+    /// far down the strip it sits.
+    pub(crate) tab_indicator: Option<(crate::components::motion::Slide, Pixels)>,
     /// Right-click menu, if one is open.
     pub(crate) context_menu: Option<ContextMenu>,
     /// A destructive action waiting on the user typing the table's name.
@@ -445,6 +503,12 @@ pub struct DbUi {
     pub(crate) commit_stamp: u64,
     /// Every statement run, newest first. Loaded once at launch.
     pub(crate) history: dbui_app::History,
+    /// Queries kept under a name.
+    pub(crate) saved_queries: dbui_app::SavedQueries,
+    /// Why the saved-queries file could not be read, when it could not. Saving
+    /// is refused while this is set: the file on disk is someone's kept work,
+    /// and writing the empty list loaded in its place would erase it.
+    pub(crate) saved_queries_unreadable: Option<String>,
 
     /// Vertical scroll of the result grid, and horizontal scroll of the pane
     /// holding it.
@@ -603,6 +667,11 @@ impl DbUi {
             refused_draft: None,
             selected_cell: None,
             copied_cell: None,
+            copied_at: None,
+            cell_flash: None,
+            row_flash: None,
+            catalog_refreshes: 0,
+            result_refreshes: 0,
             copied_field: None,
             modal: None,
             connection_picker_open: false,
@@ -632,6 +701,12 @@ impl DbUi {
             column_drag: None,
             column_move: None,
             tab_drag: None,
+            running: HashMap::new(),
+            editor_find: None,
+            schema_sheet: None,
+            next_run: 0,
+            drag_pointer: None,
+            tab_indicator: None,
             context_menu: None,
             confirm: None,
             close_guard: None,
@@ -652,6 +727,10 @@ impl DbUi {
             history: dbui_app::history::history_path()
                 .map(|path| dbui_app::history::load(&path))
                 .unwrap_or_default(),
+            // Read in `load_saved_queries`, at launch, not here: a view built
+            // by a test must not pick up the user's own saved queries.
+            saved_queries: Default::default(),
+            saved_queries_unreadable: None,
         }
     }
 
@@ -868,6 +947,11 @@ impl DbUi {
         }
         self.leave_front_tab(cx);
         self.tabs.activate(index);
+        // The bar searched the editor that was in front; the next tab's is a
+        // different text, and may not be an editor at all.
+        if self.editor_find.take().is_some() && self.focus == Focus::Find {
+            self.focus = Focus::Editor;
+        }
         self.selected_cell = None;
         self.detail_input = None;
         self.detail_value_menu = None;
@@ -882,6 +966,9 @@ impl DbUi {
         }
         self.persist_session();
         cx.notify();
+        // Launch loads only the front tab; the rest of a restored strip has
+        // no rows until it is brought forward -- which is now.
+        self.load_active_table_if_empty(cx);
     }
 
     /// Close a tab, asking first if it is holding staged changes.
@@ -946,6 +1033,8 @@ impl DbUi {
         }
         self.persist_session();
         cx.notify();
+        // The tab now in front may be a restored one that has never loaded.
+        self.load_active_table_if_empty(cx);
     }
 
     /// The tabs a bulk close is aimed at, left to right.
@@ -1575,6 +1664,7 @@ impl DbUi {
     }
 
     pub(crate) fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        self.catalog_refreshes += 1;
         self.reload_catalog(true, cx);
     }
 
@@ -1939,6 +2029,18 @@ impl DbUi {
         self.selected_cell = None;
         self.copied_cell = None;
         self.copied_field = None;
+        // Positional flashes too: lit rows that were copied from the top of
+        // the page would otherwise light whichever rows sorted up there.
+        self.cell_flash = None;
+        if matches!(
+            self.row_flash,
+            Some(RowFlash {
+                rows: FlashRows::Copied(_),
+                ..
+            })
+        ) {
+            self.row_flash = None;
+        }
 
         self.status = match &next {
             Some(key) if key.ascending => Status::info(format!("Sorted by {column_name} ↑")),
@@ -2100,13 +2202,89 @@ impl DbUi {
     /// user wants to look at before it goes anywhere, and some of them are the
     /// DELETE that made them open the history in the first place.
     pub(crate) fn put_sql_in_editor(&mut self, sql: &str, cx: &mut Context<Self>) {
+        self.load_sql_into_editor(sql, "Loaded from history — ⌘↵ to run", cx);
+    }
+
+    /// Put `sql` in the query tab's editor in place of what is there.
+    ///
+    /// As one edit, so ⌘Z brings back what it replaced: the tab has one
+    /// editor, and whatever was being written in it is not lost to a
+    /// mis-picked history row or saved query.
+    pub(crate) fn load_sql_into_editor(&mut self, sql: &str, said: &str, cx: &mut Context<Self>) {
         self.open_sql_tab(cx);
         if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
-            *editor = crate::text_input::TextInput::with_text(sql.to_string(), true);
+            let end = editor.text().len();
+            editor.replace_range(0..end, sql);
         }
         self.focus = Focus::Editor;
-        self.status = Status::info("Loaded from history — ⌘↵ to run");
+        self.status = Status::info(said.to_string());
         cx.notify();
+    }
+
+    /// ⌘⇧S on a query tab: name the editor's SQL to keep it.
+    pub(crate) fn open_save_query(&mut self, cx: &mut Context<Self>) {
+        let has_sql = matches!(
+            self.tabs.active(),
+            Some(WorkspaceTab::Sql { editor, .. }) if !editor.text().trim().is_empty()
+        );
+        if !has_sql {
+            self.status = Status::info("Write a query first — saving keeps the SQL tab's text");
+            cx.notify();
+            return;
+        }
+        self.open_palette(crate::components::palette::PaletteKind::SaveQuery, cx);
+    }
+
+    /// Keep the query tab's SQL under `name`.
+    pub(crate) fn save_query_as(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(problem) = &self.saved_queries_unreadable {
+            self.status = Status::error(format!(
+                "Not saved: the saved queries file could not be read ({problem})"
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+            return;
+        };
+        let sql = editor.text().trim().to_string();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        self.saved_queries.save(name, &sql, at);
+        self.status = match self.write_saved_queries() {
+            Ok(()) => Status::info(format!("Saved “{}” — ⌘⇧O to open it again", name.trim())),
+            Err(message) => Status::error(message),
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn delete_saved_query(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.saved_queries_unreadable.is_some() || !self.saved_queries.remove(name) {
+            return;
+        }
+        self.status = match self.write_saved_queries() {
+            Ok(()) => Status::info(format!("Deleted “{name}”")),
+            Err(message) => Status::error(message),
+        };
+        cx.notify();
+    }
+
+    fn write_saved_queries(&self) -> Result<(), String> {
+        dbui_app::saved::saved_queries_path()
+            .and_then(|path| dbui_app::saved::save(&path, &self.saved_queries))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Read the saved queries from disk. Called once at launch.
+    pub fn load_saved_queries(&mut self) {
+        let loaded =
+            dbui_app::saved::saved_queries_path().and_then(|path| dbui_app::saved::load(&path));
+        match loaded {
+            Ok(saved) => self.saved_queries = saved,
+            Err(error) => self.saved_queries_unreadable = Some(error.to_string()),
+        }
     }
 
     /// Drop a ready-made statement into the editor at the caret.
@@ -2236,6 +2414,32 @@ impl DbUi {
         }
     }
 
+    /// Whether the front tab has a run that Stop would end.
+    pub(crate) fn active_run_is_stoppable(&self) -> bool {
+        self.tabs.active_id().is_some_and(|tab| {
+            self.running
+                .contains_key(&(self.workspace.active_id(), tab))
+        })
+    }
+
+    /// ⌘. -- end the front tab's run, on the server as well as here.
+    ///
+    /// The handle is taken rather than read, so a second press while the
+    /// server is still winding down is quiet instead of a second cancel.
+    pub(crate) fn stop_query(&mut self, cx: &mut Context<Self>) {
+        let connection = self.workspace.active_id();
+        let Some((_, handle)) = self
+            .tabs
+            .active_id()
+            .and_then(|tab| self.running.remove(&(connection, tab)))
+        else {
+            return;
+        };
+        handle.stop();
+        self.status = Status::busy("Cancelling…");
+        cx.notify();
+    }
+
     /// ⌘⇧↵ target: every statement in the selection, or the whole buffer.
     pub(crate) fn resolve_run_all_sql(&self) -> Option<Vec<String>> {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
@@ -2328,10 +2532,31 @@ impl DbUi {
         }
 
         let sent = statements.clone();
-        let task = commands::run_queries(&self.runtime, driver, statements);
+        let timeout = self
+            .workspace
+            .active()
+            .map(|entry| entry.config.query_timeout_secs)
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)));
+        let (stop_handle, stop) = commands::stop_signal(timeout);
+        // A second run on the same tab replaces the first's handle: that run
+        // is superseded -- its result will be dropped as stale -- and Stop
+        // now means the one the user is looking at.
+        let run = self.next_run;
+        self.next_run += 1;
+        let run_key = (self.workspace.active_id(), tab_id);
+        self.running.insert(run_key, (run, stop_handle));
+        let task = commands::run_queries(&self.runtime, driver, statements, stop);
         cx.spawn(async move |this, cx| {
             let landed = task.await;
             this.update(cx, |this, cx| {
+                if this
+                    .running
+                    .get(&run_key)
+                    .is_some_and(|(held, _)| *held == run)
+                {
+                    this.running.remove(&run_key);
+                }
                 let mut catalog_is_stale = false;
                 this.finish_tab_load(
                     connection,
@@ -2384,6 +2609,19 @@ impl DbUi {
 
         if !sql.is_empty() {
             self.record_history_failure(&sql);
+        }
+
+        // Asked for, so not an error: the tab keeps what it had, and the
+        // footer says where the run was when it stopped.
+        if matches!(error, dbui_app::DriverError::Cancelled { .. }) {
+            if is_active {
+                self.status = Status::info(if succeeded > 0 {
+                    format!("Cancelled after {succeeded} of {} statements", sent.len())
+                } else {
+                    "Cancelled".to_string()
+                });
+            }
+            return;
         }
 
         let failure = crate::tabs::StatementError {
@@ -2597,6 +2835,7 @@ impl DbUi {
     }
 
     pub(crate) fn refresh_result(&mut self, cx: &mut Context<Self>) {
+        self.result_refreshes += 1;
         match self.tabs.active() {
             Some(WorkspaceTab::Table { .. }) => self.load_active_table(cx),
             Some(WorkspaceTab::Sql { .. }) => self.run_query(cx),
@@ -2605,8 +2844,20 @@ impl DbUi {
     }
 
     pub(crate) fn set_table_pane(&mut self, pane: crate::tabs::TablePane, cx: &mut Context<Self>) {
-        if let Some(WorkspaceTab::Table { pane: tab_pane, .. }) = self.tabs.active_mut() {
+        let mut needs_indexes = false;
+        if let Some(WorkspaceTab::Table {
+            pane: tab_pane,
+            indexes,
+            ..
+        }) = self.tabs.active_mut()
+        {
             *tab_pane = pane;
+            // Read when first asked for, not with every page of rows: most
+            // visits to a table never look at its indexes.
+            needs_indexes = pane == crate::tabs::TablePane::Structure && indexes.is_none();
+        }
+        if needs_indexes {
+            self.load_indexes(cx);
         }
         cx.notify();
     }
@@ -2980,7 +3231,11 @@ impl DbUi {
             return true;
         }
         match self.focus {
-            Focus::Editor | Focus::Filter | Focus::PageSize | Focus::SidebarSearch => true,
+            Focus::Editor
+            | Focus::Find
+            | Focus::Filter
+            | Focus::PageSize
+            | Focus::SidebarSearch => true,
             Focus::Detail => self.detail_input.is_some(),
             Focus::Sidebar | Focus::Grid => false,
         }
@@ -3180,6 +3435,7 @@ impl DbUi {
         let Some(drag) = self.tab_drag.take() else {
             return;
         };
+        self.drag_pointer = None;
         if drag.moved {
             match self.tabs.items.iter().position(|tab| tab.id() == drag.id) {
                 // `activate_tab` writes the session on its way through.
@@ -3555,16 +3811,24 @@ impl DbUi {
             return;
         };
         let typed = self.cell_editor.text().to_string();
+        let tab_id = self.tabs.active_id();
+        let mut changed = false;
         if let Some(WorkspaceTab::Table {
             draft: Some(draft), ..
         }) = self.tabs.active_mut()
         {
             if draft.rows == [row] {
                 if let Some((_, input, _)) = draft.fields.get_mut(column) {
+                    changed = input.text() != typed;
                     let multiline = input.is_multiline();
                     *input = crate::text_input::TextInput::with_text(typed, multiline);
                 }
             }
+        }
+        // Only a real change lights up: pressing Enter on an untouched value
+        // staged nothing, and a flash would claim otherwise.
+        if let Some(tab) = tab_id.filter(|_| changed) {
+            self.cell_flash = Some((tab, row, column, Instant::now()));
         }
         self.focus = Focus::Grid;
         cx.notify();
@@ -3750,6 +4014,7 @@ impl DbUi {
         let Some(drag) = self.column_move.take() else {
             return;
         };
+        self.drag_pointer = None;
         if !drag.moved {
             let name = self
                 .tabs
@@ -3978,24 +4243,41 @@ impl DbUi {
             return;
         };
 
+        self.stage_named_rows(pasted, "Pasted", cx);
+    }
+
+    /// Stage rows that name their columns -- pasted, or read from a file --
+    /// as inserts into the front table.
+    ///
+    /// Columns are matched by name, exactly first and then ignoring case,
+    /// since a spreadsheet round trip often changes a header's case. A name
+    /// the table does not have is ignored rather than refused: three of five
+    /// columns is a reasonable thing to bring in. So is a name that appears
+    /// twice -- the first one is used and the repeat ignored and counted,
+    /// where it used to overwrite the first cell without a word.
+    pub(crate) fn stage_named_rows(
+        &mut self,
+        incoming: crate::row_export::PastedRows,
+        verb: &str,
+        cx: &mut Context<Self>,
+    ) {
         let Some(WorkspaceTab::Table {
             result: Some(view), ..
         }) = self.tabs.active()
         else {
-            self.status = Status::info("Pasting rows needs a table tab");
+            self.status = Status::info("Adding rows needs a table tab");
             cx.notify();
             return;
         };
         let columns = view.set.columns.clone();
         let structure = view.structure.clone();
 
-        // Match by name, case-insensitively as a fallback -- a spreadsheet
-        // round trip often changes the case of a header.
-        let matched: Vec<Option<String>> = pasted
+        let mut taken: Vec<String> = Vec::new();
+        let matched: Vec<Option<String>> = incoming
             .columns
             .iter()
             .map(|name| {
-                columns
+                let column = columns
                     .iter()
                     .find(|column| column.name == *name)
                     .or_else(|| {
@@ -4003,7 +4285,12 @@ impl DbUi {
                             .iter()
                             .find(|column| column.name.eq_ignore_ascii_case(name))
                     })
-                    .map(|column| column.name.clone())
+                    .map(|column| column.name.clone())?;
+                if taken.contains(&column) {
+                    return None;
+                }
+                taken.push(column.clone());
+                Some(column)
             })
             .collect();
 
@@ -4013,7 +4300,7 @@ impl DbUi {
             return;
         }
 
-        let staged: Vec<crate::tabs::PendingRowInsert> = pasted
+        let staged: Vec<crate::tabs::PendingRowInsert> = incoming
             .rows
             .iter()
             .map(|cells| {
@@ -4033,9 +4320,9 @@ impl DbUi {
 
         let plural = if count == 1 { "row" } else { "rows" };
         self.status = Status::info(if ignored > 0 {
-            format!("Pasted {count} {plural} — {ignored} column(s) ignored")
+            format!("{verb} {count} {plural} — {ignored} column(s) ignored")
         } else {
-            format!("Pasted {count} {plural} — ⌘S to commit")
+            format!("{verb} {count} {plural} — ⌘S to commit")
         });
         cx.notify();
     }
@@ -4231,6 +4518,7 @@ impl DbUi {
 
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.copied_cell = Some((row, column));
+        self.copied_at = Some(Instant::now());
         self.status = Status::info(format!("Copied {name}"));
         cx.notify();
         true
@@ -4292,6 +4580,16 @@ impl DbUi {
 
         let count = rows.len();
         let plural = if count == 1 { "row" } else { "rows" };
+        let copied = if selected.is_empty() {
+            (0..count).collect()
+        } else {
+            selected
+        };
+        self.row_flash = Some(RowFlash {
+            tab: tab.id(),
+            rows: FlashRows::Copied(copied),
+            started: Instant::now(),
+        });
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.status = Status::info(format!("Copied {count} {plural}"));
         cx.notify();
@@ -4640,6 +4938,8 @@ impl DbUi {
         cx.notify();
 
         let runtime = self.runtime.clone();
+        let saved_keys: Vec<Vec<(String, Value)>> =
+            edits.iter().map(|edit| edit.pk.clone()).collect();
         let batch = dbui_app::RowBatch {
             inserts,
             updates: edits
@@ -4742,6 +5042,13 @@ impl DbUi {
                         if in_front {
                             this.load_table(tab_id, cx);
                         }
+                        // Lit by key, so the glow lands on the rows as the
+                        // reload redraws them.
+                        this.row_flash = Some(RowFlash {
+                            tab: tab_id,
+                            rows: FlashRows::Committed(saved_keys),
+                            started: Instant::now(),
+                        });
                     }
                     Some(Err(error)) => {
                         // Transaction rolled back — leave everything staged.
@@ -5257,6 +5564,7 @@ impl DbUi {
             || self.settings_menu_open
             || self.detail_menu_open
             || self.page_size_menu_open
+            || self.schema_sheet.is_some()
     }
 
     pub(crate) fn on_key(
@@ -5284,6 +5592,13 @@ impl DbUi {
         // nothing else can be triggered by accident while it is up.
         if self.confirm.is_some() {
             self.handle_confirm_key(keystroke, cx);
+            return;
+        }
+
+        // The structure sheet is modal the same way: a DDL statement is not
+        // something to be set off from underneath it.
+        if self.schema_sheet.is_some() {
+            self.handle_schema_sheet_key(keystroke, cx);
             return;
         }
 
@@ -5663,7 +5978,18 @@ impl DbUi {
             }
         }
 
+        if self.focus == Focus::Find && self.handle_find_key(keystroke, cx) {
+            return;
+        }
+
         if self.focus == Focus::Editor {
+            // ⌘G walks the matches from the editor too, the bar open or not
+            // in focus: find, look, type a fix, ⌘G to the next one.
+            if command && key == "g" && self.editor_find.is_some() {
+                self.find_step(!shift, cx);
+                return;
+            }
+
             // Completion popup owns navigation while open.
             if self.completion.is_some() {
                 match key {
@@ -5706,7 +6032,29 @@ impl DbUi {
             }
 
             if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
-                if editor.handle_key(keystroke, cx) {
+                // What only a code editor does, ahead of the keys every text
+                // field shares: ⌘/ comments lines out, and brackets and
+                // quotes come in pairs. The form fields and filters keep the
+                // plain behaviour -- a `(` that grows a `)` in a password
+                // box is a bug, not a convenience.
+                let plain = !command && !keystroke.modifiers.control && !keystroke.modifiers.alt;
+                let handled = if command && key == "/" {
+                    editor.toggle_line_comment();
+                    true
+                } else if plain && key == "backspace" {
+                    editor.backspace_paired();
+                    true
+                } else if plain
+                    && keystroke
+                        .key_char
+                        .as_deref()
+                        .is_some_and(|typed| editor.type_paired(typed))
+                {
+                    true
+                } else {
+                    editor.handle_key(keystroke, cx)
+                };
+                if handled {
                     // Typing past the right edge pans the editor instead of
                     // writing where the user cannot see.
                     editor.ensure_editor_caret_visible();
@@ -6050,6 +6398,8 @@ impl Render for DbUi {
         let context_menu = self.render_context_menu(window, cx);
         let confirm = self.render_confirm(cx);
         let close_guard = self.render_close_guard(cx);
+        let schema_sheet = self.render_schema_sheet(cx);
+        let drag_ghost = self.render_drag_ghost();
 
         div()
             .size_full()
@@ -6077,6 +6427,16 @@ impl Render for DbUi {
                 |root| {
                     root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         this.drag_titlebar();
+                        // The carried copy follows every move, not just the
+                        // ones that cross into a new slot.
+                        let carrying = this.tab_drag.as_ref().is_some_and(|drag| drag.moved)
+                            || this.column_move.is_some_and(|drag| drag.moved);
+                        if this.tab_drag.is_some() || this.column_move.is_some() {
+                            this.drag_pointer = Some(event.position);
+                            if carrying {
+                                cx.notify();
+                            }
+                        }
                         if this.change_bubble_drag.is_some() {
                             this.drag_change_bubble(event.position.y, window, cx);
                         }
@@ -6148,6 +6508,11 @@ impl Render for DbUi {
                     this.open_palette(PaletteKind::Themes, cx)
                 }))
                 .on_action(cx.listener(|this, _: &crate::Find, _window, cx| this.cmd_find(cx)))
+                .on_action(cx.listener(|this, _: &crate::FindReplace, _window, cx| {
+                    if this.tabs.active().is_some_and(|tab| tab.is_sql()) {
+                        this.open_editor_find(true, cx);
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &crate::SearchTables, _window, cx| {
                     this.focus_sidebar_search(cx)
                 }))
@@ -6162,6 +6527,18 @@ impl Render for DbUi {
                 }))
                 .on_action(
                     cx.listener(|this, _: &crate::PasteRows, _window, cx| this.paste_rows(cx)),
+                )
+                .on_action(cx.listener(|this, _: &crate::ExportCsv, _window, cx| {
+                    this.export_rows(crate::row_export::RowFormat::Csv, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::ExportJson, _window, cx| {
+                    this.export_rows(crate::row_export::RowFormat::Json, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::ExportSql, _window, cx| {
+                    this.export_rows(crate::row_export::RowFormat::Insert, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::ImportCsv, _window, cx| this.import_csv(cx)),
                 )
                 .on_action(cx.listener(|this, _: &crate::DiscardChanges, _window, cx| {
                     this.discard_pending_edits(cx)
@@ -6179,6 +6556,18 @@ impl Render for DbUi {
                 )
                 .on_action(cx.listener(|this, _: &crate::RunAllQueries, _window, cx| {
                     this.run_all_queries(cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::StopQuery, _window, cx| this.stop_query(cx)),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::SaveQuery, _window, cx| this.open_save_query(cx)),
+                )
+                .on_action(cx.listener(|this, _: &crate::OpenSavedQuery, _window, cx| {
+                    this.open_palette(PaletteKind::SavedQueries, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::NewTable, _window, cx| {
+                    this.create_table_sheet(None, cx)
                 }))
                 .on_action(
                     cx.listener(|this, _: &crate::CloseTab, _window, cx| this.close_active_tab(cx)),
@@ -6272,6 +6661,10 @@ impl Render for DbUi {
             .children(context_menu)
             .children(confirm)
             .children(close_guard)
+            .children(schema_sheet)
+            // Over everything: it is the pointer's, and the pointer can be
+            // anywhere.
+            .children(drag_ghost)
     }
 }
 
