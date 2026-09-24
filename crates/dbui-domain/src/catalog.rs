@@ -103,6 +103,16 @@ pub struct DbObject {
     pub key: String,
 }
 
+/// What it takes to create a table or view again, as a dump writes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateStatements {
+    /// Before the rows: the `CREATE TABLE` (or `VIEW`) and its indexes.
+    pub create: Vec<String>,
+    /// After every table's rows: the constraints that point between tables,
+    /// which would otherwise need the tables loaded in dependency order.
+    pub after_data: Vec<String>,
+}
+
 /// A namespace of tables.
 ///
 /// MySQL has no schema layer -- a database *is* the namespace -- so its adapter

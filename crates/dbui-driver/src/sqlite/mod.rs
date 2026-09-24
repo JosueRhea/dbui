@@ -12,9 +12,9 @@ use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
-    ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
-    SortKey, Table, TableRef, TransactionState, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, CreateStatements, DbObject, Driver,
+    ForeignKey, Index, ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet,
+    Row as DomainRow, Schema, SortKey, Table, TableRef, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::pool::PoolConnection;
@@ -159,6 +159,18 @@ impl DatabaseDriver for SqliteDriver {
                 tables,
             }],
             objects,
+        })
+    }
+
+    async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
+        let create: Vec<String> = sqlx::query_scalar(catalog::CREATE_STATEMENTS)
+            .bind(&table.name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(catalog::CREATE_STATEMENTS, &error))?;
+        Ok(CreateStatements {
+            create,
+            after_data: Vec::new(),
         })
     }
 

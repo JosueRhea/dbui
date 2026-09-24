@@ -18,7 +18,8 @@ pub mod statement;
 pub mod value;
 
 pub use catalog::{
-    Catalog, Column, DbObject, ForeignKey, ObjectKind, Schema, Table, TableKind, TableRef,
+    Catalog, Column, CreateStatements, DbObject, ForeignKey, ObjectKind, Schema, Table, TableKind,
+    TableRef,
 };
 pub use connection::{ConnectionConfig, ConnectionId, Driver, Environment, SshConfig, TlsMode};
 pub use ddl::{ColumnSpec, Index};

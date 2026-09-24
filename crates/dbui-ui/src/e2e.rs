@@ -4329,6 +4329,76 @@ fn the_activity_panel_draws_and_escape_backs_out(cx: &mut TestAppContext) {
     view.update(cx, |view, _| assert!(view.activity.is_none()));
 }
 
+/// Dump one database from the app, empty another, run the dump there with
+/// Run SQL File, and the two hold the same rows.
+#[gpui::test]
+fn a_dump_run_as_a_file_rebuilds_the_database(cx: &mut TestAppContext) {
+    let (view, cx, first, second) = open_two_connected(cx, "dump");
+    let dump = ScratchFile::new("dump.sql");
+
+    // Something only the first one has.
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "INSERT INTO members (name, team_slug) VALUES ('It''s \\ Linus', 'ops')",
+            cx,
+        );
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, cx| {
+        view.dump_database_to(dump.0.clone(), None, cx)
+    });
+    settle(&view, cx, |view| {
+        describe(&view.status).starts_with("info: Dumped")
+    });
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(said.contains("2 tables, 5 rows"), "{said}");
+    });
+
+    // Over to the second, emptied.
+    let second_id = view.update(cx, |view, _| view.workspace.entries()[1].id());
+    view.update(cx, |view, cx| view.open_connection_tab(second_id, cx));
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "DROP VIEW active_members; DROP TABLE members; DROP TABLE teams",
+            cx,
+        );
+        view.run_all_queries(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+
+    view.update(cx, |view, cx| view.run_sql_file_at(&dump.0, cx));
+    settle(&view, cx, |view| {
+        describe(&view.status).starts_with("info: Ran")
+    });
+    for sql in [
+        "SELECT * FROM members ORDER BY id",
+        "SELECT * FROM teams ORDER BY slug",
+        "SELECT * FROM active_members ORDER BY id",
+    ] {
+        assert_eq!(
+            read_back(&first.path, sql),
+            read_back(&second.path, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// A file that fails partway says which statement stopped it.
+#[gpui::test]
+fn a_failing_file_names_the_statement(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "run-file-fails");
+    let file = ScratchFile::new("broken.sql");
+    std::fs::write(&file.0, "SELECT 1;\nSELECT * FROM nowhere;\nSELECT 3;\n").unwrap();
+    view.update(cx, |view, cx| view.run_sql_file_at(&file.0, cx));
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(said.contains("stopped at statement 2 of 3"), "{said}");
+    });
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

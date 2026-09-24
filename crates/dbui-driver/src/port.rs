@@ -7,8 +7,8 @@
 use crate::error::{DriverError, Result};
 use async_trait::async_trait;
 use dbui_domain::{
-    Catalog, Column, DbObject, Driver, Index, Page, QueryResult, ResultSet, ServerSession, SortKey,
-    TableRef, TransactionState, Value,
+    Catalog, Column, CreateStatements, DbObject, Driver, Index, Page, QueryResult, ResultSet,
+    ServerSession, SortKey, Table, TableRef, TransactionState, Value,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,23 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// The columns of one table, in declaration order.
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>>;
+
+    /// The statements that would create `table` (or view) again, exactly,
+    /// for a dump.
+    async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
+        Err(DriverError::message(
+            "",
+            format!("Cannot script {} on this engine", table.name),
+        ))
+    }
+
+    /// For a sequence, the statement that puts a restored copy back where
+    /// this one is -- so rows dumped with their ids do not collide with the
+    /// next value handed out. `None` where there is nothing to restore.
+    async fn sequence_position(&self, sequence: &DbObject) -> Result<Option<String>> {
+        let _ = sequence;
+        Ok(None)
+    }
 
     /// Every client connection to the server, for the activity panel.
     async fn server_sessions(&self) -> Result<Vec<ServerSession>> {

@@ -23,6 +23,11 @@ pub enum GuardedWrite {
     Commit { changes: usize },
     /// Statements from the SQL editor, at least one of which writes.
     Statements(Vec<String>),
+    /// A file of statements, from Run SQL File.
+    Script {
+        name: String,
+        statements: Vec<String>,
+    },
 }
 
 pub struct ProductionGuard {
@@ -41,6 +46,11 @@ impl ProductionGuard {
             GuardedWrite::Commit { changes } => format!(
                 "{changes} staged change{} will be committed.",
                 if *changes == 1 { "" } else { "s" }
+            ),
+            GuardedWrite::Script { name, statements } => format!(
+                "{name}: {} statement{}, run in order.",
+                statements.len(),
+                if statements.len() == 1 { "" } else { "s" }
             ),
             GuardedWrite::Statements(statements) => {
                 let writes: Vec<_> = statements
@@ -62,7 +72,7 @@ impl ProductionGuard {
     pub fn confirm_label(&self) -> &'static str {
         match self.write {
             GuardedWrite::Commit { .. } => "Commit to Production",
-            GuardedWrite::Statements(_) => "Run on Production",
+            GuardedWrite::Statements(_) | GuardedWrite::Script { .. } => "Run on Production",
         }
     }
 }
@@ -217,6 +227,7 @@ impl DbUi {
         match guard.write {
             GuardedWrite::Commit { .. } => self.save_pending_edits(cx),
             GuardedWrite::Statements(statements) => self.dispatch_statements(statements, cx),
+            GuardedWrite::Script { name, statements } => self.run_script(name, statements, cx),
         }
         // Spent or not, the pass is for this one write only.
         self.production_confirmed = false;

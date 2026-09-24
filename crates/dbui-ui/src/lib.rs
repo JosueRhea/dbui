@@ -211,6 +211,8 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New Connection", NewConnection),
                 MenuItem::action("Server Activity", ServerActivity),
+                MenuItem::action("Dump Database…", DumpDatabase),
+                MenuItem::action("Run SQL File…", RunSqlFile),
                 MenuItem::separator(),
                 MenuItem::action("Next Connection", NextConnection),
                 MenuItem::action("Previous Connection", PrevConnection),
@@ -303,6 +305,8 @@ gpui::actions!(
         RunAllQueries,
         ExplainQuery,
         ServerActivity,
+        DumpDatabase,
+        RunSqlFile,
         StopQuery,
         SaveQuery,
         OpenSavedQuery,

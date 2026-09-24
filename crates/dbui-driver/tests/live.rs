@@ -391,6 +391,81 @@ both_engines!(
     }
 );
 
+// A column of a type the server defines -- an enum, a domain -- reads the
+// first time, from the grid and from the editor alike. On Postgres the driver
+// has to look such a type up mid-statement, and that lookup used to clobber
+// the unnamed statement it was in the middle of.
+both_engines!(a_column_of_a_custom_type_reads, |fx: Fixture| async move {
+    let schema = fx.schema().to_string();
+    let q = |name: &str| TableRef::new(&schema, name).quoted(fx.driver());
+    let setup: Vec<String> = match fx.driver() {
+        Driver::Postgres => vec![
+            format!("CREATE TYPE {} AS ENUM ('new', 'paid')", q("status")),
+            format!("CREATE DOMAIN {} AS bigint CHECK (VALUE >= 0)", q("cents")),
+            format!(
+                "CREATE TABLE {} (id int PRIMARY KEY, status {} NOT NULL, total {})",
+                q("orders"),
+                q("status"),
+                q("cents")
+            ),
+            format!("INSERT INTO {} VALUES (1, 'paid', 5), (2, 'new', NULL)", q("orders")),
+        ],
+        _ => vec![
+            format!(
+                "CREATE TABLE {} (id INT PRIMARY KEY, status ENUM('new', 'paid') NOT NULL, total BIGINT)",
+                q("orders")
+            ),
+            format!("INSERT INTO {} VALUES (1, 'paid', 5), (2, 'new', NULL)", q("orders")),
+        ],
+    };
+    for sql in &setup {
+        fx.execute(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{error}\n{sql}"));
+    }
+
+    let page = fx
+        .table_rows(&fx.table("orders"), Page::first(), "", &[])
+        .await
+        .expect("the grid reads it");
+    assert_eq!(page.rows.len(), 2);
+    assert_eq!(page.rows[0].0[1].to_text(), "paid");
+
+    let result = fx
+        .execute(&format!("SELECT * FROM {} ORDER BY id", q("orders")))
+        .await
+        .expect("the editor reads it");
+    let QueryOutcome::Rows(set) = result.outcome else {
+        panic!("rows");
+    };
+    assert_eq!(set.rows[1].0[1].to_text(), "new");
+    // An array may hold a NULL; the element is NULL, not the whole cell.
+    if fx.driver() == Driver::Postgres {
+        let result = fx
+            .execute("SELECT ARRAY['a', NULL, 'b']::text[], ARRAY[1, NULL]::int[]")
+            .await
+            .expect("arrays");
+        let QueryOutcome::Rows(set) = result.outcome else {
+            panic!("rows");
+        };
+        assert_eq!(
+            set.rows[0].0[0],
+            Value::Array(vec![
+                Value::Text("a".into()),
+                Value::Null,
+                Value::Text("b".into())
+            ])
+        );
+        assert_eq!(
+            set.rows[0].0[1],
+            Value::Array(vec![Value::Int(1), Value::Null])
+        );
+    }
+    // The domain reads as its base type, not as an unknown.
+    assert_eq!(set.rows[0].0[2], Value::Int(5));
+    assert_eq!(set.rows[1].0[2], Value::Null);
+});
+
 both_engines!(a_live_connection_answers, |fx: Fixture| async move {
     fx.ping().await.expect("ping");
     assert!(

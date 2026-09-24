@@ -395,6 +395,93 @@ pub fn fetch_indexes(
     runtime.spawn(async move { driver.indexes(&table).await })
 }
 
+/// Dump `schemas` to `path`, reporting each table as it starts in
+/// `progress`. Written beside the target and renamed into place, so a dump
+/// that fails halfway leaves no file that looks complete.
+pub fn dump_database(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    schemas: Vec<String>,
+    path: std::path::PathBuf,
+    progress: Arc<std::sync::Mutex<String>>,
+) -> Task<Result<crate::dump::DumpReport, String>> {
+    runtime.spawn(async move {
+        let partial = path.with_extension("sql.partial");
+        let file = std::fs::File::create(&partial)
+            .map_err(|error| format!("Could not create {}: {error}", partial.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        let written = crate::dump::dump(driver.as_ref(), &schemas, &mut out, |table| {
+            if let Ok(mut line) = progress.lock() {
+                *line = table.to_string();
+            }
+        })
+        .await;
+        drop(out);
+        match written {
+            Ok(report) => {
+                std::fs::rename(&partial, &path)
+                    .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&partial);
+                Err(error)
+            }
+        }
+    })
+}
+
+/// How a script run went.
+#[derive(Debug)]
+pub struct ScriptOutcome {
+    pub ran: usize,
+    pub total: usize,
+    pub elapsed: Duration,
+    /// The statement that stopped it (1-based), its text, and why.
+    pub failure: Option<(usize, String, DriverError)>,
+}
+
+/// Run a file's statements in order on the editor's session, stopping at the
+/// first that fails. `progress` counts the ones done, for a status line.
+///
+/// The editor's session rather than the pool, because a script sets things
+/// for the statements after it -- `USE`, `SET FOREIGN_KEY_CHECKS`, a `BEGIN`
+/// -- and a pool would hand each statement a different connection. Nothing
+/// is kept but the count: a restore is thousands of INSERTs, and their
+/// "1 row affected" is not worth holding.
+pub fn run_script(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    statements: Vec<String>,
+    mut stop: Stop,
+    progress: Arc<std::sync::atomic::AtomicUsize>,
+) -> Task<ScriptOutcome> {
+    runtime.spawn(async move {
+        let started = std::time::Instant::now();
+        let total = statements.len();
+        let mut ran = 0;
+        let mut failure = None;
+        for (index, sql) in statements.into_iter().enumerate() {
+            match run_stoppable(driver.as_ref(), &sql, &mut stop).await {
+                Ok(_) => {
+                    ran += 1;
+                    progress.store(ran, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    failure = Some((index + 1, sql, error));
+                    break;
+                }
+            }
+        }
+        ScriptOutcome {
+            ran,
+            total,
+            elapsed: started.elapsed(),
+            failure,
+        }
+    })
+}
+
 /// Every client connection on the server, for the activity panel.
 pub fn fetch_sessions(
     runtime: &DbRuntime,

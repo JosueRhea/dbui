@@ -34,6 +34,15 @@ pub const TRIGGER_SQL: &str = "
     SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?
 ";
 
+/// A table's or view's own `CREATE`, as the file keeps it, then the indexes
+/// written for it (`sql` is NULL for the ones a constraint made).
+pub const CREATE_STATEMENTS: &str = "
+    SELECT sql
+      FROM sqlite_master
+     WHERE tbl_name = ? AND type IN ('table', 'view', 'index') AND sql IS NOT NULL
+     ORDER BY type <> 'table' AND type <> 'view', name
+";
+
 /// Columns of one table.
 ///
 /// `pragma_table_info` reports the declared type, nullability and which

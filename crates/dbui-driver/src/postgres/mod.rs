@@ -8,6 +8,7 @@ use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sessions::{Lease, SessionId, Sessions};
 use crate::sql_build;
 use async_trait::async_trait;
+use dbui_domain::CreateStatements;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
     ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
@@ -17,6 +18,44 @@ use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
 use std::time::{Duration, Instant};
+
+/// Teach a new connection every user-defined type before it runs anything.
+///
+/// sqlx looks up a type it has not seen -- an enum, a domain -- in the
+/// middle of preparing the statement that returns it, and the lookup reuses
+/// the unnamed statement that statement was parsed into. The statement then
+/// fails with "unnamed prepared statement does not exist" (26000): every
+/// table with an enum column failed to open, the first time on each
+/// connection. Selecting a NULL of every such type once, here, fills the
+/// connection's type cache, so nothing later needs a lookup -- including
+/// inside a transaction, where a failed statement would abort the whole
+/// transaction. Best effort: a failure here only means the lookups happen
+/// later, where [`retry_lost_statement`] covers them.
+async fn warm_type_cache(conn: &mut sqlx::PgConnection) {
+    let Ok(Some(warmup)) = sqlx::query_scalar::<_, Option<String>>(catalog::TYPE_WARMUP)
+        .fetch_one(&mut *conn)
+        .await
+    else {
+        return;
+    };
+    for _ in 0..2 {
+        let ran = sqlx::query(AssertSqlSafe(warmup.clone()))
+            .persistent(false)
+            .fetch_all(&mut *conn)
+            .await;
+        // The first try can itself lose its statement to the lookups it
+        // triggers; by the second, they are cached.
+        if !ran.as_ref().err().is_some_and(lost_statement) {
+            return;
+        }
+    }
+}
+
+/// The error sqlx's mid-statement type lookup causes; see
+/// [`warm_type_cache`]. The statement it names was parsed but never run.
+fn lost_statement(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("26000"))
+}
 
 /// The `object_kind` column of `catalog::OBJECTS`.
 fn object_kind(kind: &str) -> Option<ObjectKind> {
@@ -82,6 +121,7 @@ impl PostgresDriver {
                             .execute(&mut *conn)
                             .await?;
                     }
+                    warm_type_cache(conn).await;
                     Ok(())
                 })
             })
@@ -255,6 +295,41 @@ impl DatabaseDriver for PostgresDriver {
         Ok(Catalog { schemas, objects })
     }
 
+    async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
+        let name = TableRef::new(&table.schema, &table.name).quoted(Driver::Postgres);
+        let scalar = |sql: &'static str| {
+            let name = name.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(sql)
+                    .bind(name)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map(|rows| rows.into_iter().flatten().collect::<Vec<String>>())
+                    .map_err(|error| DriverError::query(sql, &error))
+            }
+        };
+        if table.kind.is_view() {
+            return Ok(CreateStatements {
+                create: scalar(catalog::VIEW_DEFINITION).await?,
+                after_data: Vec::new(),
+            });
+        }
+        let mut create = scalar(catalog::CREATE_TABLE).await?;
+        create.extend(scalar(catalog::TABLE_INDEXES).await?);
+        Ok(CreateStatements {
+            create,
+            after_data: scalar(catalog::TABLE_AFTER_DATA).await?,
+        })
+    }
+
+    async fn sequence_position(&self, sequence: &DbObject) -> Result<Option<String>> {
+        sqlx::query_scalar::<_, String>(catalog::SEQUENCE_POSITION)
+            .bind(&sequence.key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(catalog::SEQUENCE_POSITION, &error))
+    }
+
     async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
         let rows = sqlx::query(catalog::SESSIONS)
             .fetch_all(&self.pool)
@@ -391,15 +466,23 @@ impl DatabaseDriver for PostgresDriver {
         // and after a column is added PostgreSQL refuses a cached plan whose
         // result type changed -- every later page of the table failed -- and
         // SQLite quietly returns nothing.
-        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone())).persistent(false);
-        for value in &bound.binds {
-            query = bind_value(query, value);
-        }
-        query = query.bind(page.probe_limit()).bind(page.offset as i64);
+        let build = || {
+            let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone())).persistent(false);
+            for value in &bound.binds {
+                query = bind_value(query, value);
+            }
+            query.bind(page.probe_limit()).bind(page.offset as i64)
+        };
 
         let mut lease = self.lease(&bound.sql).await?;
         let tracking = token.track(lease.session());
-        let rows = query.fetch_all(lease.conn()).await;
+        let mut rows = build().fetch_all(lease.conn()).await;
+        // A type created since the connection was warmed: the lookup that
+        // just failed has cached it, and a pool connection is never inside
+        // a transaction, so the read is safe to make again.
+        if rows.as_ref().err().is_some_and(lost_statement) {
+            rows = build().fetch_all(lease.conn()).await;
+        }
         drop(tracking);
         lease.settle(&rows);
         let rows = rows.map_err(|error| DriverError::query(&bound.sql, &error))?;
@@ -584,23 +667,37 @@ impl PostgresDriver {
         // after an ALTER TABLE -- here, or from any other session -- a cached
         // plan still has the old columns, which PostgreSQL refuses and SQLite
         // answers with no rows at all.
-        let ran = if query::returns_rows(sql) {
-            // One row past the cap says whether there were more. The rest are
-            // never decoded or kept, and `cut_short` stops the server sending
-            // them.
-            sqlx::query(AssertSqlSafe(sql.to_string()))
-                .persistent(false)
-                .fetch(lease.conn())
-                .take(ResultSet::QUERY_ROW_CAP + 1)
-                .try_collect()
-                .await
-                .map(Ran::Rows)
-        } else {
-            sqlx::query(AssertSqlSafe(sql.to_string()))
-                .persistent(false)
-                .execute(lease.conn())
-                .await
-                .map(|done| Ran::Affected(done.rows_affected()))
+        let returns_rows = query::returns_rows(sql);
+        let mut attempts = 0;
+        let ran = loop {
+            attempts += 1;
+            let ran = if returns_rows {
+                // One row past the cap says whether there were more. The rest
+                // are never decoded or kept, and `cut_short` stops the server
+                // sending them.
+                sqlx::query(AssertSqlSafe(sql.to_string()))
+                    .persistent(false)
+                    .fetch(lease.conn())
+                    .take(ResultSet::QUERY_ROW_CAP + 1)
+                    .try_collect()
+                    .await
+                    .map(Ran::Rows)
+            } else {
+                sqlx::query(AssertSqlSafe(sql.to_string()))
+                    .persistent(false)
+                    .execute(lease.conn())
+                    .await
+                    .map(|done| Ran::Affected(done.rows_affected()))
+            };
+            // Lost to a type lookup (see `warm_type_cache`): it never ran, so
+            // outside a transaction it is sent again, once. Inside one, the
+            // failure has already aborted the transaction, and the error says
+            // so rather than a retry pretending otherwise.
+            let lost = ran.as_ref().err().is_some_and(lost_statement);
+            if lost && attempts == 1 && !was_open {
+                continue;
+            }
+            break ran;
         };
         drop(tracking);
 

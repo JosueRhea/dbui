@@ -6,6 +6,7 @@
 //! from a plain `#[test]`.
 
 pub mod commands;
+pub mod dump;
 pub mod history;
 pub mod plan;
 pub mod runtime;

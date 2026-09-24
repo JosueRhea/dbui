@@ -556,6 +556,8 @@ pub struct DbUi {
     /// Counts openings of the panel, so a refresh loop can tell it has been
     /// replaced by a newer one.
     pub(crate) activity_generation: u64,
+    /// Stops the SQL file being run, while one is.
+    pub(crate) script_stop: Option<dbui_app::commands::StopHandle>,
     /// Bumped each time a commit puts its "Committing…" line up, so the one
     /// that lands can tell whether the line on screen is still its own.
     pub(crate) commit_stamp: u64,
@@ -780,6 +782,7 @@ impl DbUi {
             production_confirmed: false,
             activity: None,
             activity_generation: 0,
+            script_stop: None,
             commit_stamp: 0,
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
@@ -2784,6 +2787,13 @@ impl DbUi {
     /// The handle is taken rather than read, so a second press while the
     /// server is still winding down is quiet instead of a second cancel.
     pub(crate) fn stop_query(&mut self, cx: &mut Context<Self>) {
+        // A file being run stops between statements; what ran, stays.
+        if let Some(handle) = self.script_stop.take() {
+            handle.stop();
+            self.status = Status::busy("Stopping the file…");
+            cx.notify();
+            return;
+        }
         let connection = self.workspace.active_id();
         let Some((_, handle)) = self
             .tabs
@@ -4095,7 +4105,7 @@ impl DbUi {
         let predicate = format!(
             "{} = {}",
             driver.quote_identifier(&key.references_column),
-            crate::row_export::sql_literal(&value)
+            value.sql_literal(driver)
         );
 
         let target = key.references.clone();
@@ -7049,6 +7059,14 @@ impl Render for DbUi {
                 .on_action(cx.listener(|this, _: &crate::ServerActivity, _window, cx| {
                     this.open_activity(cx)
                 }))
+                .on_action(
+                    cx.listener(|this, _: &crate::DumpDatabase, _window, cx| {
+                        this.dump_database(cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::RunSqlFile, _window, cx| this.run_sql_file(cx)),
+                )
                 .on_action(
                     cx.listener(|this, _: &crate::StopQuery, _window, cx| this.stop_query(cx)),
                 )

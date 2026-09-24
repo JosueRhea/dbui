@@ -8,6 +8,7 @@ use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sessions::{Lease, SessionId, Sessions};
 use crate::sql_build;
 use async_trait::async_trait;
+use dbui_domain::CreateStatements;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
     ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
@@ -238,6 +239,36 @@ impl DatabaseDriver for MySqlDriver {
             .unwrap_or_default();
 
         Ok(Catalog { schemas, objects })
+    }
+
+    async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
+        // MySQL writes its own, exactly -- indexes, foreign keys and
+        // AUTO_INCREMENT included -- so there is nothing to rebuild. Foreign
+        // keys stay inline; a dump turns their checks off while it loads.
+        let what = if table.kind.is_view() {
+            "VIEW"
+        } else {
+            "TABLE"
+        };
+        let sql = format!(
+            "SHOW CREATE {what} {}",
+            TableRef::new(&table.schema, &table.name).quoted(Driver::MySql)
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.clone()))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(&sql, &error))?;
+        let text = row
+            .try_get::<String, _>(1)
+            .or_else(|_| {
+                row.try_get::<Vec<u8>, _>(1)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .map_err(|error| DriverError::query(&sql, &error))?;
+        Ok(CreateStatements {
+            create: vec![text],
+            after_data: Vec::new(),
+        })
     }
 
     async fn server_sessions(&self) -> Result<Vec<ServerSession>> {

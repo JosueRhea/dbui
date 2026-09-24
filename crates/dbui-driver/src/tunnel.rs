@@ -513,11 +513,23 @@ mod tests {
     fn the_helper_answers_a_password_prompt_and_nothing_else() {
         let askpass = Askpass::write().unwrap();
         let ask = |prompt: &str| {
-            let out = Command::new(&askpass.script)
-                .arg(prompt)
-                .env(ASKPASS_SECRET_VAR, "s3cret $x")
-                .output()
-                .unwrap();
+            // Another test thread forking while the script was still open
+            // for writing leaves it briefly "busy" to exec (ETXTBSY) in the
+            // child that fork made. ssh runs the helper only after its
+            // handshake, long past that window; a test running it at once
+            // waits it out.
+            let out = loop {
+                match Command::new(&askpass.script)
+                    .arg(prompt)
+                    .env(ASKPASS_SECRET_VAR, "s3cret $x")
+                    .output()
+                {
+                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    other => break other.unwrap(),
+                }
+            };
             String::from_utf8(out.stdout).unwrap()
         };
         assert_eq!(ask("deploy@bastion's password: "), "s3cret $x\n");

@@ -38,6 +38,14 @@ transaction are picked out, and either can be cancelled or ended after a
 confirmation on the row (`pg_cancel_backend` / `pg_terminate_backend`,
 `KILL QUERY` / `KILL`).
 
+**Dump and restore, built in.** *Dump Database…* writes the whole database -- types,
+extensions and sequences, every table with its rows, indexes and constraints
+(composite foreign keys included), functions, views and triggers -- as one SQL file,
+through the app's own connection: no `pg_dump` or `mysqldump` to install or version-match,
+and it works through an SSH tunnel. *Run SQL File…* runs any file statement by
+statement on one session, with the count on the status line and `⌘.` to stop. A dump
+restores to identical rows on all three engines; that is tested, not assumed.
+
 **Production looks like production.** Tag a connection Local, Testing, Staging or
 Production and its colour runs under the title bar and its tab. On Production,
 ⌘S and any writing statement stop for a confirmation that names the server and
