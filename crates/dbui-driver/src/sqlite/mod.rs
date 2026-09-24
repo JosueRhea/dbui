@@ -16,6 +16,7 @@ use dbui_domain::{
     QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
     TableRef, Value,
 };
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::Sqlite;
@@ -326,10 +327,14 @@ impl DatabaseDriver for SqliteDriver {
         let tracking = token.track(0);
 
         let outcome = if query::returns_rows(sql) {
+            // One row past the cap says whether there were more; the
+            // statement is reset without stepping through the rest.
             sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(&mut *conn)
+                .fetch(&mut *conn)
+                .take(ResultSet::QUERY_ROW_CAP + 1)
+                .try_collect()
                 .await
-                .map(|rows| QueryOutcome::Rows(build_result_set(rows, usize::MAX)))
+                .map(|rows| QueryOutcome::Rows(build_result_set(rows, ResultSet::QUERY_ROW_CAP)))
         } else {
             sqlx::query(AssertSqlSafe(sql.to_string()))
                 .execute(&mut *conn)

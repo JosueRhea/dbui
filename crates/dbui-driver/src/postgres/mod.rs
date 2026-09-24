@@ -13,6 +13,7 @@ use dbui_domain::{
     QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
     TableRef, TlsMode, Value,
 };
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
 use std::time::{Duration, Instant};
@@ -454,8 +455,13 @@ impl PostgresDriver {
             Affected(u64),
         }
         let ran = if query::returns_rows(sql) {
+            // One row past the cap says whether there were more. The rest are
+            // never decoded or kept; the connection drains them before its
+            // next statement.
             sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(lease.conn())
+                .fetch(lease.conn())
+                .take(ResultSet::QUERY_ROW_CAP + 1)
+                .try_collect()
                 .await
                 .map(Ran::Rows)
         } else {
@@ -469,9 +475,7 @@ impl PostgresDriver {
 
         let outcome = match ran.map_err(|error| DriverError::query(sql, &error))? {
             Ran::Rows(rows) => {
-                // A hand-written query is shown as-is: the user asked for these
-                // rows, so no probe row is added and nothing is marked truncated.
-                let mut set = build_result_set(rows, usize::MAX);
+                let mut set = build_result_set(rows, ResultSet::QUERY_ROW_CAP);
                 self.backfill_columns(&mut set, sql).await;
                 QueryOutcome::Rows(set)
             }

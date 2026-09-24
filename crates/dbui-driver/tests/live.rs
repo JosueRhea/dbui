@@ -1364,6 +1364,53 @@ both_engines!(
     }
 );
 
+// A query typed in the editor keeps at most QUERY_ROW_CAP rows and says there
+// were more -- and the connection it left mid-result is fine for the next one.
+both_engines!(
+    an_editor_query_stops_at_the_row_cap,
+    |fx: Fixture| async move {
+        let cap = dbui_domain::ResultSet::QUERY_ROW_CAP;
+        let token = dbui_driver::QueryToken::new();
+        let many = match fx.driver() {
+            Driver::Postgres => format!("SELECT i FROM generate_series(1, {}) AS i", cap * 5),
+            _ => {
+                // MySQL stops a recursive CTE at 1000 levels unless told
+                // otherwise -- in this session, which is the next run's too.
+                fx.execute_tracked("SET SESSION cte_max_recursion_depth = 1000000", &token)
+                    .await
+                    .expect("raise the depth");
+                format!(
+                    "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {}) \
+                     SELECT i FROM n",
+                    cap * 5
+                )
+            }
+        };
+        let result = fx.execute_tracked(&many, &token).await.expect("the query");
+        let QueryOutcome::Rows(set) = result.outcome else {
+            panic!("expected rows");
+        };
+        assert_eq!(set.rows.len(), cap, "kept up to the cap");
+        assert!(set.truncated, "and said there were more");
+        assert_eq!(set.rows[cap - 1].0[0].to_text(), cap.to_string());
+
+        let after = fx
+            .execute_tracked("SELECT 42", &token)
+            .await
+            .expect("the same connection answers the next statement");
+        assert_eq!(after.rows().expect("rows").rows[0].0[0].to_text(), "42");
+
+        let few = fx
+            .execute_tracked("SELECT 1 UNION ALL SELECT 2", &token)
+            .await
+            .unwrap();
+        assert!(
+            !few.rows().unwrap().truncated,
+            "a small result is not marked"
+        );
+    }
+);
+
 // Changing a table's shape, end to end, with the statements the structure
 // editor shows before it runs them.
 both_engines!(

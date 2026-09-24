@@ -86,6 +86,27 @@ async fn a_file_database_connects_and_reports_its_version() {
     assert_eq!(db.driver(), Driver::Sqlite);
 }
 
+/// A query typed in the editor keeps at most QUERY_ROW_CAP rows and says there
+/// were more, and the connection is fine for the next statement.
+#[tokio::test]
+async fn an_editor_query_stops_at_the_row_cap() {
+    let db = open("row-cap").await;
+    let cap = dbui_domain::ResultSet::QUERY_ROW_CAP;
+    let token = dbui_driver::QueryToken::new();
+    let sql = format!(
+        "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {}) \
+         SELECT i FROM n",
+        cap * 5
+    );
+    let result = db.execute_tracked(&sql, &token).await.expect("the query");
+    let set = result.rows().expect("rows");
+    assert_eq!(set.rows.len(), cap);
+    assert!(set.truncated);
+
+    let after = db.execute_tracked("SELECT 42", &token).await.expect("next");
+    assert_eq!(after.rows().unwrap().rows[0].0[0].to_text(), "42");
+}
+
 /// A path that is not there is a typo worth reporting, not a reason to make an
 /// empty database and look like it worked.
 #[tokio::test]
