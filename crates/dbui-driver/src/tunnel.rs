@@ -19,7 +19,7 @@ use crate::error::{DriverError, Result};
 use dbui_domain::{ConnectionConfig, SshConfig};
 use std::io::{BufRead as _, BufReader};
 use std::net::{Ipv4Addr, TcpListener};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A running `ssh -L`, killed on drop.
 pub struct SshTunnel {
+    /// The [`leashed`] shell that runs ssh, not ssh itself.
     child: Child,
+    /// The leash: closing it -- here on drop, or by the OS when this process
+    /// dies -- is what stops ssh.
+    leash: Option<ChildStdin>,
     local_port: u16,
     /// Kept until the tunnel closes: ssh asks again when it re-keys.
     _askpass: Option<Askpass>,
@@ -46,10 +50,9 @@ impl SshTunnel {
         let bastion = ssh.summary();
         let local_port = free_port().map_err(|error| tunnel_error(&bastion, error.to_string()))?;
 
-        let mut command = Command::new("ssh");
+        let mut command = leashed("ssh");
         command
             .args(ssh_args(ssh, local_port, &config.host, config.port))
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let askpass = if ssh.password.is_empty() {
@@ -98,8 +101,10 @@ impl SshTunnel {
             });
         }
 
+        let leash = child.stdin.take();
         let mut tunnel = SshTunnel {
             child,
+            leash,
             local_port,
             _askpass: askpass,
         };
@@ -115,7 +120,7 @@ impl SshTunnel {
                 return Ok(tunnel);
             }
             if started.elapsed() > READY_TIMEOUT {
-                let _ = tunnel.child.kill();
+                // Dropping `tunnel` on the way out stops ssh.
                 return Err(tunnel_error(
                     &bastion,
                     format!(
@@ -139,9 +144,44 @@ impl SshTunnel {
 
 impl Drop for SshTunnel {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // Let go of the leash; the shell stops ssh and exits after it.
+        drop(self.leash.take());
         let _ = self.child.wait();
     }
+}
+
+/// `program`, run so that it cannot outlive this process.
+///
+/// `Drop` does not run when the app is force-quit or crashes, and an ssh left
+/// behind keeps a forward into production open on a loopback port for as
+/// long as the machine stays up. So ssh runs under a small shell that also
+/// reads a pipe from us: the pipe reaches end-of-file when we close it *or*
+/// when the OS tears this process down for any reason, and on end-of-file
+/// the shell kills ssh. It then exits with ssh's own status, so an ssh that
+/// gives up on its own still reads as an exit here. Linux's `PDEATHSIG`
+/// would do the same job on one platform; this does it on both.
+fn leashed(program: &str) -> Command {
+    // The reader gets the pipe as fd 3, explicitly: a background job in a
+    // non-interactive shell otherwise has its stdin replaced by /dev/null.
+    const LEASH: &str = r#"exec 3<&0
+"$@" </dev/null 3<&- &
+child=$!
+(read _ignored <&3; kill "$child" 2>/dev/null) &
+reader=$!
+exec 3<&-
+wait "$child"
+status=$?
+kill "$reader" 2>/dev/null
+exit "$status"
+"#;
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(LEASH)
+        .arg("dbui-ssh")
+        .arg(program)
+        .stdin(Stdio::piped());
+    command
 }
 
 /// The arguments for `ssh`, separated out so a test can read them.
@@ -457,6 +497,7 @@ mod tests {
         let child = Command::new("true").spawn().unwrap();
         let tunnel = SshTunnel {
             child,
+            leash: None,
             local_port: 41234,
             _askpass: None,
         };
@@ -487,5 +528,51 @@ mod tests {
         let dir = askpass.dir.clone();
         drop(askpass);
         assert!(!dir.exists(), "the helper goes with the tunnel");
+    }
+
+    fn alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Whatever ends the tunnel's owner -- a drop, a crash, a force quit --
+    /// closes the leash, and the leash takes the program with it.
+    #[test]
+    fn the_program_dies_with_the_leash() {
+        let mut child = leashed("sh")
+            .args(["-c", "echo $$; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pid = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut pid)
+            .unwrap();
+        let pid = pid.trim().to_string();
+        assert!(alive(&pid), "running while held");
+
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "killed, not finished: {status:?}");
+        assert!(!alive(&pid), "and gone with the leash");
+    }
+
+    /// A program that exits by itself is seen to, with its own status.
+    #[test]
+    fn the_programs_own_exit_comes_through() {
+        let mut child = leashed("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        // Held, as `SshTunnel` holds it: `Child::wait` closes stdin before it
+        // waits, which would pull the leash and race the exit being tested.
+        let _leash = child.stdin.take();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(7));
     }
 }
