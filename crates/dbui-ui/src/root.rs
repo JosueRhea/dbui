@@ -6202,7 +6202,9 @@ impl DbUi {
                 }
             }
 
-            if key == " " && keystroke.modifiers.control {
+            // GPUI names the key "space" on every platform; the literal is
+            // what a synthesized keystroke may carry.
+            if (key == "space" || key == " ") && keystroke.modifiers.control {
                 self.trigger_completion(cx);
                 return;
             }
@@ -6241,16 +6243,14 @@ impl DbUi {
                     // Typing past the right edge pans the editor instead of
                     // writing where the user cannot see.
                     editor.ensure_editor_caret_visible();
-                    let should_refresh = self.completion.is_some()
-                        && !command
-                        && (key.len() == 1 || key == "backspace" || key == "delete");
-                    if should_refresh {
-                        self.trigger_completion(cx);
-                    } else if self.completion.is_some()
-                        && (key.len() == 1 || key == "backspace" || key == "delete")
-                    {
-                        // Unreachable when should_refresh is true; kept for clarity.
+                    // A space ends the word being completed, so the popup
+                    // goes with it rather than going stale; anything else
+                    // that edits the word re-filters it.
+                    let edits_word = key.len() == 1 || key == "backspace" || key == "delete";
+                    if self.completion.is_some() && !command && key == "space" {
                         self.dismiss_completion(cx);
+                    } else if self.completion.is_some() && !command && edits_word {
+                        self.trigger_completion(cx);
                     } else {
                         cx.notify();
                     }

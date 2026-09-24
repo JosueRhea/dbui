@@ -5085,6 +5085,33 @@ fn autocomplete_offers_tables_after_from(cx: &mut TestAppContext) {
     });
 }
 
+/// Through the keyboard, not `trigger_completion`: the platform names the key
+/// `space`, and a check against `" "` once meant the shortcut never fired.
+#[gpui::test]
+fn ctrl_space_opens_completion_and_a_space_closes_it(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select * from us");
+    });
+    cx.simulate_keystrokes("ctrl-space");
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_some(), "ctrl-space opens the popup");
+        assert_eq!(
+            sql_editor_text(view),
+            "select * from us",
+            "and types nothing"
+        );
+    });
+
+    cx.simulate_keystrokes("space");
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "a space ends the word");
+        assert_eq!(sql_editor_text(view), "select * from us ");
+    });
+}
+
 /// Accepting replaces the partial word rather than appending to it.
 #[gpui::test]
 fn accepting_a_completion_replaces_what_was_typed(cx: &mut TestAppContext) {
