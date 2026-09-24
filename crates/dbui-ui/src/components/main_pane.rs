@@ -143,7 +143,44 @@ impl DbUi {
                 .child(self.render_editor(cx))
                 .child(self.render_error_panel(cx))
                 .child(self.render_statement_strip(cx))
-                .child(self.render_grid(window, cx))
+                // An `EXPLAIN` is drawn as the plan it is; its rows are one
+                // click away, and the plan one click back.
+                .child(if self.active_plan().is_some() {
+                    self.render_plan(cx)
+                } else {
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .flex_col()
+                        .when(self.active_result_has_plan(), |pane| {
+                            pane.child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .px_3()
+                                    .py_1()
+                                    .bg(self.theme.panel)
+                                    .border_b_1()
+                                    .border_color(self.theme.border)
+                                    .child(
+                                        super::button(
+                                            "plan-show-plan",
+                                            "Show plan",
+                                            &self.theme,
+                                            false,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _window, cx| {
+                                                this.toggle_plan_rows(cx)
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        })
+                        .child(self.render_grid(window, cx))
+                        .into_any_element()
+                })
                 .into_any_element(),
             WorkspaceTab::Table { pane, .. } => match pane {
                 TablePane::Structure => self.render_structure(cx).into_any_element(),

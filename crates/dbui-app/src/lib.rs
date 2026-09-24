@@ -7,6 +7,7 @@
 
 pub mod commands;
 pub mod history;
+pub mod plan;
 pub mod runtime;
 pub mod saved;
 pub mod session;
@@ -17,6 +18,7 @@ pub mod workspace;
 
 pub use commands::{BatchQueryResult, Outcome, PageSink, TableContents};
 pub use history::{History, HistoryEntry};
+pub use plan::{Plan, PlanStep};
 pub use runtime::{DbRuntime, Task};
 pub use saved::{SavedQueries, SavedQuery};
 pub use session::{SavedConnectionTab, SavedTab, Session};

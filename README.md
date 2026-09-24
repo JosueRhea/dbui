@@ -33,6 +33,10 @@ what is about to be sent.
 **SQL, with the catalog behind it.** `⌘↵` runs the statement under the caret, `⌘⇧↵`
 runs every statement in the buffer, and `⌃Space` completes against the schemas, tables
 and columns the connection actually has. Results land in the same typed grid, timed.
+`⌘⌥E` explains the statement instead of running it, and any `EXPLAIN` -- Postgres
+text or JSON, MySQL or MariaDB JSON, MySQL's tree, SQLite's query plan, with or
+without `ANALYZE` -- is drawn as a tree, with each step's own share of the cost
+(or of the measured time) as a bar and the most expensive step picked out.
 
 ## Install
 

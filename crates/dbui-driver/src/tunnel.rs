@@ -483,10 +483,12 @@ mod tests {
         assert!(log.ready);
     }
 
+    /// The OS hands out a real port. (Whether it is still free a moment
+    /// later cannot be asserted -- anything on the machine may take it, which
+    /// is why `ExitOnForwardFailure` turns that into an error.)
     #[test]
-    fn a_free_port_can_be_bound() {
-        let port = free_port().unwrap();
-        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+    fn a_free_port_is_a_real_one() {
+        assert_ne!(free_port().unwrap(), 0);
     }
 
     #[test]

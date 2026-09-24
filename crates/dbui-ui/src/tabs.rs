@@ -263,6 +263,10 @@ pub struct StatementResult {
     pub rows: Option<ResultView>,
     /// The one-line verdict, shown on the tab and in the status bar.
     pub summary: String,
+    /// The rows read as a query plan, when they are the output of `EXPLAIN`.
+    pub plan: Option<dbui_app::Plan>,
+    /// Show the raw rows even though they read as a plan.
+    pub show_rows: bool,
 }
 
 /// A run that stopped on an error, kept on the tab that ran it.

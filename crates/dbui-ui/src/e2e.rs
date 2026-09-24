@@ -4129,6 +4129,56 @@ fn the_sheet_sets_the_environment_tag(cx: &mut TestAppContext) {
     });
 }
 
+/// ⌘⌥E asks for the plan instead of the rows, draws it as a tree, and the
+/// statement it explains is never run.
+#[gpui::test]
+fn explain_draws_the_plan_and_runs_nothing(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, db) = open_connected(cx, "explain");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "SELECT m.name FROM members m JOIN teams t ON t.slug = m.team_slug WHERE m.id > 0",
+            cx,
+        );
+    });
+    cx.simulate_keystrokes("cmd-alt-e");
+    settle(&view, cx, |view| view.active_plan().is_some());
+    view.update(cx, |view, _| {
+        let plan = view.active_plan().unwrap();
+        let titles: Vec<&str> = plan.steps.iter().map(|s| s.title.as_str()).collect();
+        assert!(
+            titles
+                .iter()
+                .any(|t| t.contains("members") || t.contains(" m")),
+            "{titles:?}"
+        );
+    });
+    draw_at_every_size(&view, cx);
+
+    // The rows are one click away, and the plan one click back.
+    view.update(cx, |view, cx| {
+        view.toggle_plan_rows(cx);
+        assert!(view.active_plan().is_none());
+        assert!(view.active_result_has_plan());
+    });
+    draw_at_every_size(&view, cx);
+    view.update(cx, |view, cx| {
+        view.toggle_plan_rows(cx);
+        assert!(view.active_plan().is_some());
+    });
+
+    // Explaining a DELETE deletes nothing.
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("DELETE FROM members", cx);
+        view.explain_query(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2"
+    );
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

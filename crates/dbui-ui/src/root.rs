@@ -2386,6 +2386,24 @@ impl DbUi {
         self.dispatch_statements(vec![statement.to_string()], cx);
     }
 
+    /// Ask for the plan of the statement under the caret (or each one in
+    /// the selection) instead of running it. The plan lands in the result
+    /// pane drawn as a tree; see `plan_view`.
+    ///
+    /// Plain `EXPLAIN`, never `ANALYZE`: the statement itself is not run, so
+    /// explaining a `DELETE` deletes nothing.
+    pub(crate) fn explain_query(&mut self, cx: &mut Context<Self>) {
+        let Some(statements) = self.resolve_run_sql() else {
+            return;
+        };
+        let driver = self.sql_dialect();
+        let explained = statements
+            .iter()
+            .map(|sql| dbui_app::plan::explain_sql(driver, sql))
+            .collect();
+        self.dispatch_statements(explained, cx);
+    }
+
     pub(crate) fn run_all_queries(&mut self, cx: &mut Context<Self>) {
         let Some(statements) = self.resolve_run_all_sql() else {
             return;
@@ -2774,6 +2792,9 @@ impl DbUi {
         if statements.is_empty() {
             return;
         }
+        // A completion list open at the caret is about the text, not the
+        // run; left up, it hangs over the results the run brings back.
+        self.completion = None;
         // The server refuses writes on a read-only connection too, but only
         // through a session setting the editor could switch off. Nothing in
         // the batch runs if any of it would write.
@@ -2957,10 +2978,17 @@ impl DbUi {
                     )),
                     QueryOutcome::Affected(_) => None,
                 };
+                // Read once, here: a plan is drawn on every frame the tab
+                // is in front, and the rows it comes from never change.
+                let plan = rows
+                    .as_ref()
+                    .and_then(|view| dbui_app::Plan::from_result(&view.set));
                 crate::tabs::StatementResult {
                     sql,
                     rows,
                     summary: one_line,
+                    plan,
+                    show_rows: false,
                 }
             })
             .collect();
@@ -6920,6 +6948,11 @@ impl Render for DbUi {
                 .on_action(cx.listener(|this, _: &crate::RunAllQueries, _window, cx| {
                     this.run_all_queries(cx)
                 }))
+                .on_action(
+                    cx.listener(|this, _: &crate::ExplainQuery, _window, cx| {
+                        this.explain_query(cx)
+                    }),
+                )
                 .on_action(
                     cx.listener(|this, _: &crate::StopQuery, _window, cx| this.stop_query(cx)),
                 )
