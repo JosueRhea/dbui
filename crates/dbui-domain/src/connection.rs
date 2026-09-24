@@ -104,6 +104,47 @@ impl TlsMode {
     }
 }
 
+/// Which kind of server a connection is, as the user labels it.
+///
+/// A name like "db-2" says nothing about what breaks if a query goes wrong.
+/// The tag is drawn in the connection's colour wherever the connection is,
+/// and [`Environment::Production`] also asks before anything is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Environment {
+    #[default]
+    None,
+    Local,
+    Testing,
+    Staging,
+    Production,
+}
+
+impl Environment {
+    pub const ALL: [Environment; 5] = [
+        Environment::None,
+        Environment::Local,
+        Environment::Testing,
+        Environment::Staging,
+        Environment::Production,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Environment::None => "None",
+            Environment::Local => "Local",
+            Environment::Testing => "Testing",
+            Environment::Staging => "Staging",
+            Environment::Production => "Production",
+        }
+    }
+
+    /// Whether a write should be confirmed before it is sent.
+    pub fn confirms_writes(self) -> bool {
+        matches!(self, Environment::Production)
+    }
+}
+
 /// Identifies one saved connection.
 ///
 /// Stable across launches: the id is written to `connections.json` and used as
@@ -277,6 +318,9 @@ pub struct ConnectionConfig {
     /// `default` so a connections file written before tunnels existed loads.
     #[serde(default)]
     pub ssh: SshConfig,
+    /// Local, staging, production... `default` so older files load untagged.
+    #[serde(default)]
+    pub environment: Environment,
 }
 
 impl ConnectionConfig {
@@ -299,6 +343,7 @@ impl ConnectionConfig {
             read_only: false,
             query_timeout_secs: 0,
             ssh: SshConfig::default(),
+            environment: Environment::None,
         }
     }
 
@@ -450,5 +495,24 @@ mod tests {
         config.ssh.password = "hunter2".into();
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("hunter2"));
+    }
+
+    #[test]
+    fn only_production_asks_before_a_write() {
+        let asking: Vec<_> = Environment::ALL
+            .into_iter()
+            .filter(|env| env.confirms_writes())
+            .collect();
+        assert_eq!(asking, vec![Environment::Production]);
+    }
+
+    #[test]
+    fn the_tag_is_stored_by_name() {
+        let mut config = ConnectionConfig::new(Driver::MySql);
+        config.environment = Environment::Staging;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""environment":"staging""#), "{json}");
+        let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.environment, Environment::Staging);
     }
 }

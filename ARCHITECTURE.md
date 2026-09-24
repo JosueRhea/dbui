@@ -199,6 +199,22 @@ the app and loopback that accepts connections -- a proxy, a firewall agent --
 answers a probe before ssh does. `tests/ssh.rs` proves it against a real
 `sshd`, opt-in behind `DBUI_SSH_TESTS=1`.
 
+**A tunnel cannot outlive the app.** `Drop` does not run on a force quit or
+a crash, and an orphaned `ssh -L` is a forward into production left open on
+loopback. So `ssh` runs under a small `sh` that also reads a pipe from the app;
+the pipe reaches end-of-file when the app closes it *or* when the OS tears the
+app down, and the shell then kills `ssh`. It exits with `ssh`'s own status, so
+an `ssh` that gives up by itself still reads as an exit. Linux's `PDEATHSIG`
+would cover one platform; this covers both.
+
+**Production asks; read-only refuses.** They are different switches because
+they are different servers: a read-only connection must never write, a
+production one must write, but not by reflex. The production question stands
+in front of ⌘S and of any editor run with a writing statement in it, and its
+answer re-runs the same call with a one-shot pass. DROP and TRUNCATE skip it --
+they already make the user type the table's name, which is the stronger
+question.
+
 **`DBUI_CONFIG_DIR` overrides the configuration directory.** It is what lets a
 second profile exist side by side, and what keeps the UI tests — which persist
 a session as they click around — out of the developer's own configuration.

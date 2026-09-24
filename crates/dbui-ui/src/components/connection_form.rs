@@ -4,7 +4,7 @@ use super::{button_with_focus, caption, motion};
 use crate::root::DbUi;
 use crate::text_input::{self, TextInput};
 use crate::theme::{metrics, Theme};
-use dbui_app::domain::{ConnectionConfig, Driver, TlsMode};
+use dbui_app::domain::{ConnectionConfig, Driver, Environment, TlsMode};
 use gpui::{
     canvas, div, prelude::*, px, AnyElement, App, Context, Keystroke, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, SharedString,
@@ -313,6 +313,14 @@ impl ConnectionForm {
 
     pub fn set_tls(&mut self, tls: TlsMode) {
         self.config.tls = tls;
+    }
+
+    pub fn environment(&self) -> Environment {
+        self.config.environment
+    }
+
+    pub fn set_environment(&mut self, environment: Environment) {
+        self.config.environment = environment;
     }
 
     pub fn focus(&mut self, field: Field) {
@@ -666,6 +674,50 @@ impl DbUi {
                     .child(mode.label())
             })));
 
+        let current = form.environment();
+        let environment_choice = labelled(
+            "Tag",
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .children(Environment::ALL.map(|environment| {
+                    let active = current == environment;
+                    let color = theme.environment_color(environment);
+                    div()
+                        .id(("environment", environment as usize))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .h(metrics::control_height())
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(metrics::scaled(11.))
+                        .bg(if active {
+                            theme.elevated
+                        } else {
+                            theme.background
+                        })
+                        .text_color(if active { theme.text } else { theme.text_faint })
+                        .border_1()
+                        .border_color(match (active, color) {
+                            (true, Some(color)) => color,
+                            (true, None) => theme.accent,
+                            (false, _) => theme.border,
+                        })
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            if let Some(form) = this.modal.as_mut() {
+                                form.set_environment(environment);
+                            }
+                            cx.notify();
+                        }))
+                        .children(color.map(super::dot))
+                        .child(environment.label())
+                })),
+            theme,
+        );
+
         let read_only = form.read_only();
         let read_only_choice = labelled(
             "Access",
@@ -718,135 +770,160 @@ impl DbUi {
         // The scrim: a click outside the sheet dismisses it, the way every
         // other modal on the platform behaves.
         motion::dialog(
-"modal-in",
-div()
-            .id("modal-scrim")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::rgba(0x00000099))
-            .on_click(cx.listener(|this, _, _window, cx| this.close_modal(cx)))
-            .child(
-                div()
-                    .id("modal-sheet")
-                    .w(metrics::scaled(420.))
-                    // With the tunnel's fields open the sheet is tall; on a
-                    // short window it scrolls rather than losing its buttons
-                    // off the bottom.
-                    .max_h(gpui::relative(0.92))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_5()
-                    .rounded_lg()
-                    .bg(theme.elevated)
-                    .border_1()
-                    .border_color(theme.border)
-                    // Swallow clicks so hitting a field does not dismiss the
-                    // sheet through the scrim behind it. An empty handler is
-                    // not enough -- GPUI still bubbles unless stopped.
-                    .on_click(|_, _window, cx| cx.stop_propagation())
-                    .child(div().text_size(metrics::scaled(15.)).child(title))
-                    .child(driver_choice)
-                    .children(rows)
-                    // A local file has no transport to encrypt, and no server
-                    // to tunnel to.
-                    .when(!engine.is_file_based(), |sheet| {
-                        sheet.child(tls_choice).child(ssh_choice).children(ssh_rows)
-                    })
-                    .child(read_only_choice)
-                    .child(caption(
-                        "Passwords are kept for this session only and are never written to disk.",
-                        theme,
-                    ))
-                    .children(message)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .pt_2()
-                            // Removal lives with the connection it removes,
-                            // and only appears when there is one to remove.
-                            .when(form.is_editing(), |actions| {
-                                let id = form.config.id;
-                                actions.child(
+            "modal-in",
+            div()
+                .id("modal-scrim")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x00000099))
+                // Nothing behind the sheet hears the mouse. Without this a click
+                // on a checkbox also landed on the grid row under it, selecting
+                // it and opening its details behind the scrim.
+                .occlude()
+                .on_click(cx.listener(|this, _, _window, cx| this.close_modal(cx)))
+                .child(
+                    div()
+                        .id("modal-sheet")
+                        .w(metrics::scaled(420.))
+                        // With the tunnel's fields open the sheet is taller than
+                        // a small window. The fields scroll; the buttons stay.
+                        .max_h(gpui::relative(0.92))
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(theme.elevated)
+                        .border_1()
+                        .border_color(theme.border)
+                        // Swallow clicks so hitting a field does not dismiss the
+                        // sheet through the scrim behind it. An empty handler is
+                        // not enough -- GPUI still bubbles unless stopped.
+                        .on_click(|_, _window, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .id("modal-fields")
+                                .flex_1()
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .p_5()
+                                .pb_3()
+                                .child(div().text_size(metrics::scaled(15.)).child(title))
+                                .child(driver_choice)
+                                .children(rows)
+                                .child(environment_choice)
+                                // A local file has no transport to encrypt, and no
+                                // server to tunnel to.
+                                .when(!engine.is_file_based(), |sheet| {
+                                    sheet.child(tls_choice).child(ssh_choice).children(ssh_rows)
+                                })
+                                .child(read_only_choice)
+                                .child(caption(
+                                    "Passwords are kept in the system keychain, never in the \
+                                 connections file.",
+                                    theme,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .px_5()
+                                .pb_5()
+                                .children(message)
+                                .child(
                                     div()
-                                        .id("form-remove")
-                                        .px_2()
-                                        .text_size(metrics::scaled(11.))
-                                        .text_color(theme.text_faint)
-                                        .cursor_pointer()
-                                        .hover(|label| label.text_color(theme.danger))
-                                        .on_click(cx.listener(move |this, _, _window, cx| {
-                                            this.close_modal(cx);
-                                            this.remove_connection(id, cx);
-                                        }))
-                                        .child("Remove"),
-                                )
-                            })
-                            .child(div().flex_1())
-                            .child(
-                                button_with_focus(
-                                    "form-cancel",
-                                    "Cancel",
-                                    theme,
-                                    false,
-                                    cancel_focused,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _window, cx| {
-                                        if let Some(form) = this.modal.as_mut() {
-                                            form.focus_action(FormAction::Cancel);
-                                        }
-                                        this.close_modal(cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                button_with_focus(
-                                    "form-test",
-                                    test_label,
-                                    theme,
-                                    false,
-                                    test_focused,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _window, cx| {
-                                        if let Some(form) = this.modal.as_mut() {
-                                            form.focus_action(FormAction::Test);
-                                        }
-                                        this.test_connection(cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                button_with_focus(
-                                    "form-save",
-                                    "Save & Connect",
-                                    theme,
-                                    true,
-                                    save_focused,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _window, cx| {
-                                        if let Some(form) = this.modal.as_mut() {
-                                            form.focus_action(FormAction::Save);
-                                        }
-                                        this.save_connection(cx);
-                                    },
-                                )),
-                            ),
-                    ),
-            ),
-px(0.),
-)
-            .into_any_element()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .pt_2()
+                                        // Removal lives with the connection it removes,
+                                        // and only appears when there is one to remove.
+                                        .when(form.is_editing(), |actions| {
+                                            let id = form.config.id;
+                                            actions.child(
+                                                div()
+                                                    .id("form-remove")
+                                                    .px_2()
+                                                    .text_size(metrics::scaled(11.))
+                                                    .text_color(theme.text_faint)
+                                                    .cursor_pointer()
+                                                    .hover(|label| label.text_color(theme.danger))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _window, cx| {
+                                                            this.close_modal(cx);
+                                                            this.remove_connection(id, cx);
+                                                        },
+                                                    ))
+                                                    .child("Remove"),
+                                            )
+                                        })
+                                        .child(div().flex_1())
+                                        .child(
+                                            button_with_focus(
+                                                "form-cancel",
+                                                "Cancel",
+                                                theme,
+                                                false,
+                                                cancel_focused,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _window, cx| {
+                                                    if let Some(form) = this.modal.as_mut() {
+                                                        form.focus_action(FormAction::Cancel);
+                                                    }
+                                                    this.close_modal(cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            button_with_focus(
+                                                "form-test",
+                                                test_label,
+                                                theme,
+                                                false,
+                                                test_focused,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _window, cx| {
+                                                    if let Some(form) = this.modal.as_mut() {
+                                                        form.focus_action(FormAction::Test);
+                                                    }
+                                                    this.test_connection(cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            button_with_focus(
+                                                "form-save",
+                                                "Save & Connect",
+                                                theme,
+                                                true,
+                                                save_focused,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _window, cx| {
+                                                    if let Some(form) = this.modal.as_mut() {
+                                                        form.focus_action(FormAction::Save);
+                                                    }
+                                                    this.save_connection(cx);
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                        ),
+                ),
+            px(0.),
+        )
+        .into_any_element()
     }
 }
 

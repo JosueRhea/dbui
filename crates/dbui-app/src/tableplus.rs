@@ -12,7 +12,7 @@
 //! skipped, because the only thing left to import is a direct dial to a host
 //! that was never meant to be reachable directly.
 
-use dbui_domain::{ConnectionConfig, ConnectionId, Driver, SshConfig, TlsMode};
+use dbui_domain::{ConnectionConfig, ConnectionId, Driver, Environment, SshConfig, TlsMode};
 use keyring::Entry;
 use plist::Value as PlistValue;
 use std::path::{Path, PathBuf};
@@ -208,6 +208,10 @@ pub fn import_from_plist(
             read_only: false,
             query_timeout_secs: 0,
             ssh,
+            environment: map_environment(
+                plist_string(dict.get("Enviroment"))
+                    .or_else(|| plist_string(dict.get("Environment"))),
+            ),
         });
     }
 
@@ -219,6 +223,24 @@ fn map_driver(label: &str) -> Option<Driver> {
         "postgresql" | "postgres" => Some(Driver::Postgres),
         "mysql" | "mariadb" => Some(Driver::MySql),
         _ => None,
+    }
+}
+
+/// TablePlus tags each connection too, and the tag is the one thing about a
+/// production server worth bringing over intact. (Its plist has spelled the
+/// key both ways over the years.)
+fn map_environment(label: Option<String>) -> Environment {
+    match label
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "local" => Environment::Local,
+        "testing" | "development" => Environment::Testing,
+        "staging" => Environment::Staging,
+        "production" => Environment::Production,
+        _ => Environment::None,
     }
 }
 
@@ -387,6 +409,7 @@ mod tests {
     <key>DatabaseName</key><string>app</string>
     <key>tLSMode</key><integer>0</integer>
     <key>isOverSSH</key><false/>
+    <key>Enviroment</key><string>production</string>
   </dict>
   <dict>
     <key>ID</key><string>BBBB</string>
@@ -429,12 +452,14 @@ mod tests {
         assert_eq!(pg.driver, Driver::Postgres);
         assert_eq!(pg.port, 5432);
         assert_eq!(pg.tls, TlsMode::Prefer);
+        assert_eq!(pg.environment, Environment::Production);
 
         let mysql = &report.imported[1];
         assert_eq!(mysql.name, "shop");
         assert_eq!(mysql.driver, Driver::MySql);
         assert_eq!(mysql.port, 3307);
         assert_eq!(mysql.tls, TlsMode::Require);
+        assert_eq!(mysql.environment, Environment::None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

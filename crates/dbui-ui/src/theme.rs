@@ -4,7 +4,7 @@
 //! catalog, plus a clean Light. Everything that draws takes `&Theme` — nothing
 //! reads a colour from a global.
 
-use dbui_app::domain::{Driver, ValueKind};
+use dbui_app::domain::{Driver, Environment, ValueKind};
 use gpui::{px, rgb, rgba, Pixels, Rgba};
 
 /// A full chrome + value-colour palette.
@@ -104,6 +104,19 @@ impl Theme {
             Driver::Postgres => rgb(0x4a90d9),
             Driver::MySql => rgb(0xe48e00),
             Driver::Sqlite => rgb(0x6bbf59),
+        }
+    }
+
+    /// The colour a connection's environment tag is drawn in, or `None` for
+    /// an untagged one. Fixed rather than themed, like the engine colours:
+    /// red has to mean production in every theme, or it means nothing.
+    pub fn environment_color(&self, environment: Environment) -> Option<Rgba> {
+        match environment {
+            Environment::None => None,
+            Environment::Local => Some(rgb(0x6bbf59)),
+            Environment::Testing => Some(rgb(0x4a90d9)),
+            Environment::Staging => Some(rgb(0xe0a526)),
+            Environment::Production => Some(rgb(0xe5484d)),
         }
     }
 

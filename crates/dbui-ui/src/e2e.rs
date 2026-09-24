@@ -4004,6 +4004,131 @@ fn a_read_only_connection_refuses_writes_from_the_editor(cx: &mut TestAppContext
     });
 }
 
+/// Tag a live connection production, the way the sheet would.
+fn tag_production(view: &mut DbUi) {
+    let id = view.workspace.active_id().unwrap();
+    view.workspace.get_mut(id).unwrap().config.environment =
+        dbui_app::domain::Environment::Production;
+}
+
+/// On production a writing statement waits for an answer; Escape sends
+/// nothing, Enter sends the whole run as typed.
+#[gpui::test]
+fn production_asks_before_the_editor_writes(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "editor-production");
+    view.update(cx, |view, cx| {
+        tag_production(view);
+        view.put_sql_in_editor("DELETE FROM members WHERE id = 1", cx);
+        view.run_query(cx);
+        let guard = view.production_guard.as_ref().expect("asked first");
+        assert!(
+            guard.body().contains("DELETE FROM members"),
+            "{}",
+            guard.body()
+        );
+    });
+
+    cx.simulate_keystrokes("escape");
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| assert!(view.production_guard.is_none()));
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2"
+    );
+
+    view.update(cx, |view, cx| view.run_query(cx));
+    // ⌘↵ again is not an answer -- it is how the question was raised.
+    cx.simulate_keystrokes("cmd-enter");
+    view.update(cx, |view, _| assert!(view.production_guard.is_some()));
+    cx.simulate_keystrokes("enter");
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| {
+        assert!(view.production_guard.is_none());
+        assert!(!view.production_confirmed, "the pass was for one run only");
+    });
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "1"
+    );
+}
+
+/// Reads never ask, production or not.
+#[gpui::test]
+fn production_lets_reads_through(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "editor-production-read");
+    view.update(cx, |view, cx| {
+        tag_production(view);
+        view.put_sql_in_editor("SELECT count(*) FROM members", cx);
+        view.run_query(cx);
+        assert!(view.production_guard.is_none());
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+}
+
+/// ⌘S on production asks too, and the answer commits the batch.
+#[gpui::test]
+fn production_asks_before_a_commit(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "commit-production");
+    view.update(cx, |view, cx| {
+        tag_production(view);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, stage_one_edit);
+
+    cx.simulate_keystrokes("cmd-s");
+    view.update(cx, |view, _| {
+        let guard = view.production_guard.as_ref().expect("asked first");
+        assert_eq!(guard.body(), "1 staged change will be committed.");
+        assert_eq!(view.tabs.active().unwrap().pending_change_count(), 1);
+    });
+    // Nothing reached the file while the question stood.
+    let before = read_back(&db.path, "SELECT name FROM members ORDER BY id");
+
+    view.update(cx, |view, cx| view.confirm_production_write(cx));
+    settle(&view, cx, |view| {
+        view.tabs.active().unwrap().pending_change_count() == 0
+            && !matches!(view.status, Status::Busy(_))
+    });
+    let after = read_back(&db.path, "SELECT name FROM members ORDER BY id");
+    assert_ne!(before, after, "the commit went through");
+}
+
+/// The question paints, over a commit and over statements, at every size.
+#[gpui::test]
+fn the_production_guard_draws(cx: &mut TestAppContext) {
+    use crate::components::production_guard::{GuardedWrite, ProductionGuard};
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+    for write in [
+        GuardedWrite::Commit { changes: 3 },
+        GuardedWrite::Statements(vec!["UPDATE orders SET status = 'x'".into()]),
+    ] {
+        view.update(cx, |view, cx| {
+            view.production_guard = Some(ProductionGuard {
+                write: write.clone(),
+                connection: "prod".into(),
+            });
+            cx.notify();
+        });
+        draw_at_every_size(&view, cx);
+    }
+}
+
+/// The sheet stores the tag it was given.
+#[gpui::test]
+fn the_sheet_sets_the_environment_tag(cx: &mut TestAppContext) {
+    use dbui_app::domain::Environment;
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, _| {
+        let form = view.modal.as_mut().unwrap();
+        assert_eq!(form.environment(), Environment::None);
+        form.set_environment(Environment::Staging);
+        assert_eq!(form.to_config().environment, Environment::Staging);
+    });
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

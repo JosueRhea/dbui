@@ -18,7 +18,7 @@ pub mod statement;
 pub mod value;
 
 pub use catalog::{Catalog, Column, ForeignKey, Schema, Table, TableKind, TableRef};
-pub use connection::{ConnectionConfig, ConnectionId, Driver, SshConfig, TlsMode};
+pub use connection::{ConnectionConfig, ConnectionId, Driver, Environment, SshConfig, TlsMode};
 pub use ddl::{ColumnSpec, Index};
 pub use query::{
     order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, SortKey,

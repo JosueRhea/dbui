@@ -36,6 +36,8 @@ impl DbUi {
         let settings_open = self.settings_menu_open;
         let chrome = self.chrome_theme();
         let theme = &chrome;
+        let environment = self.active_environment();
+        let environment_color = theme.environment_color(environment);
 
         div()
             .id("titlebar")
@@ -53,6 +55,31 @@ impl DbUi {
             .text_color(theme.text_muted)
             .text_size(metrics::text_size_small())
             .child(connections)
+            // The tag, where the user looks to tell which server they are on,
+            // and a line in its colour right across the window under the bar:
+            // production should be visible from across the room.
+            .children(environment_color.map(|color| {
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(4.))
+                    .bg(gpui::Rgba { a: 0.16, ..color })
+                    .border_1()
+                    .border_color(color)
+                    .text_color(color)
+                    .text_size(metrics::scaled(10.))
+                    .child(environment.label().to_uppercase())
+            }))
+            .children(environment_color.map(|color| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(2.))
+                    .bg(color)
+            }))
             // A read-only connection says so where the user is already
             // looking to tell which server they are on.
             .children(self.is_read_only().then(|| {
@@ -251,6 +278,7 @@ impl DbUi {
                 let light = status_color(&entry.status, theme);
                 let name = SharedString::from(entry.config.name.clone());
                 let driver = entry.config.driver;
+                let tag = theme.environment_color(entry.config.environment);
                 // Staged work anywhere under this connection, including the
                 // tabs that are not in front -- ⌘⇧W closes all of them.
                 let changes: usize = self
@@ -307,6 +335,19 @@ impl DbUi {
                     // other whether it is reachable.
                     .child(database_icon(theme.driver_color(driver)))
                     .child(div().truncate().child(name))
+                    // Every tagged chip carries its colour, not just the one
+                    // in front: switching to production should be seen
+                    // before it is clicked, not after.
+                    .children(tag.map(|color| {
+                        div()
+                            .absolute()
+                            .left(px(6.))
+                            .right(px(6.))
+                            .bottom(px(-1.))
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(color)
+                    }))
                     .children((changes > 0).then(|| dot(theme.warning)))
                     .child(dot(light))
                     .when(is_active, |chip| {

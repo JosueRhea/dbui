@@ -25,6 +25,11 @@ server. It runs your own `ssh`, so `~/.ssh/config`, the agent and `known_hosts`
 all apply; a password or key passphrase is kept in the keychain beside the
 database one. TablePlus connections that go over SSH import with their tunnel.
 
+**Production looks like production.** Tag a connection Local, Testing, Staging or
+Production and its colour runs under the title bar and its tab. On Production,
+⌘S and any writing statement stop for a confirmation that names the server and
+what is about to be sent.
+
 **SQL, with the catalog behind it.** `⌘↵` runs the statement under the caret, `⌘⇧↵`
 runs every statement in the buffer, and `⌃Space` completes against the schemas, tables
 and columns the connection actually has. Results land in the same typed grid, timed.

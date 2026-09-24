@@ -8,6 +8,7 @@
 use crate::components::close_guard::{CloseGuard, CloseTarget, TabScope};
 use crate::components::context_menu::{ConfirmPrompt, ContextMenu};
 use crate::components::palette::{Palette, PaletteKind};
+use crate::components::production_guard::{GuardedWrite, ProductionGuard};
 use crate::components::{ConnectionForm, DetailInput, FormAction};
 use crate::sql_complete::CompletionPopup;
 use crate::tabs::{RowDraft, TabId, Tabs, WorkspaceTab};
@@ -525,6 +526,12 @@ pub struct DbUi {
     pub(crate) confirm: Option<ConfirmPrompt>,
     /// A close waiting on the user deciding what to do about staged changes.
     pub(crate) close_guard: Option<CloseGuard>,
+    /// "Write to production?" -- standing in front of a commit or a writing
+    /// statement on a connection tagged production.
+    pub(crate) production_guard: Option<ProductionGuard>,
+    /// Set for the one call the guard's answer makes, so that call is not
+    /// stopped by the same question again.
+    pub(crate) production_confirmed: bool,
     /// Bumped each time a commit puts its "Committing…" line up, so the one
     /// that lands can tell whether the line on screen is still its own.
     pub(crate) commit_stamp: u64,
@@ -745,6 +752,8 @@ impl DbUi {
             context_menu: None,
             confirm: None,
             close_guard: None,
+            production_guard: None,
+            production_confirmed: false,
             commit_stamp: 0,
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
@@ -2761,7 +2770,7 @@ impl DbUi {
             .and_then(|path| dbui_app::history::save(&path, &self.history));
     }
 
-    fn dispatch_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
+    pub(crate) fn dispatch_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
         if statements.is_empty() {
             return;
         }
@@ -2771,6 +2780,11 @@ impl DbUi {
         if let Some(write) = statements.iter().find(|sql| dbui_app::domain::writes(sql)) {
             let verb = dbui_app::domain::statement::describe(write).verb;
             if self.refuse_if_read_only(&verb, cx) {
+                return;
+            }
+            // A production connection takes writes, but asks first. The whole
+            // batch waits, reads included, so the answer runs it as typed.
+            if self.hold_for_production(GuardedWrite::Statements(statements.clone()), cx) {
                 return;
             }
         }
@@ -3461,6 +3475,14 @@ impl DbUi {
             return false;
         }
         self.focus == Focus::Grid || (self.focus == Focus::Detail && self.detail_input.is_none())
+    }
+
+    /// The active connection's environment tag.
+    pub(crate) fn active_environment(&self) -> dbui_app::domain::Environment {
+        self.workspace
+            .active()
+            .map(|entry| entry.config.environment)
+            .unwrap_or_default()
     }
 
     /// Whether the active connection refuses writes.
@@ -5188,6 +5210,11 @@ impl DbUi {
         };
 
         let count = edits.len() + deletes.len() + inserts.len();
+        // Last, so the question is only ever asked about a batch that would
+        // actually go -- never in place of "no changes" or "not connected".
+        if self.hold_for_production(GuardedWrite::Commit { changes: count }, cx) {
+            return;
+        }
         if let Some(WorkspaceTab::Table { saving, .. }) = self.tabs.get_mut(tab_id) {
             *saving = true;
         }
@@ -5841,6 +5868,7 @@ impl DbUi {
     fn keyboard_is_claimed(&self) -> bool {
         self.palette.is_some()
             || self.confirm.is_some()
+            || self.production_guard.is_some()
             || self.close_guard.is_some()
             || self.context_menu.is_some()
             || self.modal.is_some()
@@ -5883,6 +5911,19 @@ impl DbUi {
         // something to be set off from underneath it.
         if self.schema_sheet.is_some() {
             self.handle_schema_sheet_key(keystroke, cx);
+            return;
+        }
+
+        // The production question owns it too, and is checked before the
+        // close guard: ⌘S from under that guard is what can raise this one.
+        if self.production_guard.is_some() {
+            match key {
+                "escape" => self.cancel_production_write(cx),
+                // Unmodified, for the reason the close guard gives below: the
+                // ⌘↵ that raised this question must not also answer it.
+                "enter" if !command => self.confirm_production_write(cx),
+                _ => {}
+            }
             return;
         }
 
@@ -6712,6 +6753,7 @@ impl Render for DbUi {
         let context_menu = self.render_context_menu(window, cx);
         let confirm = self.render_confirm(cx);
         let close_guard = self.render_close_guard(cx);
+        let production_guard = self.render_production_guard(cx);
         let schema_sheet = self.render_schema_sheet(cx);
         let drag_ghost = self.render_drag_ghost();
 
@@ -6942,12 +6984,15 @@ impl Render for DbUi {
             // closes them once the commit is actually sent, which is what
             // keeps a dropdown from hanging open over work that already went.
             .when(
-                !self.keyboard_is_claimed()
-                    || self.close_guard.is_some()
-                    || self.connection_picker_open
-                    || self.settings_menu_open
-                    || self.detail_menu_open
-                    || self.page_size_menu_open,
+                // Never under the production question, though: that is the
+                // one ⌘S is waiting on, and pressing it again is not an answer.
+                self.production_guard.is_none()
+                    && (!self.keyboard_is_claimed()
+                        || self.close_guard.is_some()
+                        || self.connection_picker_open
+                        || self.settings_menu_open
+                        || self.detail_menu_open
+                        || self.page_size_menu_open),
                 |root| {
                     root.on_action(cx.listener(|this, _: &crate::CommitChanges, _window, cx| {
                         this.save_pending_edits(cx)
@@ -6980,6 +7025,7 @@ impl Render for DbUi {
             .children(context_menu)
             .children(confirm)
             .children(close_guard)
+            .children(production_guard)
             .children(schema_sheet)
             // Over everything: it is the pointer's, and the pointer can be
             // anywhere.
