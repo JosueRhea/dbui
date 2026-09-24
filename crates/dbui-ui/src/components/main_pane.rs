@@ -622,6 +622,38 @@ impl DbUi {
         let lines_owned: Vec<String> = layout.lines.iter().map(|l| (*l).to_string()).collect();
         let theme = &self.theme;
         let line_h = metrics::editor_line_height();
+        // Where the popup goes: under the caret, or over it when the pane has
+        // more room above. Measured from the editor body's padding edge, with
+        // the scroll taken off, since the popup does not scroll with the text.
+        let anchor = {
+            let offset = scroll_handle.offset();
+            let viewport_h = scroll_handle.bounds().size.height;
+            let column = lines_owned.get(caret_line).map_or(0, |line| {
+                line[..layout.caret_column.min(line.len())].chars().count()
+            });
+            let left = px(12. * metrics::zoom())
+                + text_input::editor_gutter()
+                + px(column as f32 * text_input::char_width())
+                + offset.x;
+            // Kept inside the pane at the right edge, where it would be clipped.
+            let widest_left = scroll_handle.bounds().size.width - px(220.);
+            let left = left.min(widest_left).max(px(0.));
+            let top = line_h * caret_line as f32 + offset.y;
+            let below = viewport_h - (top + line_h);
+            if below >= px(120.) || below >= top {
+                CompletionAnchor::Below {
+                    left,
+                    top: top + line_h,
+                    room: below,
+                }
+            } else {
+                CompletionAnchor::Above {
+                    left,
+                    bottom: viewport_h - top,
+                    room: top,
+                }
+            }
+        };
         // The same box the caret-follow pans over, so the two agree on where
         // the text ends.
         let content_w = text_input::editor_content_size(editor.text()).width;
@@ -861,7 +893,7 @@ impl DbUi {
                             )),
                     )
                     .children(completion.map(|popup| {
-                        render_completion_popup(&popup, &completion_scroll, theme, cx)
+                        render_completion_popup(&popup, anchor, &completion_scroll, theme, cx)
                     })),
             )
             .child(editor_resize_handle(dragging, theme, cx))
@@ -903,8 +935,25 @@ fn editor_resize_handle(
         .into_any_element()
 }
 
+/// Where the completion popup sits in the editor body, and how tall it may
+/// grow before it would leave the pane.
+#[derive(Clone, Copy)]
+enum CompletionAnchor {
+    Below {
+        left: gpui::Pixels,
+        top: gpui::Pixels,
+        room: gpui::Pixels,
+    },
+    Above {
+        left: gpui::Pixels,
+        bottom: gpui::Pixels,
+        room: gpui::Pixels,
+    },
+}
+
 fn render_completion_popup(
     popup: &crate::sql_complete::CompletionPopup,
+    anchor: CompletionAnchor,
     scroll: &gpui::ScrollHandle,
     theme: &crate::theme::Theme,
     cx: &mut Context<DbUi>,
@@ -923,7 +972,10 @@ fn render_completion_popup(
                 .flex()
                 .items_center()
                 .justify_between()
-                .px_2()
+                .gap_3()
+                // Clear of the scrollbar laid over the right edge.
+                .pl_2()
+                .pr_4()
                 .py_0p5()
                 .when(selected, |row| row.bg(theme.selection))
                 .hover(|row| row.bg(theme.hover))
@@ -950,10 +1002,17 @@ fn render_completion_popup(
     div()
         .id("sql-completion")
         .absolute()
-        .left(px(40.))
-        .bottom(px(4.))
+        .map(|popup| match anchor {
+            CompletionAnchor::Below { left, top, room } => popup
+                .left(left)
+                .top(top)
+                .max_h(room.min(px(180.)).max(px(60.))),
+            CompletionAnchor::Above { left, bottom, room } => popup
+                .left(left)
+                .bottom(bottom)
+                .max_h(room.min(px(180.)).max(px(60.))),
+        })
         .min_w(px(220.))
-        .max_h(px(180.))
         .flex()
         .flex_col()
         .overflow_hidden()

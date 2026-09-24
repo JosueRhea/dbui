@@ -465,6 +465,10 @@ pub struct DbUi {
     pub(crate) editor_drag: Option<(Pixels, Pixels)>,
     /// Open SQL autocomplete popup, if any.
     pub(crate) completion: Option<CompletionPopup>,
+    /// Whether the popup opened by itself as the user typed, rather than on
+    /// ⌃Space. An automatic one keeps out of the way: it closes when nothing
+    /// is left worth offering, where one asked for shows what there is.
+    pub(crate) completion_auto: bool,
     /// Cached `driver.columns` results keyed by `(schema, table)`.
     pub(crate) column_cache: HashMap<(String, String), Vec<Column>>,
     /// Substring filter over the schema tree. Empty means show everything.
@@ -721,6 +725,7 @@ impl DbUi {
             editor_height: px(EDITOR_HEIGHT_DEFAULT),
             editor_drag: None,
             completion: None,
+            completion_auto: false,
             column_cache: HashMap::new(),
             sidebar_filter: crate::text_input::TextInput::new(false),
             row_drag: None,
@@ -2483,8 +2488,44 @@ impl DbUi {
         cx.notify();
     }
 
-    /// Open or refresh the SQL autocomplete popup at the caret.
+    /// ⌃Space: open the SQL autocomplete popup at the caret with everything
+    /// that matches, even when the word is already complete.
     pub(crate) fn trigger_completion(&mut self, cx: &mut Context<Self>) {
+        self.completion_auto = false;
+        self.refresh_completion(cx);
+    }
+
+    /// The fewest characters of a bare word before the popup opens by
+    /// itself. One would put a list over every `a` in `WHERE x = a`.
+    const AUTO_COMPLETE_MIN: usize = 2;
+
+    /// Open the popup as the user types, when there is something worth
+    /// offering: after a `.`, or a word of [`Self::AUTO_COMPLETE_MIN`]
+    /// characters that is not a number and not inside a string or comment.
+    pub(crate) fn auto_complete(&mut self, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+            return;
+        };
+        let caret = editor.cursor();
+        let in_text = caret > 0
+            && crate::sql_format::highlight_spans(editor.text(), self.sql_dialect())
+                .iter()
+                .any(|(start, end, style)| {
+                    matches!(
+                        style,
+                        crate::sql_format::SqlStyle::String | crate::sql_format::SqlStyle::Comment
+                    ) && *start < caret
+                        && caret <= *end
+                });
+        if in_text {
+            return;
+        }
+        self.completion_auto = true;
+        self.refresh_completion(cx);
+    }
+
+    /// Rebuild the popup at the caret, in whichever mode it is in.
+    pub(crate) fn refresh_completion(&mut self, cx: &mut Context<Self>) {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
             return;
         };
@@ -2510,8 +2551,25 @@ impl DbUi {
             .workspace
             .active()
             .and_then(|entry| entry.catalog.as_ref());
-        self.completion =
+        let mut popup =
             crate::sql_complete::build_popup(&request, catalog, &self.column_cache, &sql, caret);
+        if self.completion_auto {
+            let worth_it = request.qualifier.is_some()
+                || request.prefix.chars().count() >= Self::AUTO_COMPLETE_MIN
+                    && !request.prefix.starts_with(|c: char| c.is_ascii_digit());
+            // A word typed out in full is not offered back: Enter after
+            // `FROM users` is a new line, not a request to write `users` again.
+            if let Some(popup) = popup.as_mut() {
+                popup
+                    .items
+                    .retain(|item| !item.label.eq_ignore_ascii_case(&request.prefix));
+                popup.selected = 0;
+            }
+            if !worth_it || popup.as_ref().is_some_and(|popup| popup.items.is_empty()) {
+                popup = None;
+            }
+        }
+        self.completion = popup;
         cx.notify();
     }
 
@@ -2528,7 +2586,7 @@ impl DbUi {
                         .insert((table.schema.clone(), table.name.clone()), columns);
                     // Rebuild the popup now that columns are available.
                     if this.focus == Focus::Editor {
-                        this.trigger_completion(cx);
+                        this.refresh_completion(cx);
                     } else {
                         cx.notify();
                     }
@@ -6275,10 +6333,21 @@ impl DbUi {
                     // goes with it rather than going stale; anything else
                     // that edits the word re-filters it.
                     let edits_word = key.len() == 1 || key == "backspace" || key == "delete";
+                    // A name character or a `.` opens it by itself; deleting
+                    // does not, the way no editor pops a list on backspace.
+                    let types_name = !command
+                        && !keystroke.modifiers.control
+                        && keystroke.key_char.as_deref().is_some_and(|typed| {
+                            typed
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        });
                     if self.completion.is_some() && !command && key == "space" {
                         self.dismiss_completion(cx);
                     } else if self.completion.is_some() && !command && edits_word {
-                        self.trigger_completion(cx);
+                        self.refresh_completion(cx);
+                    } else if self.completion.is_none() && types_name {
+                        self.auto_complete(cx);
                     } else {
                         cx.notify();
                     }

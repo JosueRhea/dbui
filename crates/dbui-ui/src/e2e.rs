@@ -5147,6 +5147,71 @@ fn autocomplete_offers_tables_after_from(cx: &mut TestAppContext) {
     });
 }
 
+/// Typing opens the popup by itself -- no shortcut -- once a word is long
+/// enough to be worth completing, or right after a `.`.
+#[gpui::test]
+fn completion_opens_as_you_type(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id", "email"])]);
+    view.update(cx, open_sql_editor);
+
+    cx.simulate_keystrokes(&typing("select * from u"));
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "one letter is not enough");
+    });
+    cx.simulate_keystrokes(&typing("s"));
+    view.update(cx, |view, _| {
+        let popup = view.completion.as_ref().expect("opened while typing");
+        assert!(popup.items.iter().any(|item| item.label == "users"));
+    });
+
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "select * from users");
+        assert!(view.completion.is_none());
+    });
+
+    // After an alias and a dot, the columns -- with no letters typed yet.
+    cx.simulate_keystrokes(&typing(" u where u."));
+    view.update(cx, |view, _| {
+        let popup = view.completion.as_ref().expect("a dot opens it");
+        let labels: Vec<_> = popup.items.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"email"), "got {labels:?}");
+    });
+}
+
+/// A word typed out in full is not offered back, so Enter at the end of
+/// `FROM users` starts a new line instead of accepting `users` again.
+#[gpui::test]
+fn enter_after_a_complete_word_is_a_new_line(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+    view.update(cx, open_sql_editor);
+
+    cx.simulate_keystrokes(&typing("select * from users"));
+    view.update(cx, |view, _| assert!(view.completion.is_none()));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "select * from users\n");
+    });
+}
+
+/// Nothing pops up over a string or a comment.
+#[gpui::test]
+fn completion_stays_out_of_strings_and_comments(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+    view.update(cx, open_sql_editor);
+
+    cx.simulate_keystrokes(&typing("select 'us"));
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "in a string")
+    });
+
+    view.update(cx, |view, _| set_sql_editor_text(view, ""));
+    cx.simulate_keystrokes(&typing("-- us"));
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "in a comment")
+    });
+}
+
 /// Through the keyboard, not `trigger_completion`: the platform names the key
 /// `space`, and a check against `" "` once meant the shortcut never fired.
 #[gpui::test]
