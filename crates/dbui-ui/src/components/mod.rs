@@ -5,6 +5,7 @@
 //! That lives on [`DbUi`](crate::root::DbUi), which is what keeps "what the app
 //! knows" in one file instead of spread across the widgets that draw it.
 
+pub(crate) mod activity;
 mod change_bubble;
 pub(crate) mod close_guard;
 pub(crate) mod connection_form;

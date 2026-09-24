@@ -31,6 +31,13 @@ and triggers; SQLite: triggers). Open one and its `CREATE` statement lands in a
 query tab, ready to read, change and run back. Objects an extension installed
 are left out; the extension is listed instead.
 
+**Who is on the server.** `⌘⌥A` lists every client session -- user, database,
+state, how long its statement has run, what it is waiting on -- busiest first,
+refreshed every two seconds. Long-running statements and sessions idle inside a
+transaction are picked out, and either can be cancelled or ended after a
+confirmation on the row (`pg_cancel_backend` / `pg_terminate_backend`,
+`KILL QUERY` / `KILL`).
+
 **Production looks like production.** Tag a connection Local, Testing, Staging or
 Production and its colour runs under the title bar and its tab. On Production,
 ⌘S and any writing statement stop for a confirmation that names the server and

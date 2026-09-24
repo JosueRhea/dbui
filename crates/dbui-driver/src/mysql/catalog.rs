@@ -56,6 +56,23 @@ pub const OBJECTS: &str = "
      ORDER BY 1, 3, 2
 ";
 
+/// Client threads, busiest first. The event scheduler and replication
+/// threads report `Daemon` and are not something to cancel.
+pub const SESSIONS: &str = "
+    SELECT CAST(ID AS SIGNED)          AS id,
+           COALESCE(USER, '')          AS user_name,
+           COALESCE(DB, '')            AS database_name,
+           COALESCE(HOST, '')          AS client,
+           COALESCE(COMMAND, '')       AS state,
+           NULLIF(STATE, '')           AS waiting_on,
+           COALESCE(INFO, '')          AS query,
+           CAST(TIME AS DOUBLE)        AS running_for,
+           CAST(ID = CONNECTION_ID() AS SIGNED) AS is_self
+      FROM information_schema.PROCESSLIST
+     WHERE COMMAND <> 'Daemon'
+     ORDER BY COMMAND = 'Sleep', TIME DESC
+";
+
 /// `COLUMN_TYPE` rather than `DATA_TYPE`: the former is `varchar(255)` and
 /// `int unsigned`, the latter just `varchar` and `int`.
 pub const COLUMNS: &str = "

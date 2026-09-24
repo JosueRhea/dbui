@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
     ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
-    SortKey, Table, TableRef, TlsMode, TransactionState, Value,
+    ServerSession, SortKey, Table, TableRef, TlsMode, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -253,6 +253,52 @@ impl DatabaseDriver for PostgresDriver {
             .collect();
 
         Ok(Catalog { schemas, objects })
+    }
+
+    async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
+        let rows = sqlx::query(catalog::SESSIONS)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(catalog::SESSIONS, &error))?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some(ServerSession {
+                    id: row.try_get("id").ok()?,
+                    user: row.try_get("user_name").unwrap_or_default(),
+                    database: row.try_get("database_name").unwrap_or_default(),
+                    client: row.try_get("client").unwrap_or_default(),
+                    state: row.try_get("state").unwrap_or_default(),
+                    waiting_on: row.try_get("waiting_on").ok().flatten(),
+                    query: row.try_get("query").unwrap_or_default(),
+                    running_for: row.try_get("running_for").ok().flatten(),
+                    is_self: row.try_get("is_self").unwrap_or(false),
+                })
+            })
+            .collect())
+    }
+
+    async fn end_session(&self, id: i64, terminate: bool) -> Result<()> {
+        let sql = if terminate {
+            catalog::TERMINATE_SESSION
+        } else {
+            catalog::CANCEL_SESSION
+        };
+        let done: bool = sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?;
+        if done {
+            Ok(())
+        } else {
+            // Postgres says false rather than raising for a pid that is gone,
+            // or one this role may not signal.
+            Err(DriverError::message(
+                sql,
+                format!("Session {id} has already ended, or this user may not signal it"),
+            ))
+        }
     }
 
     async fn definition(&self, object: &DbObject) -> Result<String> {

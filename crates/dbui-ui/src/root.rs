@@ -551,6 +551,11 @@ pub struct DbUi {
     /// Set for the one call the guard's answer makes, so that call is not
     /// stopped by the same question again.
     pub(crate) production_confirmed: bool,
+    /// The server activity panel, while it is open.
+    pub(crate) activity: Option<crate::components::activity::ActivityPanel>,
+    /// Counts openings of the panel, so a refresh loop can tell it has been
+    /// replaced by a newer one.
+    pub(crate) activity_generation: u64,
     /// Bumped each time a commit puts its "Committing…" line up, so the one
     /// that lands can tell whether the line on screen is still its own.
     pub(crate) commit_stamp: u64,
@@ -773,6 +778,8 @@ impl DbUi {
             close_guard: None,
             production_guard: None,
             production_confirmed: false,
+            activity: None,
+            activity_generation: 0,
             commit_stamp: 0,
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
@@ -5961,6 +5968,7 @@ impl DbUi {
         self.palette.is_some()
             || self.confirm.is_some()
             || self.production_guard.is_some()
+            || self.activity.is_some()
             || self.close_guard.is_some()
             || self.context_menu.is_some()
             || self.modal.is_some()
@@ -6015,6 +6023,26 @@ impl DbUi {
                 // ⌘↵ that raised this question must not also answer it.
                 "enter" if !command => self.confirm_production_write(cx),
                 _ => {}
+            }
+            return;
+        }
+
+        // The activity panel is modal; Escape closes it, and nothing
+        // underneath hears a key while it is up.
+        if self.activity.is_some() {
+            if key == "escape" {
+                let confirming = self
+                    .activity
+                    .as_ref()
+                    .is_some_and(|panel| panel.confirming.is_some());
+                if confirming {
+                    if let Some(panel) = self.activity.as_mut() {
+                        panel.confirming = None;
+                    }
+                    cx.notify();
+                } else {
+                    self.close_activity(cx);
+                }
             }
             return;
         }
@@ -6846,6 +6874,7 @@ impl Render for DbUi {
         let confirm = self.render_confirm(cx);
         let close_guard = self.render_close_guard(cx);
         let production_guard = self.render_production_guard(cx);
+        let activity = self.render_activity(cx);
         let schema_sheet = self.render_schema_sheet(cx);
         let drag_ghost = self.render_drag_ghost();
 
@@ -7017,6 +7046,9 @@ impl Render for DbUi {
                         this.explain_query(cx)
                     }),
                 )
+                .on_action(cx.listener(|this, _: &crate::ServerActivity, _window, cx| {
+                    this.open_activity(cx)
+                }))
                 .on_action(
                     cx.listener(|this, _: &crate::StopQuery, _window, cx| this.stop_query(cx)),
                 )
@@ -7122,6 +7154,7 @@ impl Render for DbUi {
             .children(context_menu)
             .children(confirm)
             .children(close_guard)
+            .children(activity)
             .children(production_guard)
             .children(schema_sheet)
             // Over everything: it is the pointer's, and the pointer can be

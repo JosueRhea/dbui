@@ -153,6 +153,29 @@ pub const EXTENSION_DEFINITION: &str = "
      WHERE e.oid = $1::text::oid
 ";
 
+/// Client connections, busiest first. Background workers (autovacuum, the
+/// WAL writer) are the server's own and cannot be told anything useful.
+pub const SESSIONS: &str = "
+    SELECT pid::bigint AS id,
+           COALESCE(usename, '') AS user_name,
+           COALESCE(datname, '') AS database_name,
+           COALESCE(host(client_addr), 'local')
+             || CASE WHEN application_name <> '' THEN ' · ' || application_name ELSE '' END
+             AS client,
+           COALESCE(state, '') AS state,
+           CASE WHEN state = 'active' AND wait_event IS NOT NULL
+                THEN wait_event_type || ': ' || wait_event END AS waiting_on,
+           COALESCE(query, '') AS query,
+           EXTRACT(EPOCH FROM (clock_timestamp() - query_start))::float8 AS running_for,
+           pid = pg_backend_pid() AS is_self
+      FROM pg_catalog.pg_stat_activity
+     WHERE backend_type = 'client backend'
+     ORDER BY state = 'idle', query_start
+";
+
+pub const CANCEL_SESSION: &str = "SELECT pg_catalog.pg_cancel_backend($1::int)";
+pub const TERMINATE_SESSION: &str = "SELECT pg_catalog.pg_terminate_backend($1::int)";
+
 /// Every schema, including the empty ones.
 ///
 /// A schema with no tables yet still belongs in the tree -- otherwise creating

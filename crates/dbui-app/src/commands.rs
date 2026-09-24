@@ -8,7 +8,7 @@
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
     Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Index, Page, QueryOutcome,
-    QueryResult, ResultSet, SortKey, TableKind, TableRef, Value,
+    QueryResult, ResultSet, ServerSession, SortKey, TableKind, TableRef, Value,
 };
 use dbui_driver::{DatabaseDriver, DriverError, QueryToken, RowBatch, RowUpdate};
 use std::sync::Arc;
@@ -393,6 +393,24 @@ pub fn fetch_indexes(
     table: TableRef,
 ) -> Task<Outcome<Vec<Index>>> {
     runtime.spawn(async move { driver.indexes(&table).await })
+}
+
+/// Every client connection on the server, for the activity panel.
+pub fn fetch_sessions(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+) -> Task<Outcome<Vec<ServerSession>>> {
+    runtime.spawn(async move { driver.server_sessions().await })
+}
+
+/// Cancel what a session is running, or (`terminate`) end the session.
+pub fn end_session(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    id: i64,
+    terminate: bool,
+) -> Task<Outcome<()>> {
+    runtime.spawn(async move { driver.end_session(id, terminate).await })
 }
 
 /// The statement that creates one function, trigger, sequence... for the

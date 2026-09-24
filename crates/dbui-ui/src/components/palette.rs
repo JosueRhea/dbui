@@ -54,6 +54,7 @@ enum ActionId {
     NextConnection,
     PrevConnection,
     RefreshCatalog,
+    ServerActivity,
     RefreshResult,
     OpenSql,
     RunQuery,
@@ -217,6 +218,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::RefreshCatalog,
         label: "Refresh Catalog",
         shortcut: None,
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::ServerActivity,
+        label: "Server Activity",
+        shortcut: Some("⌘⌥A"),
         section: "Connection",
     },
     // Query
@@ -971,6 +978,12 @@ impl DbUi {
                         .unwrap_or(false)
             }
             ActionId::DisconnectActive | ActionId::RefreshCatalog => connected,
+            ActionId::ServerActivity => {
+                connected
+                    && !self
+                        .active_driver_kind()
+                        .is_some_and(|driver| driver.is_file_based())
+            }
             ActionId::CloseConnection => has_active,
             // Nothing to step to with one tab open, or none.
             ActionId::NextConnection | ActionId::PrevConnection => self.workspace.open_count() > 1,
@@ -1096,6 +1109,7 @@ impl DbUi {
             ActionId::NextConnection => self.cycle_connection_tab(true, cx),
             ActionId::PrevConnection => self.cycle_connection_tab(false, cx),
             ActionId::RefreshCatalog => self.refresh_catalog(cx),
+            ActionId::ServerActivity => self.open_activity(cx),
             ActionId::RefreshResult => self.refresh_result(cx),
             ActionId::OpenSql => self.open_sql_tab(cx),
             ActionId::CloseTab => self.close_active_tab(cx),

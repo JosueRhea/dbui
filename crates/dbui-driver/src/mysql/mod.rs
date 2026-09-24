@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
     ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
-    SortKey, Table, TableRef, TlsMode, TransactionState, Value,
+    ServerSession, SortKey, Table, TableRef, TlsMode, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
@@ -238,6 +238,44 @@ impl DatabaseDriver for MySqlDriver {
             .unwrap_or_default();
 
         Ok(Catalog { schemas, objects })
+    }
+
+    async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
+        let rows = sqlx::query(catalog::SESSIONS)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(catalog::SESSIONS, &error))?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let text = |column: &str| row.try_get::<String, _>(column).unwrap_or_default();
+                Some(ServerSession {
+                    id: row.try_get("id").ok()?,
+                    user: text("user_name"),
+                    database: text("database_name"),
+                    client: text("client"),
+                    state: text("state"),
+                    waiting_on: row.try_get("waiting_on").ok().flatten(),
+                    query: text("query"),
+                    running_for: row.try_get("running_for").ok().flatten(),
+                    is_self: row.try_get::<i64, _>("is_self").is_ok_and(|n| n != 0),
+                })
+            })
+            .collect())
+    }
+
+    async fn end_session(&self, id: i64, terminate: bool) -> Result<()> {
+        // An integer, so nothing to quote; `KILL` takes no bound parameter.
+        let sql = if terminate {
+            format!("KILL {id}")
+        } else {
+            format!("KILL QUERY {id}")
+        };
+        sqlx::query(AssertSqlSafe(sql.clone()))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|error| DriverError::query(&sql, &error))
     }
 
     async fn definition(&self, object: &DbObject) -> Result<String> {

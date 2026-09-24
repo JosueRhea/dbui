@@ -4254,6 +4254,81 @@ fn a_trigger_is_listed_and_opens_its_definition(cx: &mut TestAppContext) {
     });
 }
 
+/// A SQLite file has no server, so the activity panel says so rather than
+/// opening onto nothing.
+#[gpui::test]
+fn a_file_has_no_server_activity(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "activity-sqlite");
+    cx.simulate_keystrokes("cmd-alt-a");
+    view.update(cx, |view, _| {
+        assert!(view.activity.is_none());
+        assert!(
+            describe(&view.status).contains("no server"),
+            "{}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// The panel paints busy, idle, waiting and slow rows and a row asking to be
+/// confirmed; Escape takes back the question first, then the panel.
+#[gpui::test]
+fn the_activity_panel_draws_and_escape_backs_out(cx: &mut TestAppContext) {
+    use crate::components::activity::ActivityPanel;
+    use dbui_app::domain::ServerSession;
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+    let session = |id: i64, state: &str, query: &str, seconds: f64, is_self: bool| ServerSession {
+        id,
+        user: "app".into(),
+        database: "shop".into(),
+        client: "10.0.0.4 · api".into(),
+        state: state.into(),
+        waiting_on: (state == "active").then(|| "Lock: transactionid".to_string()),
+        query: query.into(),
+        running_for: Some(seconds),
+        is_self,
+    };
+    view.update(cx, |view, cx| {
+        view.activity = Some(ActivityPanel {
+            sessions: vec![
+                session(
+                    101,
+                    "active",
+                    "UPDATE orders\n SET status = 'x'",
+                    1_250.0,
+                    false,
+                ),
+                session(102, "idle in transaction", "SELECT 1", 30.0, false),
+                session(103, "idle", "COMMIT", 3.0, false),
+                session(104, "active", "SELECT * FROM pg_stat_activity", 0.01, true),
+            ],
+            loaded: true,
+            error: None,
+            show_idle: false,
+            confirming: Some((101, true)),
+            generation: 1,
+        });
+        let panel = view.activity.as_ref().unwrap();
+        assert_eq!(panel.visible().len(), 3, "the plain idle one is hidden");
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+    view.update(cx, |view, cx| {
+        view.toggle_activity_idle(cx);
+        assert_eq!(view.activity.as_ref().unwrap().visible().len(), 4);
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        let panel = view.activity.as_ref().expect("still open");
+        assert!(panel.confirming.is_none(), "the question went first");
+    });
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert!(view.activity.is_none()));
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

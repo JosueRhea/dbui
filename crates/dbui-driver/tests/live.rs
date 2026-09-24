@@ -341,6 +341,56 @@ both_engines!(
     }
 );
 
+both_engines!(
+    a_running_statement_is_listed_and_can_be_cancelled,
+    |fx: Fixture| async move {
+        // A second connection, so the statement being cancelled is not on the
+        // pool the listing and the cancel go out on.
+        let other = dbui_driver::connect(&config(fx.driver()))
+            .await
+            .expect("second connection");
+        let marker = format!("dbui_cancel_{}", fx.schema().len());
+        let sleep = match fx.driver() {
+            Driver::Postgres => format!("SELECT pg_sleep(30) AS {marker}"),
+            _ => format!("SELECT SLEEP(30) AS {marker}"),
+        };
+        let started = std::time::Instant::now();
+        let running = tokio::spawn({
+            let other = other.clone();
+            async move { other.execute(&sleep).await }
+        });
+
+        let mut found = None;
+        for _ in 0..100 {
+            let sessions = fx.server_sessions().await.expect("sessions");
+            assert!(
+                sessions.iter().any(|s| s.is_self),
+                "our own connection is marked"
+            );
+            if let Some(session) = sessions.iter().find(|s| s.query.contains(&marker)) {
+                found = Some(session.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let session = found.expect("the sleeping statement is listed");
+        assert!(!session.is_self);
+        assert!(!session.is_idle());
+
+        fx.end_session(session.id, false).await.expect("cancel");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+            .await
+            .expect("the statement stopped")
+            .expect("task");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        // Postgres raises on a cancelled statement; MySQL's SLEEP returns 1 early.
+        if fx.driver() == Driver::Postgres {
+            assert!(outcome.is_err(), "{outcome:?}");
+        }
+        other.close().await;
+    }
+);
+
 both_engines!(a_live_connection_answers, |fx: Fixture| async move {
     fx.ping().await.expect("ping");
     assert!(

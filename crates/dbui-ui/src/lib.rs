@@ -170,6 +170,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
         KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
         KeyBinding::new("cmd-alt-e", ExplainQuery, Some("DbUi")),
+        KeyBinding::new("cmd-alt-a", ServerActivity, Some("DbUi")),
         // ⌘. is the Mac's "stop" -- Terminal, Xcode and Finder copies all
         // answer to it.
         KeyBinding::new("cmd-.", StopQuery, Some("DbUi")),
@@ -209,6 +210,7 @@ fn menus() -> Vec<Menu> {
             name: "Connection".into(),
             items: vec![
                 MenuItem::action("New Connection", NewConnection),
+                MenuItem::action("Server Activity", ServerActivity),
                 MenuItem::separator(),
                 MenuItem::action("Next Connection", NextConnection),
                 MenuItem::action("Previous Connection", PrevConnection),
@@ -300,6 +302,7 @@ gpui::actions!(
         RunQuery,
         RunAllQueries,
         ExplainQuery,
+        ServerActivity,
         StopQuery,
         SaveQuery,
         OpenSavedQuery,

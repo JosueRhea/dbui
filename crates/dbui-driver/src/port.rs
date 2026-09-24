@@ -7,8 +7,8 @@
 use crate::error::{DriverError, Result};
 use async_trait::async_trait;
 use dbui_domain::{
-    Catalog, Column, DbObject, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef,
-    TransactionState, Value,
+    Catalog, Column, DbObject, Driver, Index, Page, QueryResult, ResultSet, ServerSession, SortKey,
+    TableRef, TransactionState, Value,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,24 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// The columns of one table, in declaration order.
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>>;
+
+    /// Every client connection to the server, for the activity panel.
+    async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
+        Err(DriverError::message(
+            "",
+            "This engine has no server to list connections on",
+        ))
+    }
+
+    /// Stop what session `id` is running (`terminate` false), or end the
+    /// session outright (`terminate` true).
+    async fn end_session(&self, id: i64, terminate: bool) -> Result<()> {
+        let _ = (id, terminate);
+        Err(DriverError::message(
+            "",
+            "This engine has no server sessions to end",
+        ))
+    }
 
     /// The statement that would create `object` as it stands: a function's
     /// `CREATE OR REPLACE FUNCTION`, a trigger's `CREATE TRIGGER`, and so on.

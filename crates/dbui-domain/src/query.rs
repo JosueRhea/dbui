@@ -583,3 +583,32 @@ mod sort_tests {
         assert!(order_for(None, &[]).is_empty());
     }
 }
+
+/// One connection to the server, as the activity panel lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerSession {
+    /// The engine's id for it: a Postgres backend pid, a MySQL thread id.
+    pub id: i64,
+    pub user: String,
+    pub database: String,
+    /// Where it connects from, and what it calls itself when it says.
+    pub client: String,
+    /// `active`, `idle in transaction`, `Query`, `Sleep`...
+    pub state: String,
+    /// What it is waiting on, when it is waiting.
+    pub waiting_on: Option<String>,
+    /// The statement it is running, or last ran.
+    pub query: String,
+    /// Seconds since that statement started.
+    pub running_for: Option<f64>,
+    /// This app's own connection -- the one reading the list.
+    pub is_self: bool,
+}
+
+impl ServerSession {
+    /// Whether it is doing nothing, and so safe to leave off a short list.
+    pub fn is_idle(&self) -> bool {
+        let state = self.state.to_ascii_lowercase();
+        state == "idle" || state == "sleep"
+    }
+}
