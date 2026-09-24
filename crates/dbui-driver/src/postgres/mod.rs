@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
     QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, TlsMode, Value,
+    TableRef, TlsMode, TransactionState, Value,
 };
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
 use std::time::{Duration, Instant};
@@ -274,7 +275,11 @@ impl DatabaseDriver for PostgresDriver {
         token: &QueryToken,
     ) -> Result<ResultSet> {
         let bound = sql_build::select_page_sql(Driver::Postgres, table, where_clause, order);
-        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
+        // Not kept as a prepared statement: `SELECT *` is shaped by the table,
+        // and after a column is added PostgreSQL refuses a cached plan whose
+        // result type changed -- every later page of the table failed -- and
+        // SQLite quietly returns nothing.
+        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone())).persistent(false);
         for value in &bound.binds {
             query = bind_value(query, value);
         }
@@ -402,53 +407,12 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        self.execute_tracked(sql, &QueryToken::new()).await
+        self.run_statement(sql, &QueryToken::new(), false).await
     }
 
     async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
-        // On a connection of its own, held for the whole statement, so the
-        // session noted in `token` is the session the statement runs on.
-        let mut lease = self.lease(sql).await?;
-        let tracking = token.track(lease.session());
-
-        let started = Instant::now();
-
-        enum Ran {
-            Rows(Vec<sqlx::postgres::PgRow>),
-            Affected(u64),
-        }
-        let ran = if query::returns_rows(sql) {
-            sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(lease.conn())
-                .await
-                .map(Ran::Rows)
-        } else {
-            sqlx::query(AssertSqlSafe(sql.to_string()))
-                .execute(lease.conn())
-                .await
-                .map(|done| Ran::Affected(done.rows_affected()))
-        };
-        drop(tracking);
-        lease.settle(&ran);
-
-        let outcome = match ran.map_err(|error| DriverError::query(sql, &error))? {
-            Ran::Rows(rows) => {
-                // A hand-written query is shown as-is: the user asked for these
-                // rows, so no probe row is added and nothing is marked truncated.
-                let mut set = build_result_set(rows, usize::MAX);
-                self.backfill_columns(&mut set, sql).await;
-                QueryOutcome::Rows(set)
-            }
-            Ran::Affected(count) => QueryOutcome::Affected(count),
-        };
-
-        Ok(QueryResult {
-            statement: sql.to_string(),
-            outcome,
-            stats: QueryStats {
-                elapsed: started.elapsed(),
-            },
-        })
+        // The editor's statements, which share one session across runs.
+        self.run_statement(sql, token, true).await
     }
 
     async fn cancel(&self, token: &QueryToken) -> Result<bool> {
@@ -463,9 +427,106 @@ impl DatabaseDriver for PostgresDriver {
         Ok(true)
     }
 
+    fn editor_transaction(&self) -> TransactionState {
+        self.sessions.console_transaction()
+    }
+
     async fn close(&self) {
         self.sessions.close().await;
         self.pool.close().await;
+    }
+}
+
+impl PostgresDriver {
+    /// One statement as typed, on the console connection when `console` --
+    /// see `sessions` -- or on any kept one otherwise. Either way on a
+    /// connection held for the whole statement, so the session noted in
+    /// `token` is the session the statement runs on.
+    async fn run_statement(
+        &self,
+        sql: &str,
+        token: &QueryToken,
+        console: bool,
+    ) -> Result<QueryResult> {
+        let mut lease = if console {
+            self.sessions
+                .acquire_console(&self.pool)
+                .await
+                .map_err(|error| error.for_statement(sql))?
+        } else {
+            self.sessions
+                .acquire(&self.pool)
+                .await
+                .map_err(|error| DriverError::query(sql, &error))?
+        };
+        let tracking = token.track(lease.session());
+        let was_open = console && self.sessions.console_transaction() != TransactionState::Idle;
+
+        let started = Instant::now();
+
+        enum Ran {
+            Rows(Vec<sqlx::postgres::PgRow>),
+            Affected(u64),
+        }
+        // Never kept as a prepared statement (`persistent(false)`): run again
+        // after an ALTER TABLE -- here, or from any other session -- a cached
+        // plan still has the old columns, which PostgreSQL refuses and SQLite
+        // answers with no rows at all.
+        let ran = if query::returns_rows(sql) {
+            // One row past the cap says whether there were more. The rest are
+            // never decoded or kept, and `cut_short` stops the server sending
+            // them.
+            sqlx::query(AssertSqlSafe(sql.to_string()))
+                .persistent(false)
+                .fetch(lease.conn())
+                .take(ResultSet::QUERY_ROW_CAP + 1)
+                .try_collect()
+                .await
+                .map(Ran::Rows)
+        } else {
+            sqlx::query(AssertSqlSafe(sql.to_string()))
+                .persistent(false)
+                .execute(lease.conn())
+                .await
+                .map(|done| Ran::Affected(done.rows_affected()))
+        };
+        drop(tracking);
+
+        let cut_short =
+            matches!(&ran, Ok(Ran::Rows(rows)) if rows.len() > ResultSet::QUERY_ROW_CAP);
+        let ready = !cut_short || lease.cut_short(&self.pool).await;
+        if ready && crate::sessions::survives(&ran) {
+            lease.note_transaction(sql).await;
+        }
+        if ready {
+            lease.settle(&ran);
+        } else {
+            drop(lease);
+        }
+        // The connection died under a statement inside a transaction: say
+        // that, rather than the bare I/O error, and say it now.
+        if was_open && self.sessions.take_lost() {
+            return Err(DriverError::TransactionLost {
+                statement: sql.to_string(),
+            });
+        }
+
+        let outcome = match ran.map_err(|error| DriverError::query(sql, &error))? {
+            Ran::Rows(rows) => {
+                let mut set = build_result_set(rows, ResultSet::QUERY_ROW_CAP);
+                self.backfill_columns(&mut set, sql).await;
+                QueryOutcome::Rows(set)
+            }
+            Ran::Affected(count) => QueryOutcome::Affected(count),
+        };
+
+        Ok(QueryResult {
+            statement: sql.to_string(),
+            outcome,
+            stats: QueryStats {
+                elapsed: started.elapsed(),
+            },
+        })
     }
 }
 
@@ -545,4 +606,43 @@ impl SessionId for sqlx::Postgres {
             Ok(session as u64)
         })
     }
+    fn transaction_state(
+        conn: &mut Self::Connection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransactionState> + Send + '_>> {
+        Box::pin(async move {
+            // Outside a transaction block every statement is its own
+            // transaction, begun when it arrived, so the two clocks agree.
+            // Inside one, `now()` stopped at the `BEGIN`. Sent as one simple
+            // query so there is exactly one arrival to compare against: the
+            // extended protocol's separate Parse and Execute can tick apart.
+            let asked = sqlx::raw_sql("SELECT now() <> statement_timestamp()")
+                .fetch_one(conn)
+                .await;
+            match asked {
+                Ok(row) => match row.try_get::<bool, _>(0) {
+                    Ok(true) => TransactionState::Open,
+                    _ => TransactionState::Idle,
+                },
+                // "current transaction is aborted": the one error that answers.
+                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("25P02") => {
+                    TransactionState::Failed
+                }
+                Err(_) => TransactionState::Idle,
+            }
+        })
+    }
+
+    fn stop_session(
+        pool: &sqlx::Pool<Self>,
+        session: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(session as i32)
+                .execute(pool)
+                .await;
+        })
+    }
+
+    const STOP_KEEPS_TRANSACTION: bool = false;
 }

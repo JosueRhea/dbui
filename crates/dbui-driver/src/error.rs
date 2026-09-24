@@ -34,6 +34,16 @@ pub enum DriverError {
     /// The connection's query timeout ran out first.
     #[error("Stopped after {seconds} s, this connection's query timeout")]
     TimedOut { statement: String, seconds: u64 },
+
+    /// The editor's connection went away with a transaction open, which the
+    /// server rolls back. Reported rather than papered over with a fresh
+    /// connection: an `UPDATE` then `COMMIT` sent there would each commit on
+    /// their own, outside the transaction the user thinks they are in.
+    #[error(
+        "The connection was lost with a transaction open, and the server rolled it back. \
+         Nothing from this run was sent; run it again to start over."
+    )]
+    TransactionLost { statement: String },
 }
 
 impl DriverError {
@@ -72,6 +82,7 @@ impl DriverError {
         match self {
             DriverError::Query { statement, .. }
             | DriverError::Cancelled { statement }
+            | DriverError::TransactionLost { statement }
             | DriverError::TimedOut { statement, .. } => Some(statement),
             _ => None,
         }

@@ -465,6 +465,10 @@ pub struct DbUi {
     pub(crate) editor_drag: Option<(Pixels, Pixels)>,
     /// Open SQL autocomplete popup, if any.
     pub(crate) completion: Option<CompletionPopup>,
+    /// Whether the popup opened by itself as the user typed, rather than on
+    /// ⌃Space. An automatic one keeps out of the way: it closes when nothing
+    /// is left worth offering, where one asked for shows what there is.
+    pub(crate) completion_auto: bool,
     /// Cached `driver.columns` results keyed by `(schema, table)`.
     pub(crate) column_cache: HashMap<(String, String), Vec<Column>>,
     /// Substring filter over the schema tree. Empty means show everything.
@@ -721,6 +725,7 @@ impl DbUi {
             editor_height: px(EDITOR_HEIGHT_DEFAULT),
             editor_drag: None,
             completion: None,
+            completion_auto: false,
             column_cache: HashMap::new(),
             sidebar_filter: crate::text_input::TextInput::new(false),
             row_drag: None,
@@ -2351,10 +2356,25 @@ impl DbUi {
     }
 
     pub(crate) fn run_query(&mut self, cx: &mut Context<Self>) {
-        let Some(sql) = self.resolve_run_sql() else {
+        let Some(statements) = self.resolve_run_sql() else {
             return;
         };
-        self.dispatch_statements(vec![sql], cx);
+        self.dispatch_statements(statements, cx);
+    }
+
+    /// Whether the editor's session has a transaction open, as of its last
+    /// statement. Read off the driver, which asked the server.
+    pub(crate) fn editor_transaction(&self) -> dbui_app::domain::TransactionState {
+        self.workspace
+            .active_driver()
+            .map(|driver| driver.editor_transaction())
+            .unwrap_or_default()
+    }
+
+    /// The transaction bar's buttons: end the editor's transaction with
+    /// `statement` (`COMMIT` or `ROLLBACK`), as if it had been typed.
+    pub(crate) fn end_editor_transaction(&mut self, statement: &str, cx: &mut Context<Self>) {
+        self.dispatch_statements(vec![statement.to_string()], cx);
     }
 
     pub(crate) fn run_all_queries(&mut self, cx: &mut Context<Self>) {
@@ -2483,8 +2503,44 @@ impl DbUi {
         cx.notify();
     }
 
-    /// Open or refresh the SQL autocomplete popup at the caret.
+    /// ⌃Space: open the SQL autocomplete popup at the caret with everything
+    /// that matches, even when the word is already complete.
     pub(crate) fn trigger_completion(&mut self, cx: &mut Context<Self>) {
+        self.completion_auto = false;
+        self.refresh_completion(cx);
+    }
+
+    /// The fewest characters of a bare word before the popup opens by
+    /// itself. One would put a list over every `a` in `WHERE x = a`.
+    const AUTO_COMPLETE_MIN: usize = 2;
+
+    /// Open the popup as the user types, when there is something worth
+    /// offering: after a `.`, or a word of [`Self::AUTO_COMPLETE_MIN`]
+    /// characters that is not a number and not inside a string or comment.
+    pub(crate) fn auto_complete(&mut self, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+            return;
+        };
+        let caret = editor.cursor();
+        let in_text = caret > 0
+            && crate::sql_format::highlight_spans(editor.text(), self.sql_dialect())
+                .iter()
+                .any(|(start, end, style)| {
+                    matches!(
+                        style,
+                        crate::sql_format::SqlStyle::String | crate::sql_format::SqlStyle::Comment
+                    ) && *start < caret
+                        && caret <= *end
+                });
+        if in_text {
+            return;
+        }
+        self.completion_auto = true;
+        self.refresh_completion(cx);
+    }
+
+    /// Rebuild the popup at the caret, in whichever mode it is in.
+    pub(crate) fn refresh_completion(&mut self, cx: &mut Context<Self>) {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
             return;
         };
@@ -2510,8 +2566,25 @@ impl DbUi {
             .workspace
             .active()
             .and_then(|entry| entry.catalog.as_ref());
-        self.completion =
+        let mut popup =
             crate::sql_complete::build_popup(&request, catalog, &self.column_cache, &sql, caret);
+        if self.completion_auto {
+            let worth_it = request.qualifier.is_some()
+                || request.prefix.chars().count() >= Self::AUTO_COMPLETE_MIN
+                    && !request.prefix.starts_with(|c: char| c.is_ascii_digit());
+            // A word typed out in full is not offered back: Enter after
+            // `FROM users` is a new line, not a request to write `users` again.
+            if let Some(popup) = popup.as_mut() {
+                popup
+                    .items
+                    .retain(|item| !item.label.eq_ignore_ascii_case(&request.prefix));
+                popup.selected = 0;
+            }
+            if !worth_it || popup.as_ref().is_some_and(|popup| popup.items.is_empty()) {
+                popup = None;
+            }
+        }
+        self.completion = popup;
         cx.notify();
     }
 
@@ -2528,7 +2601,7 @@ impl DbUi {
                         .insert((table.schema.clone(), table.name.clone()), columns);
                     // Rebuild the popup now that columns are available.
                     if this.focus == Focus::Editor {
-                        this.trigger_completion(cx);
+                        this.refresh_completion(cx);
                     } else {
                         cx.notify();
                     }
@@ -2560,25 +2633,43 @@ impl DbUi {
         }
     }
 
-    /// ⌘↵ target: selection if present, else the statement under the caret.
-    pub(crate) fn resolve_run_sql(&self) -> Option<String> {
+    /// The engine the editor's SQL is for, which decides how its strings
+    /// read. Not connected, the standard reading.
+    pub(crate) fn sql_dialect(&self) -> dbui_app::domain::Driver {
+        self.workspace
+            .active()
+            .map_or(dbui_app::domain::Driver::Postgres, |entry| {
+                entry.config.driver
+            })
+    }
+
+    /// ⌘↵ target: the statements in the selection if there is one, else the
+    /// statement under the caret.
+    ///
+    /// A selection is split like Run All would split it. Sent whole, several
+    /// statements went to the server as one prepared statement, which
+    /// PostgreSQL refuses outright ("cannot insert multiple commands into a
+    /// prepared statement").
+    pub(crate) fn resolve_run_sql(&self) -> Option<Vec<String>> {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
             return None;
         };
+        let dialect = self.sql_dialect();
         if let Some(selected) = editor.selected_text() {
-            let trimmed = selected.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            return Some(trimmed.to_string());
+            let statements: Vec<String> = dbui_app::domain::split_statements_for(dialect, selected)
+                .into_iter()
+                .map(|range| selected[range].trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return (!statements.is_empty()).then_some(statements);
         }
         let text = editor.text();
-        let range = dbui_app::domain::statement_at(text, editor.cursor())?;
+        let range = dbui_app::domain::statement_at_for(dialect, text, editor.cursor())?;
         let stmt = text[range].trim();
         if stmt.is_empty() {
             None
         } else {
-            Some(stmt.to_string())
+            Some(vec![stmt.to_string()])
         }
     }
 
@@ -2618,11 +2709,12 @@ impl DbUi {
         } else {
             editor.text()
         };
-        let statements: Vec<String> = dbui_app::domain::split_statements(scope)
-            .into_iter()
-            .map(|range| scope[range].trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let statements: Vec<String> =
+            dbui_app::domain::split_statements_for(self.sql_dialect(), scope)
+                .into_iter()
+                .map(|range| scope[range].trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         if statements.is_empty() {
             None
         } else {
@@ -2672,6 +2764,15 @@ impl DbUi {
     fn dispatch_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
         if statements.is_empty() {
             return;
+        }
+        // The server refuses writes on a read-only connection too, but only
+        // through a session setting the editor could switch off. Nothing in
+        // the batch runs if any of it would write.
+        if let Some(write) = statements.iter().find(|sql| dbui_app::domain::writes(sql)) {
+            let verb = dbui_app::domain::statement::describe(write).verb;
+            if self.refuse_if_read_only(&verb, cx) {
+                return;
+            }
         }
         self.record_history(&statements);
 
@@ -6202,7 +6303,9 @@ impl DbUi {
                 }
             }
 
-            if key == " " && keystroke.modifiers.control {
+            // GPUI names the key "space" on every platform; the literal is
+            // what a synthesized keystroke may carry.
+            if (key == "space" || key == " ") && keystroke.modifiers.control {
                 self.trigger_completion(cx);
                 return;
             }
@@ -6241,16 +6344,25 @@ impl DbUi {
                     // Typing past the right edge pans the editor instead of
                     // writing where the user cannot see.
                     editor.ensure_editor_caret_visible();
-                    let should_refresh = self.completion.is_some()
-                        && !command
-                        && (key.len() == 1 || key == "backspace" || key == "delete");
-                    if should_refresh {
-                        self.trigger_completion(cx);
-                    } else if self.completion.is_some()
-                        && (key.len() == 1 || key == "backspace" || key == "delete")
-                    {
-                        // Unreachable when should_refresh is true; kept for clarity.
+                    // A space ends the word being completed, so the popup
+                    // goes with it rather than going stale; anything else
+                    // that edits the word re-filters it.
+                    let edits_word = key.len() == 1 || key == "backspace" || key == "delete";
+                    // A name character or a `.` opens it by itself; deleting
+                    // does not, the way no editor pops a list on backspace.
+                    let types_name = !command
+                        && !keystroke.modifiers.control
+                        && keystroke.key_char.as_deref().is_some_and(|typed| {
+                            typed
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                        });
+                    if self.completion.is_some() && !command && key == "space" {
                         self.dismiss_completion(cx);
+                    } else if self.completion.is_some() && !command && edits_word {
+                        self.refresh_completion(cx);
+                    } else if self.completion.is_none() && types_name {
+                        self.auto_complete(cx);
                     } else {
                         cx.notify();
                     }

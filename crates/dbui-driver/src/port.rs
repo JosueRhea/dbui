@@ -7,7 +7,8 @@
 use crate::error::Result;
 use async_trait::async_trait;
 use dbui_domain::{
-    Catalog, Column, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef, Value,
+    Catalog, Column, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef,
+    TransactionState, Value,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -143,6 +144,12 @@ pub trait DatabaseDriver: Send + Sync {
     async fn cancel(&self, token: &QueryToken) -> Result<bool> {
         let _ = token;
         Ok(false)
+    }
+
+    /// Whether the SQL editor's session has a transaction open, as of its
+    /// last statement. The default is for an engine that cannot tell.
+    fn editor_transaction(&self) -> TransactionState {
+        TransactionState::Idle
     }
 
     /// Close the pool. Idempotent.

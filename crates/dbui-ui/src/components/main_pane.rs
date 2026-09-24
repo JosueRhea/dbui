@@ -618,10 +618,42 @@ impl DbUi {
         let hit_slot = editor.hit_bounds_slot();
         let scroll_handle = editor.scroll_handle().clone();
         let completion_scroll = self.completion_scroll.clone();
-        let sql_spans = sql_format::highlight_spans(editor.text());
+        let sql_spans = sql_format::highlight_spans(editor.text(), self.sql_dialect());
         let lines_owned: Vec<String> = layout.lines.iter().map(|l| (*l).to_string()).collect();
         let theme = &self.theme;
         let line_h = metrics::editor_line_height();
+        // Where the popup goes: under the caret, or over it when the pane has
+        // more room above. Measured from the editor body's padding edge, with
+        // the scroll taken off, since the popup does not scroll with the text.
+        let anchor = {
+            let offset = scroll_handle.offset();
+            let viewport_h = scroll_handle.bounds().size.height;
+            let column = lines_owned.get(caret_line).map_or(0, |line| {
+                line[..layout.caret_column.min(line.len())].chars().count()
+            });
+            let left = px(12. * metrics::zoom())
+                + text_input::editor_gutter()
+                + px(column as f32 * text_input::char_width())
+                + offset.x;
+            // Kept inside the pane at the right edge, where it would be clipped.
+            let widest_left = scroll_handle.bounds().size.width - px(220.);
+            let left = left.min(widest_left).max(px(0.));
+            let top = line_h * caret_line as f32 + offset.y;
+            let below = viewport_h - (top + line_h);
+            if below >= px(120.) || below >= top {
+                CompletionAnchor::Below {
+                    left,
+                    top: top + line_h,
+                    room: below,
+                }
+            } else {
+                CompletionAnchor::Above {
+                    left,
+                    bottom: viewport_h - top,
+                    room: top,
+                }
+            }
+        };
         // The same box the caret-follow pans over, so the two agree on where
         // the text ends.
         let content_w = text_input::editor_content_size(editor.text()).width;
@@ -700,7 +732,14 @@ impl DbUi {
                     .px_3()
                     .pt_2()
                     .pb_1()
-                    .child(caption("SQL", theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(caption("SQL", theme))
+                            .children(transaction_bar(self.editor_transaction(), theme, cx)),
+                    )
                     .child(
                         div()
                             .flex()
@@ -861,7 +900,7 @@ impl DbUi {
                             )),
                     )
                     .children(completion.map(|popup| {
-                        render_completion_popup(&popup, &completion_scroll, theme, cx)
+                        render_completion_popup(&popup, anchor, &completion_scroll, theme, cx)
                     })),
             )
             .child(editor_resize_handle(dragging, theme, cx))
@@ -903,8 +942,67 @@ fn editor_resize_handle(
         .into_any_element()
 }
 
+/// What says a transaction is open in the editor's session, with the two
+/// ways out of it. Nothing when there is none.
+///
+/// A `BEGIN` typed and forgotten holds its locks and its uncommitted changes
+/// for as long as the app stays open, and nothing else on screen shows it.
+fn transaction_bar(
+    state: dbui_app::domain::TransactionState,
+    theme: &crate::theme::Theme,
+    cx: &mut Context<DbUi>,
+) -> Option<AnyElement> {
+    use dbui_app::domain::TransactionState;
+    let (label, color) = match state {
+        TransactionState::Idle => return None,
+        TransactionState::Open => ("Transaction open", theme.warning),
+        // PostgreSQL takes nothing but ROLLBACK from here.
+        TransactionState::Failed => ("Transaction failed — roll back to go on", theme.danger),
+    };
+    Some(
+        div()
+            .id("transaction-bar")
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(metrics::text_size_small())
+            .child(super::dot(color))
+            .child(div().text_color(color).child(label))
+            .when(state == TransactionState::Open, |bar| {
+                bar.child(
+                    button("transaction-commit", "Commit", theme, false).on_click(cx.listener(
+                        |this, _, _window, cx| this.end_editor_transaction("COMMIT", cx),
+                    )),
+                )
+            })
+            .child(
+                button("transaction-rollback", "Roll back", theme, false).on_click(
+                    cx.listener(|this, _, _window, cx| this.end_editor_transaction("ROLLBACK", cx)),
+                ),
+            )
+            .into_any_element(),
+    )
+}
+
+/// Where the completion popup sits in the editor body, and how tall it may
+/// grow before it would leave the pane.
+#[derive(Clone, Copy)]
+enum CompletionAnchor {
+    Below {
+        left: gpui::Pixels,
+        top: gpui::Pixels,
+        room: gpui::Pixels,
+    },
+    Above {
+        left: gpui::Pixels,
+        bottom: gpui::Pixels,
+        room: gpui::Pixels,
+    },
+}
+
 fn render_completion_popup(
     popup: &crate::sql_complete::CompletionPopup,
+    anchor: CompletionAnchor,
     scroll: &gpui::ScrollHandle,
     theme: &crate::theme::Theme,
     cx: &mut Context<DbUi>,
@@ -923,7 +1021,10 @@ fn render_completion_popup(
                 .flex()
                 .items_center()
                 .justify_between()
-                .px_2()
+                .gap_3()
+                // Clear of the scrollbar laid over the right edge.
+                .pl_2()
+                .pr_4()
                 .py_0p5()
                 .when(selected, |row| row.bg(theme.selection))
                 .hover(|row| row.bg(theme.hover))
@@ -950,10 +1051,17 @@ fn render_completion_popup(
     div()
         .id("sql-completion")
         .absolute()
-        .left(px(40.))
-        .bottom(px(4.))
+        .map(|popup| match anchor {
+            CompletionAnchor::Below { left, top, room } => popup
+                .left(left)
+                .top(top)
+                .max_h(room.min(px(180.)).max(px(60.))),
+            CompletionAnchor::Above { left, bottom, room } => popup
+                .left(left)
+                .bottom(bottom)
+                .max_h(room.min(px(180.)).max(px(60.))),
+        })
         .min_w(px(220.))
-        .max_h(px(180.))
         .flex()
         .flex_col()
         .overflow_hidden()

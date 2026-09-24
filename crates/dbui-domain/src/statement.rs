@@ -125,6 +125,129 @@ pub fn describe(sql: &str) -> StatementInfo {
     }
 }
 
+/// Verbs that only read, or only steer the session in ways a read-only
+/// connection keeps safe. Anything else is taken to write.
+const READ_VERBS: [&str; 19] = [
+    "SELECT",
+    "SHOW",
+    "EXPLAIN",
+    "DESCRIBE",
+    "DESC",
+    "VALUES",
+    "TABLE",
+    "WITH",
+    "PRAGMA",
+    "BEGIN",
+    "START",
+    "COMMIT",
+    "ROLLBACK",
+    "END",
+    "ABORT",
+    "SAVEPOINT",
+    "RELEASE",
+    "SET",
+    "USE",
+];
+
+/// Words that write wherever they stand: a CTE feeding a `DELETE`, an
+/// `EXPLAIN ANALYZE` that runs the `UPDATE` it explains.
+const WRITE_WORDS: [&str; 4] = ["INSERT", "UPDATE", "DELETE", "MERGE"];
+
+/// Whether `sql` may write, or may lift the read-only setting that stops it
+/// writing -- the question a connection marked read only asks before it
+/// sends anything.
+///
+/// The server enforces read only too, but only through a session setting,
+/// and a session setting is one statement away from being switched off:
+/// `SET default_transaction_read_only = off`, `BEGIN READ WRITE`,
+/// `SELECT set_config(...)`, `RESET ALL`. So this errs towards "writes": a
+/// statement it cannot place is refused, and so is anything that names the
+/// setting or asks for a writable transaction. `SELECT ... FOR UPDATE` is
+/// refused as well, which the server would do anyway.
+pub fn writes(sql: &str) -> bool {
+    // Read both ways a backslash can be taken, so a string this misreads
+    // cannot hide a word from the check: `'C:\' , ...` means different
+    // things to MySQL and to PostgreSQL.
+    writes_in(&bare_words(sql, false)) || writes_in(&bare_words(sql, true))
+}
+
+fn writes_in(words: &[String]) -> bool {
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if !READ_VERBS.contains(&first.as_str()) {
+        return true;
+    }
+    let lifts_read_only = words
+        .windows(2)
+        .any(|pair| pair[0] == "READ" && pair[1] == "WRITE")
+        || words
+            .iter()
+            .any(|word| word.contains("READ_ONLY") || word == "SET_CONFIG");
+    lifts_read_only
+        || words
+            .iter()
+            .any(|word| WRITE_WORDS.contains(&word.as_str()))
+}
+
+/// Verbs after which the session may have opened or closed a transaction.
+/// `SET` for `autocommit`; `CALL` and `DO` because a procedure may commit.
+const TRANSACTION_VERBS: [&str; 13] = [
+    "BEGIN",
+    "START",
+    "COMMIT",
+    "ROLLBACK",
+    "END",
+    "ABORT",
+    "SAVEPOINT",
+    "RELEASE",
+    "SET",
+    "XA",
+    "LOCK",
+    "CALL",
+    "DO",
+];
+
+/// Whether running `sql` may have changed whether a transaction is open, so
+/// the session is worth asking afterwards. Anything else leaves an
+/// autocommit session in autocommit, and asking after every `SELECT` would
+/// be a second round trip for each one.
+pub fn may_change_transaction(sql: &str) -> bool {
+    bare_words(sql, false)
+        .first()
+        .is_some_and(|verb| TRANSACTION_VERBS.contains(&verb.as_str()))
+}
+
+/// Every unquoted word of `sql`, upper-cased, in order. Strings, quoted
+/// names, dollar-quoted bodies and comments are skipped whole, so a column
+/// called `"update"` or a string reading `'delete me'` is not a verb.
+fn bare_words(sql: &str, backslash: bool) -> Vec<String> {
+    use crate::sql_split::{
+        is_ident_cont, skip_block_comment, skip_dollar_quoted, skip_line_comment, skip_quoted,
+    };
+
+    let bytes = sql.as_bytes();
+    let mut words = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => i = skip_quoted(bytes, i, quote, backslash),
+            b'$' => i = skip_dollar_quoted(bytes, i).unwrap_or(i + 1),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => i = skip_line_comment(bytes, i),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => i = skip_block_comment(bytes, i),
+            b if is_ident_cont(b) => {
+                let start = i;
+                while i < bytes.len() && is_ident_cont(bytes[i]) {
+                    i += 1;
+                }
+                words.push(sql[start..i].to_ascii_uppercase());
+            }
+            _ => i += 1,
+        }
+    }
+    words
+}
+
 /// The first `limit` words of `sql`, with comments skipped and quoting
 /// stripped. A dotted name comes back whole: `public.orders`.
 fn lead_words(sql: &str, limit: usize) -> Vec<String> {
@@ -206,6 +329,91 @@ mod tests {
 
     fn info(sql: &str) -> StatementInfo {
         describe(sql)
+    }
+
+    #[test]
+    fn reads_are_not_writes() {
+        for sql in [
+            "select * from users",
+            "  -- a note\nSELECT 1",
+            "(select 1) union (select 2)",
+            "with t as (select 1) select * from t",
+            "explain select * from users",
+            "show tables",
+            "values (1), (2)",
+            "select * from users where name = 'delete me'",
+            "select \"update\" from t",
+            "select replace(name, 'a', 'b') from users",
+            "begin",
+            "start transaction read only",
+            "commit",
+            "rollback",
+            "set search_path = app",
+            "pragma table_info(users)",
+            "",
+            "  -- only a comment",
+        ] {
+            assert!(!writes(sql), "{sql:?} reads");
+        }
+    }
+
+    #[test]
+    fn writes_and_anything_unknown_are_writes() {
+        for sql in [
+            "insert into t values (1)",
+            "UPDATE t SET a = 1",
+            "delete from t",
+            "truncate t",
+            "create table t (id int)",
+            "drop table t",
+            "call do_things()",
+            "do $$ begin perform 1; end $$",
+            "with gone as (delete from t returning *) select * from gone",
+            "explain analyze update t set a = 1",
+            "select * from t for update",
+            "vacuum",
+            "grant select on t to bob",
+        ] {
+            assert!(writes(sql), "{sql:?} writes");
+        }
+    }
+
+    #[test]
+    fn transaction_verbs_are_worth_asking_about() {
+        for sql in [
+            "BEGIN",
+            "start transaction",
+            "commit",
+            "ROLLBACK",
+            "set autocommit = 0",
+            "call p()",
+        ] {
+            assert!(may_change_transaction(sql), "{sql:?}");
+        }
+        for sql in ["select 1", "update t set a = 1", "", "-- begin"] {
+            assert!(!may_change_transaction(sql), "{sql:?}");
+        }
+    }
+
+    /// The server's read-only mode is a session setting; none of these may
+    /// reach it from a connection marked read only.
+    #[test]
+    fn lifting_read_only_counts_as_writing() {
+        for sql in [
+            "SET default_transaction_read_only = off",
+            "set session characteristics as transaction read write",
+            "begin read write",
+            "START TRANSACTION READ WRITE",
+            "SET SESSION transaction_read_only = 0",
+            "set global read_only = 0",
+            "select set_config('default_transaction_read_only', 'off', false)",
+            "select pg_catalog.set_config('x', 'y', false)",
+            "reset all",
+            "reset default_transaction_read_only",
+            "discard all",
+        ] {
+            assert!(writes(sql), "{sql:?} lifts read only");
+        }
     }
 
     #[test]

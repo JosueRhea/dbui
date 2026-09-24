@@ -5,29 +5,103 @@
 //! "everything selected". Both need the same split: on `;` outside quotes and
 //! comments. The splitter is pure so the UI and any future CLI share it.
 
+use crate::connection::Driver;
 use std::ops::Range;
 
-/// Byte ranges of non-empty statements in `sql`, in order.
+/// Byte ranges of non-empty statements in `sql`, in order, read the way
+/// standard SQL reads strings: a backslash is an ordinary character except in
+/// a PostgreSQL `E'...'` string. [`split_statements_for`] reads them the way
+/// one engine does, and is what anything about to run the statements wants.
 ///
 /// Ranges cover the statement text itself (trimmed of surrounding whitespace)
 /// and do **not** include the terminating `;`. Empty segments between
 /// consecutive semicolons are dropped.
 pub fn split_statements(sql: &str) -> Vec<Range<usize>> {
+    split(sql, false)
+}
+
+/// [`split_statements`], as `driver` reads strings: MySQL takes a backslash
+/// as an escape in every string, so `'it\'s; fine'` is one literal there and
+/// two fragments anywhere else.
+pub fn split_statements_for(driver: Driver, sql: &str) -> Vec<Range<usize>> {
+    split(sql, backslash_escapes(driver))
+}
+
+fn backslash_escapes(driver: Driver) -> bool {
+    matches!(driver, Driver::MySql)
+}
+
+/// The scan behind both. Besides quotes and comments it knows two things a
+/// `;` can sit inside without ending anything:
+///
+/// - **Routine bodies.** `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` and `EVENT`
+///   can hold a `BEGIN ... END` block of statements -- MySQL and SQLite write
+///   them that way, and PostgreSQL's `BEGIN ATOMIC` does too. Inside one of
+///   those, `BEGIN` and `CASE` open a block and `END` closes it, and a `;`
+///   ends the statement only once every block is closed. `END IF`, `END LOOP`,
+///   `END WHILE` and `END REPEAT` close blocks that never counted as opened.
+/// - **`DELIMITER`.** The MySQL client's directive, which every dump with a
+///   routine in it uses: a line reading `DELIMITER $$` makes `$$` the
+///   terminator until the next such line. The directive is the client's, not
+///   the server's, so it is left out of every range.
+fn split(sql: &str, backslash: bool) -> Vec<Range<usize>> {
     let bytes = sql.as_bytes();
     let mut ranges = Vec::new();
     let mut stmt_start = 0usize;
     let mut i = 0usize;
+    let mut delimiter: &[u8] = b";";
+    // The statement's first few words, upper-cased, to spot a routine.
+    let mut lead: Vec<String> = Vec::new();
+    let mut routine = false;
+    let mut depth = 0usize;
+    // Nothing but whitespace since `stmt_start`.
+    let mut blank = true;
 
     while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // A `DELIMITER` directive stands where a statement would start.
+        if blank {
+            if let Some((next, end)) = delimiter_directive(sql, i) {
+                delimiter = &bytes[next];
+                i = end;
+                stmt_start = end;
+                continue;
+            }
+        }
+        blank = false;
+
+        let ends_here = if delimiter == b";" {
+            bytes[i] == b';' && depth == 0
+        } else {
+            bytes[i..].starts_with(delimiter)
+        };
+        if ends_here {
+            if let Some(range) = trim_range(sql, stmt_start..i) {
+                ranges.push(range);
+            }
+            i += delimiter.len();
+            stmt_start = i;
+            lead.clear();
+            routine = false;
+            depth = 0;
+            blank = true;
+            continue;
+        }
+
         match bytes[i] {
             b'\'' => {
-                i = skip_quoted(bytes, i, b'\'');
+                // `E'...'` escapes with a backslash in PostgreSQL whatever the
+                // engine does with its other strings.
+                let e_string = i > 0
+                    && matches!(bytes[i - 1], b'e' | b'E')
+                    && (i < 2 || !is_ident_cont(bytes[i - 2]));
+                i = skip_quoted(bytes, i, b'\'', backslash || e_string);
             }
-            b'"' => {
-                i = skip_quoted(bytes, i, b'"');
-            }
-            b'`' => {
-                i = skip_quoted(bytes, i, b'`');
+            quote @ (b'"' | b'`') => {
+                i = skip_quoted(bytes, i, quote, backslash);
             }
             // Behind the string arms on purpose: a `$$` inside `'...'` is text
             // the engine never reads as a delimiter, and treating it as one
@@ -41,12 +115,47 @@ pub fn split_statements(sql: &str) -> Vec<Range<usize>> {
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 i = skip_block_comment(bytes, i);
             }
-            b';' => {
-                if let Some(range) = trim_range(sql, stmt_start..i) {
-                    ranges.push(range);
+            b if is_ident_cont(b) && (i == 0 || !is_ident_cont(bytes[i - 1])) => {
+                let word_start = i;
+                // `$` continues a word, so `END$$` would swallow a `$$`
+                // terminator whole without the second check.
+                while i < bytes.len()
+                    && is_ident_cont(bytes[i])
+                    && (delimiter == b";" || !bytes[i..].starts_with(delimiter))
+                {
+                    i += 1;
                 }
-                i += 1;
-                stmt_start = i;
+                let word = sql[word_start..i].to_ascii_uppercase();
+                if lead.len() < 8 {
+                    lead.push(word.clone());
+                    routine = routine || opens_routine(&lead);
+                }
+                if routine {
+                    match word.as_str() {
+                        "BEGIN" | "CASE" => depth += 1,
+                        "END" if depth > 0 => {
+                            // `END IF` and friends close a block never counted
+                            // as opened; `END CASE` closes one that was. The
+                            // word after `END` is taken with it either way, or
+                            // that `CASE` would read as a new one opening.
+                            match next_word(sql, i) {
+                                Some((closer, after))
+                                    if matches!(
+                                        closer.as_str(),
+                                        "IF" | "LOOP" | "WHILE" | "REPEAT" | "CASE"
+                                    ) =>
+                                {
+                                    if closer == "CASE" {
+                                        depth -= 1;
+                                    }
+                                    i = after;
+                                }
+                                _ => depth -= 1,
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => i += 1,
         }
@@ -59,14 +168,65 @@ pub fn split_statements(sql: &str) -> Vec<Range<usize>> {
     ranges
 }
 
+/// Whether a statement's leading words make it a routine that may carry a
+/// `BEGIN ... END` body: `CREATE [OR REPLACE] [DEFINER = x] [TEMP] PROCEDURE`
+/// and the like.
+fn opens_routine(lead: &[String]) -> bool {
+    lead.first().is_some_and(|word| word == "CREATE")
+        && lead[1..].iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT"
+            )
+        })
+}
+
+/// The word after byte `from`, upper-cased, skipping whitespace only -- and
+/// the byte just past it.
+fn next_word(sql: &str, from: usize) -> Option<(String, usize)> {
+    let rest = sql[from..].trim_start();
+    let start = sql.len() - rest.len();
+    let len = rest.bytes().take_while(|byte| is_ident_cont(*byte)).count();
+    (len > 0).then(|| (rest[..len].to_ascii_uppercase(), start + len))
+}
+
+/// A `DELIMITER <token>` line starting at `at`: the byte range of the new
+/// terminator, and where the line ends.
+fn delimiter_directive(sql: &str, at: usize) -> Option<(Range<usize>, usize)> {
+    const WORD: &str = "DELIMITER";
+    let head = sql.get(at..at + WORD.len())?;
+    if !head.eq_ignore_ascii_case(WORD) {
+        return None;
+    }
+    let line_end = sql[at..].find('\n').map_or(sql.len(), |offset| at + offset);
+    let rest = &sql[at + WORD.len()..line_end];
+    // `DELIMITER` has to be followed by space; `DELIMITERS` is a word.
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let token = rest.trim();
+    if token.is_empty() || token.contains(char::is_whitespace) {
+        return None;
+    }
+    let token_start = at + WORD.len() + rest.find(token)?;
+    Some((token_start..token_start + token.len(), line_end))
+}
+
 /// The statement that contains `offset`, or the nearest preceding non-empty
 /// statement when the caret sits in whitespace between statements / after a
 /// trailing `;`.
 ///
 /// Returns `None` when the buffer has no non-empty statement.
 pub fn statement_at(sql: &str, offset: usize) -> Option<Range<usize>> {
-    let offset = offset.min(sql.len());
-    let ranges = split_statements(sql);
+    nearest(split_statements(sql), offset.min(sql.len()))
+}
+
+/// [`statement_at`], as `driver` reads strings. See [`split_statements_for`].
+pub fn statement_at_for(driver: Driver, sql: &str, offset: usize) -> Option<Range<usize>> {
+    nearest(split_statements_for(driver, sql), offset.min(sql.len()))
+}
+
+fn nearest(ranges: Vec<Range<usize>>, offset: usize) -> Option<Range<usize>> {
     if ranges.is_empty() {
         return None;
     }
@@ -109,7 +269,13 @@ fn trim_range(sql: &str, range: Range<usize>) -> Option<Range<usize>> {
     Some(start..end)
 }
 
-pub(crate) fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+/// Past the string or quoted name opening at `start`. A doubled quote is
+/// always an escaped one; a backslash escapes the next byte only when
+/// `backslash` says the engine reads it that way (MySQL, or a PostgreSQL
+/// `E'...'` string). Standard SQL does not: in PostgreSQL `'C:\'` is a
+/// complete string, and reading the `\'` as an escape ran it on over the
+/// statements that followed.
+pub(crate) fn skip_quoted(bytes: &[u8], start: usize, quote: u8, backslash: bool) -> usize {
     let mut i = start + 1;
     while i < bytes.len() {
         if bytes[i] == quote {
@@ -120,8 +286,7 @@ pub(crate) fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
             }
             return i + 1;
         }
-        // Backslash escape (MySQL / Postgres standard_conforming_strings off).
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+        if backslash && bytes[i] == b'\\' && i + 1 < bytes.len() {
             i += 2;
             continue;
         }
@@ -412,6 +577,120 @@ mod tests {
         assert_eq!(
             &sql[range],
             "CREATE FUNCTION f() RETURNS int AS $$ RETURN 1; $$ LANGUAGE plpgsql"
+        );
+    }
+
+    fn texts_for(driver: Driver, sql: &str) -> Vec<&str> {
+        split_statements_for(driver, sql)
+            .into_iter()
+            .map(|r| &sql[r])
+            .collect()
+    }
+
+    /// Standard strings take a backslash literally: `'C:\'` is a whole
+    /// string in PostgreSQL and SQLite. Reading `\'` as an escape ran the
+    /// string on and merged every statement after it into this one.
+    #[test]
+    fn a_backslash_is_literal_in_a_standard_string() {
+        let sql = r"SELECT 'C:\'; SELECT 2";
+        assert_eq!(texts(sql), vec![r"SELECT 'C:\'", "SELECT 2"]);
+        assert_eq!(
+            texts_for(Driver::Postgres, sql),
+            vec![r"SELECT 'C:\'", "SELECT 2"]
+        );
+        assert_eq!(
+            texts_for(Driver::Sqlite, sql),
+            vec![r"SELECT 'C:\'", "SELECT 2"]
+        );
+    }
+
+    /// ...but escapes in MySQL, and in a PostgreSQL `E'...'` string.
+    #[test]
+    fn a_backslash_escapes_in_mysql_and_e_strings() {
+        let sql = r"SELECT 'it\'s; fine'; SELECT 2";
+        assert_eq!(
+            texts_for(Driver::MySql, sql),
+            vec![r"SELECT 'it\'s; fine'", "SELECT 2"]
+        );
+        let sql = r"SELECT E'it\'s; fine'; SELECT 2";
+        assert_eq!(
+            texts_for(Driver::Postgres, sql),
+            vec![r"SELECT E'it\'s; fine'", "SELECT 2"]
+        );
+        // A name that merely ends in `e` does not make an E-string.
+        let sql = r"SELECT name'C:\'; SELECT 2";
+        assert_eq!(texts(sql), vec![r"SELECT name'C:\'", "SELECT 2"]);
+    }
+
+    /// A routine body's statements are the routine's, not the batch's.
+    #[test]
+    fn a_begin_end_body_is_one_statement() {
+        let proc = "CREATE PROCEDURE p()\nBEGIN\n  DECLARE n INT;\n  IF n > 0 THEN\n    SET n = 1;\n  END IF;\n  CASE n WHEN 1 THEN SELECT 1; ELSE SELECT 2; END CASE;\n  WHILE n < 3 DO SET n = n + 1; END WHILE;\nEND";
+        let sql = format!("{proc};\nCALL p();");
+        assert_eq!(texts_for(Driver::MySql, &sql), vec![proc, "CALL p()"]);
+
+        let trigger = "CREATE TRIGGER t AFTER INSERT ON a BEGIN\n  UPDATE b SET n = n + 1;\n  DELETE FROM c;\nEND";
+        let sql = format!("{trigger}; SELECT 1");
+        assert_eq!(texts_for(Driver::Sqlite, &sql), vec![trigger, "SELECT 1"]);
+
+        let atomic =
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END";
+        let sql = format!("{atomic}; SELECT 3");
+        assert_eq!(texts(&sql), vec![atomic, "SELECT 3"]);
+    }
+
+    /// Outside a routine, `BEGIN` is a transaction and `CASE` an expression:
+    /// the batch splits as it always did.
+    #[test]
+    fn begin_outside_a_routine_is_a_statement() {
+        assert_eq!(
+            texts("BEGIN; UPDATE t SET a = CASE WHEN b THEN 1 END; COMMIT"),
+            vec!["BEGIN", "UPDATE t SET a = CASE WHEN b THEN 1 END", "COMMIT"]
+        );
+        // A routine with no body is over at its `;`.
+        assert_eq!(
+            texts("CREATE TRIGGER t BEFORE INSERT ON a FOR EACH ROW SET NEW.x = 1; SELECT 1"),
+            vec![
+                "CREATE TRIGGER t BEFORE INSERT ON a FOR EACH ROW SET NEW.x = 1",
+                "SELECT 1"
+            ]
+        );
+    }
+
+    /// The MySQL client's `DELIMITER`, as dumps write it. The directive lines
+    /// are the client's and are not statements.
+    #[test]
+    fn delimiter_lines_change_the_terminator() {
+        let sql = "DROP PROCEDURE IF EXISTS p;\nDELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END$$\nDELIMITER ;\nCALL p();";
+        assert_eq!(
+            texts_for(Driver::MySql, sql),
+            vec![
+                "DROP PROCEDURE IF EXISTS p",
+                "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END",
+                "CALL p()"
+            ]
+        );
+        // `delimiter` is case-insensitive, and a word that only starts with it
+        // is not the directive.
+        assert_eq!(
+            texts("delimiter //\nSELECT 1; SELECT 2//\nSELECT 3//"),
+            vec!["SELECT 1; SELECT 2", "SELECT 3"]
+        );
+        assert_eq!(
+            texts("DELIMITERS; SELECT 1"),
+            vec!["DELIMITERS", "SELECT 1"]
+        );
+    }
+
+    /// The caret runs the whole routine from anywhere inside its body.
+    #[test]
+    fn statement_at_covers_a_whole_routine() {
+        let sql = "SELECT 1;\nCREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET n = 1; END;\nSELECT 2";
+        let caret = sql.find("UPDATE").unwrap();
+        let range = statement_at_for(Driver::Sqlite, sql, caret).unwrap();
+        assert_eq!(
+            &sql[range],
+            "CREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET n = 1; END"
         );
     }
 }

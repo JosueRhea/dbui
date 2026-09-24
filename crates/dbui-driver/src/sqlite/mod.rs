@@ -14,18 +14,23 @@ use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
     QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, Value,
+    TableRef, TransactionState, Value,
 };
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::Sqlite;
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub struct SqliteDriver {
     pool: SqlitePool,
     server_version: String,
+    /// Whether the file's one connection was left inside a transaction by
+    /// the last editor statement.
+    in_transaction: AtomicBool,
 }
 
 impl SqliteDriver {
@@ -50,6 +55,11 @@ impl SqliteDriver {
             // a transaction and the statements around it on the same one.
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
+            // Never closed for age or for idling: the one connection is where
+            // a `BEGIN` typed in the editor lives, and closing it would roll
+            // that back without a word.
+            .idle_timeout(None)
+            .max_lifetime(None)
             .connect_with(options)
             .await
             .map_err(|error| DriverError::connect(path, &error))?;
@@ -62,6 +72,7 @@ impl SqliteDriver {
         Ok(Self {
             pool,
             server_version: format!("SQLite {version}"),
+            in_transaction: AtomicBool::new(false),
         })
     }
 
@@ -188,7 +199,11 @@ impl DatabaseDriver for SqliteDriver {
         token: &QueryToken,
     ) -> Result<ResultSet> {
         let bound = sql_build::select_page_sql(Driver::Sqlite, table, where_clause, order);
-        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
+        // Not kept as a prepared statement: `SELECT *` is shaped by the table,
+        // and after a column is added PostgreSQL refuses a cached plan whose
+        // result type changed -- every later page of the table failed -- and
+        // SQLite quietly returns nothing.
+        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone())).persistent(false);
         for value in &bound.binds {
             query = bind_value(query, value);
         }
@@ -319,24 +334,50 @@ impl DatabaseDriver for SqliteDriver {
         self.execute_tracked(sql, &QueryToken::new()).await
     }
 
+    fn editor_transaction(&self) -> TransactionState {
+        if self.in_transaction.load(Ordering::SeqCst) {
+            TransactionState::Open
+        } else {
+            TransactionState::Idle
+        }
+    }
+
     async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
         let started = Instant::now();
 
         let mut conn = self.interruptible_connection(sql, token).await?;
         let tracking = token.track(0);
 
+        // Never kept as a prepared statement (`persistent(false)`): run again
+        // after an ALTER TABLE -- here, or from any other session -- a cached
+        // plan still has the old columns, which PostgreSQL refuses and SQLite
+        // answers with no rows at all.
         let outcome = if query::returns_rows(sql) {
+            // One row past the cap says whether there were more; the
+            // statement is reset without stepping through the rest.
             sqlx::query(AssertSqlSafe(sql.to_string()))
-                .fetch_all(&mut *conn)
+                .persistent(false)
+                .fetch(&mut *conn)
+                .take(ResultSet::QUERY_ROW_CAP + 1)
+                .try_collect()
                 .await
-                .map(|rows| QueryOutcome::Rows(build_result_set(rows, usize::MAX)))
+                .map(|rows| QueryOutcome::Rows(build_result_set(rows, ResultSet::QUERY_ROW_CAP)))
         } else {
             sqlx::query(AssertSqlSafe(sql.to_string()))
+                .persistent(false)
                 .execute(&mut *conn)
                 .await
                 .map(|done| QueryOutcome::Affected(done.rows_affected()))
         };
         drop(tracking);
+        // In-process, so asking costs no round trip: asked every time.
+        if let Ok(mut handle) = conn.lock_handle().await {
+            // SAFETY: the handle is locked for the duration of the call, and
+            // `sqlite3_get_autocommit` only reads the connection's flag.
+            let autocommit =
+                unsafe { libsqlite3_sys::sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) };
+            self.in_transaction.store(autocommit == 0, Ordering::SeqCst);
+        }
         // Handed back before the backfill, which needs the pool's one
         // connection for itself.
         release_interruptible(conn).await;

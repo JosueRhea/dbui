@@ -30,18 +30,43 @@ impl Row {
     }
 }
 
+/// What the SQL editor's session is doing with transactions, as last seen.
+///
+/// The editor runs on one connection of its own (see the driver's
+/// `sessions`), so a `BEGIN` typed there stays open across runs -- and
+/// something on screen has to say so, or a forgotten one holds its locks and
+/// its uncommitted changes until the app closes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransactionState {
+    /// Autocommit: every statement stands on its own.
+    #[default]
+    Idle,
+    /// A transaction is open and waiting for `COMMIT` or `ROLLBACK`.
+    Open,
+    /// A transaction is open but a statement in it failed. PostgreSQL refuses
+    /// everything but `ROLLBACK` from here on.
+    Failed,
+}
+
 /// A grid of decoded values.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResultSet {
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Row>,
-    /// Set when the adapter stopped at [`Page::limit`] and the server had more.
-    /// The status bar says so, because a silently clipped result set is how
-    /// someone concludes a table has 500 rows when it has 5 million.
+    /// Set when the adapter stopped at [`Page::limit`] -- or, for a query
+    /// typed in the editor, at [`ResultSet::QUERY_ROW_CAP`] -- and the server
+    /// had more. The status bar says so, because a silently clipped result
+    /// set is how someone concludes a table has 500 rows when it has 5 million.
     pub truncated: bool,
 }
 
 impl ResultSet {
+    /// The most rows a hand-written query keeps. A table is paged, but a
+    /// query's rows used to be read in full, so a `SELECT` over a big table
+    /// held all of it in memory at once. Past this the result is marked
+    /// truncated; a query that wants more can page itself with `LIMIT`.
+    pub const QUERY_ROW_CAP: usize = 10_000;
+
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -288,7 +313,10 @@ fn has_returning(sql: &str) -> bool {
     while i < bytes.len() {
         match bytes[i] {
             quote @ (b'\'' | b'"' | b'`') => {
-                i = crate::sql_split::skip_quoted(bytes, i, quote);
+                // Backslashes read as escapes, as this always has: the
+                // question is only which call to make, and a misread costs a
+                // mislabelled summary, never a wrong statement.
+                i = crate::sql_split::skip_quoted(bytes, i, quote, true);
             }
             // Dollar-quoted bodies are values too, and a function body is
             // where a stray `RETURNING` is most likely to sit. Missing this

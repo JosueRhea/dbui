@@ -7,6 +7,7 @@
 use gpui::Rgba;
 
 use crate::theme::Theme;
+use dbui_app::domain::Driver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlStyle {
@@ -31,9 +32,11 @@ impl SqlStyle {
     }
 }
 
-/// Absolute byte spans covering `text`.
-pub fn highlight_spans(text: &str) -> Vec<(usize, usize, SqlStyle)> {
-    tokenize(text)
+/// Absolute byte spans covering `text`, with strings read the way `driver`
+/// reads them: a backslash escapes in MySQL and in a PostgreSQL `E'...'`
+/// string, and is an ordinary character anywhere else.
+pub fn highlight_spans(text: &str, driver: Driver) -> Vec<(usize, usize, SqlStyle)> {
+    tokenize(text, matches!(driver, Driver::MySql))
 }
 
 const KEYWORDS: &[&str] = &[
@@ -121,12 +124,17 @@ const KEYWORDS: &[&str] = &[
     "USING",
 ];
 
+/// A byte that continues a word, so `name'x'` is not an `E'...'` string.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
 fn is_keyword(word: &str) -> bool {
     let upper = word.to_ascii_uppercase();
     KEYWORDS.iter().any(|k| *k == upper)
 }
 
-fn tokenize(text: &str) -> Vec<(usize, usize, SqlStyle)> {
+fn tokenize(text: &str, backslash: bool) -> Vec<(usize, usize, SqlStyle)> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -169,6 +177,11 @@ fn tokenize(text: &str) -> Vec<(usize, usize, SqlStyle)> {
         if c == b'\'' || c == b'"' || c == b'`' {
             let start = i;
             let quote = c;
+            let escapes = backslash
+                || quote == b'\''
+                    && start > 0
+                    && matches!(bytes[start - 1], b'e' | b'E')
+                    && (start < 2 || !is_word_byte(bytes[start - 2]));
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == quote {
@@ -179,7 +192,7 @@ fn tokenize(text: &str) -> Vec<(usize, usize, SqlStyle)> {
                     i += 1;
                     break;
                 }
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                if escapes && bytes[i] == b'\\' && i + 1 < bytes.len() {
                     i += 2;
                     continue;
                 }
@@ -243,7 +256,7 @@ mod tests {
 
     #[test]
     fn colours_keywords_and_strings() {
-        let spans = highlight_spans("SELECT 'hi' FROM t");
+        let spans = highlight_spans("SELECT 'hi' FROM t", Driver::Postgres);
         assert!(spans.iter().any(|&(s, e, style)| {
             style == SqlStyle::Keyword && &"SELECT 'hi' FROM t"[s..e] == "SELECT"
         }));
@@ -257,7 +270,7 @@ mod tests {
 
     #[test]
     fn colours_comments() {
-        let spans = highlight_spans("SELECT 1 -- note\n/* block */");
+        let spans = highlight_spans("SELECT 1 -- note\n/* block */", Driver::Postgres);
         assert!(spans
             .iter()
             .any(|&(_, _, style)| style == SqlStyle::Comment));
@@ -265,9 +278,34 @@ mod tests {
 
     #[test]
     fn colours_numbers() {
-        let spans = highlight_spans("SELECT 42, 3.14");
+        let spans = highlight_spans("SELECT 42, 3.14", Driver::Postgres);
         assert!(spans.iter().any(|&(s, e, style)| {
             style == SqlStyle::Number && &"SELECT 42, 3.14"[s..e] == "42"
         }));
+    }
+
+    /// `'C:\'` is a whole string in PostgreSQL, so what follows it is code,
+    /// not more string -- but in MySQL the `\'` is an escaped quote.
+    #[test]
+    fn a_backslash_escapes_only_where_the_engine_says() {
+        let text = r"SELECT 'C:\', 1";
+        let string_end = |driver| {
+            highlight_spans(text, driver)
+                .into_iter()
+                .find(|(_, _, style)| *style == SqlStyle::String)
+                .map(|(_, end, _)| end)
+                .unwrap()
+        };
+        assert_eq!(string_end(Driver::Postgres), 12);
+        assert_eq!(string_end(Driver::Sqlite), 12);
+        assert_eq!(string_end(Driver::MySql), text.len(), "runs to the end");
+
+        let text = r"SELECT E'it\'s', 1";
+        let spans = highlight_spans(text, Driver::Postgres);
+        let (start, end, _) = spans
+            .into_iter()
+            .find(|(_, _, style)| *style == SqlStyle::String)
+            .unwrap();
+        assert_eq!(&text[start..end], r"'it\'s'");
     }
 }

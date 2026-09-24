@@ -86,6 +86,81 @@ async fn a_file_database_connects_and_reports_its_version() {
     assert_eq!(db.driver(), Driver::Sqlite);
 }
 
+/// A query typed in the editor keeps at most QUERY_ROW_CAP rows and says there
+/// were more, and the connection is fine for the next statement.
+#[tokio::test]
+async fn an_editor_query_stops_at_the_row_cap() {
+    let db = open("row-cap").await;
+    let cap = dbui_domain::ResultSet::QUERY_ROW_CAP;
+    let token = dbui_driver::QueryToken::new();
+    let sql = format!(
+        "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {}) \
+         SELECT i FROM n",
+        cap * 5
+    );
+    let result = db.execute_tracked(&sql, &token).await.expect("the query");
+    let set = result.rows().expect("rows");
+    assert_eq!(set.rows.len(), cap);
+    assert!(set.truncated);
+
+    let after = db.execute_tracked("SELECT 42", &token).await.expect("next");
+    assert_eq!(after.rows().unwrap().rows[0].0[0].to_text(), "42");
+}
+
+/// The editor's session says when a typed `BEGIN` is still open.
+#[tokio::test]
+async fn the_editor_session_reports_its_transaction() {
+    use dbui_domain::TransactionState;
+    let db = open("transaction-state").await;
+    let token = dbui_driver::QueryToken::new();
+    db.execute_tracked("SELECT 1", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Idle);
+    db.execute_tracked("BEGIN", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Open);
+    db.execute_tracked("SELECT 1", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Open);
+    db.execute_tracked("ROLLBACK", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Idle);
+}
+
+/// A table read, then given a column, then read again. The cached statement
+/// kept the old column list while SQLite quietly re-prepared it with the new
+/// one, so the second read panicked inside sqlx and came back with no rows.
+#[tokio::test]
+async fn a_table_given_a_column_still_reads() {
+    let db = open("reshaped").await;
+    let token = dbui_driver::QueryToken::new();
+    let first = db
+        .execute_tracked("SELECT * FROM people", &token)
+        .await
+        .unwrap();
+    let (width, rows) = {
+        let set = first.rows().unwrap();
+        (set.columns.len(), set.rows.len())
+    };
+    assert!(rows > 0);
+    db.table_rows(&TableRef::new("main", "people"), Page::first(), "", &[])
+        .await
+        .unwrap();
+
+    db.execute("ALTER TABLE people ADD COLUMN extra TEXT")
+        .await
+        .unwrap();
+
+    let again = db
+        .execute_tracked("SELECT * FROM people", &token)
+        .await
+        .unwrap();
+    let set = again.rows().unwrap();
+    assert_eq!(set.columns.len(), width + 1);
+    assert_eq!(set.rows.len(), rows, "the same rows, not none");
+    let page = db
+        .table_rows(&TableRef::new("main", "people"), Page::first(), "", &[])
+        .await
+        .unwrap();
+    assert_eq!(page.columns.len(), width + 1);
+}
+
 /// A path that is not there is a typo worth reporting, not a reason to make an
 /// empty database and look like it worked.
 #[tokio::test]

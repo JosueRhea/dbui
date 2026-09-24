@@ -209,6 +209,67 @@ fn switching_to_a_file_engine_does_not_carry_the_database_over(cx: &mut TestAppC
     });
 }
 
+/// Tab walks the fields the sheet shows. On a SQLite sheet it went from Name
+/// into the hidden Host box, and what was typed next vanished.
+#[gpui::test]
+fn tab_skips_the_fields_an_engine_hides(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().set_driver(Driver::Sqlite);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("app.db"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(config.database, "app.db", "typed into File");
+        assert_eq!(config.host, "localhost", "not into the hidden Host");
+    });
+    // And back again, past them the other way.
+    cx.simulate_keystrokes("shift-tab");
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("Local"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.modal.as_ref().unwrap().to_config().name, "Local");
+    });
+}
+
+/// A path longer than the box pans under the caret; the box and the sheet
+/// keep their width. It used to run out past the sheet's edge.
+#[gpui::test]
+fn a_long_file_path_pans_instead_of_widening_the_sheet(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().set_driver(Driver::Sqlite);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("tab");
+    // Painted once, so the field knows how wide it is.
+    cx.run_until_parked();
+    let path = format!("{}app.db", "/a/rather/long/directory".repeat(6));
+    cx.simulate_keystrokes(&typing(&path));
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    view.update(cx, |view, _| {
+        let form = view.modal.as_mut().unwrap();
+        assert_eq!(form.to_config().database, path);
+        let field = form.field_mut(5).unwrap();
+        let box_width = field.hit_bounds_slot().get().expect("painted").size.width;
+        let text_width = gpui::px(path.chars().count() as f32 * crate::text_input::char_width());
+        assert!(box_width < text_width, "the path is longer than the box");
+        assert!(
+            box_width < crate::theme::metrics::scaled(420.),
+            "and the box is still inside the sheet: {box_width:?}"
+        );
+        assert!(
+            field.scroll_handle().offset().x < gpui::px(0.),
+            "the text panned to keep the caret in view"
+        );
+    });
+}
+
 #[gpui::test]
 fn sheet_field_supports_select_all_copy_and_paste(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
@@ -619,14 +680,42 @@ fn run_resolves_selection_then_statement_under_caret(cx: &mut TestAppContext) {
         if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
             editor.move_to(12);
         }
-        assert_eq!(view.resolve_run_sql().as_deref(), Some("SELECT 2"));
+        assert_eq!(view.resolve_run_sql(), Some(vec!["SELECT 2".to_string()]));
 
         // Selection wins over caret.
         if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
             editor.move_to(0);
             editor.select_to(8); // "SELECT 1"
         }
-        assert_eq!(view.resolve_run_sql().as_deref(), Some("SELECT 1"));
+        assert_eq!(view.resolve_run_sql(), Some(vec!["SELECT 1".to_string()]));
+
+        // A selection spanning statements runs each of them, not one string
+        // with a `;` in it.
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(0);
+            editor.select_to(18);
+        }
+        assert_eq!(
+            view.resolve_run_sql(),
+            Some(vec!["SELECT 1".to_string(), "SELECT 2".to_string()])
+        );
+    });
+}
+
+/// The editor splits the way the connected engine reads strings: in SQLite a
+/// backslash is an ordinary character, so `'C:\'` ends where it looks like
+/// it ends and the caret's statement is the second one, not both merged.
+#[gpui::test]
+fn the_caret_statement_follows_the_engine_s_strings(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "backslash");
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        let text = "SELECT 'C:\\'; SELECT 2";
+        set_sql_editor_text(view, text);
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(text.len());
+        }
+        assert_eq!(view.resolve_run_sql(), Some(vec!["SELECT 2".to_string()]));
     });
 }
 
@@ -3796,6 +3885,72 @@ fn a_read_only_connection_will_not_change_a_table(cx: &mut TestAppContext) {
     });
 }
 
+/// The editor refuses a write on a read-only connection before sending it --
+/// and refuses the whole run, so the reads in front of it do not go either.
+/// Reads still run.
+#[gpui::test]
+fn a_read_only_connection_refuses_writes_from_the_editor(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "editor-read-only");
+    view.update(cx, |view, cx| {
+        let id = view.workspace.active_id().unwrap();
+        view.workspace.get_mut(id).unwrap().config.read_only = true;
+        view.put_sql_in_editor("SELECT 1; DELETE FROM members; SELECT 2", cx);
+        view.run_all_queries(cx);
+        let said = describe(&view.status);
+        assert!(
+            said.contains("DELETE refused") && said.contains("read only"),
+            "got: {said}"
+        );
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2"
+    );
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT count(*) FROM members", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(!said.contains("refused"), "a read still runs, got: {said}");
+    });
+}
+
+/// A `BEGIN` run in the editor shows the transaction bar, which paints, and
+/// its Roll back button ends the transaction for real.
+#[gpui::test]
+fn the_transaction_bar_shows_an_open_transaction_and_ends_it(cx: &mut TestAppContext) {
+    use dbui_app::domain::TransactionState;
+    let (view, cx, db) = open_connected(cx, "transaction-bar");
+    let idle = |view: &DbUi| !matches!(view.status, Status::Busy(_));
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        assert_eq!(view.editor_transaction(), TransactionState::Idle);
+        view.put_sql_in_editor("BEGIN; DELETE FROM members", cx);
+        view.run_all_queries(cx);
+    });
+    settle(&view, cx, idle);
+    view.update(cx, |view, _| {
+        assert_eq!(view.editor_transaction(), TransactionState::Open);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| view.end_editor_transaction("ROLLBACK", cx));
+    settle(&view, cx, idle);
+    view.update(cx, |view, _| {
+        assert_eq!(view.editor_transaction(), TransactionState::Idle);
+    });
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2",
+        "the delete was rolled back"
+    );
+}
+
 /// The structure pane and every kind of structure sheet paint, at every
 /// window size.
 #[gpui::test]
@@ -5082,6 +5237,98 @@ fn autocomplete_offers_tables_after_from(cx: &mut TestAppContext) {
             "got: {:?}",
             popup.items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
+    });
+}
+
+/// Typing opens the popup by itself -- no shortcut -- once a word is long
+/// enough to be worth completing, or right after a `.`.
+#[gpui::test]
+fn completion_opens_as_you_type(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id", "email"])]);
+    view.update(cx, open_sql_editor);
+
+    cx.simulate_keystrokes(&typing("select * from u"));
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "one letter is not enough");
+    });
+    cx.simulate_keystrokes(&typing("s"));
+    view.update(cx, |view, _| {
+        let popup = view.completion.as_ref().expect("opened while typing");
+        assert!(popup.items.iter().any(|item| item.label == "users"));
+    });
+
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "select * from users");
+        assert!(view.completion.is_none());
+    });
+
+    // After an alias and a dot, the columns -- with no letters typed yet.
+    cx.simulate_keystrokes(&typing(" u where u."));
+    view.update(cx, |view, _| {
+        let popup = view.completion.as_ref().expect("a dot opens it");
+        let labels: Vec<_> = popup.items.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"email"), "got {labels:?}");
+    });
+}
+
+/// A word typed out in full is not offered back, so Enter at the end of
+/// `FROM users` starts a new line instead of accepting `users` again.
+#[gpui::test]
+fn enter_after_a_complete_word_is_a_new_line(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+    view.update(cx, open_sql_editor);
+
+    cx.simulate_keystrokes(&typing("select * from users"));
+    view.update(cx, |view, _| assert!(view.completion.is_none()));
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(sql_editor_text(view), "select * from users\n");
+    });
+}
+
+/// Nothing pops up over a string or a comment.
+#[gpui::test]
+fn completion_stays_out_of_strings_and_comments(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+    view.update(cx, open_sql_editor);
+
+    cx.simulate_keystrokes(&typing("select 'us"));
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "in a string")
+    });
+
+    view.update(cx, |view, _| set_sql_editor_text(view, ""));
+    cx.simulate_keystrokes(&typing("-- us"));
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "in a comment")
+    });
+}
+
+/// Through the keyboard, not `trigger_completion`: the platform names the key
+/// `space`, and a check against `" "` once meant the shortcut never fired.
+#[gpui::test]
+fn ctrl_space_opens_completion_and_a_space_closes_it(cx: &mut TestAppContext) {
+    let (view, cx) = with_catalog(cx, &[("users", &["id"])]);
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        set_sql_editor_text(view, "select * from us");
+    });
+    cx.simulate_keystrokes("ctrl-space");
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_some(), "ctrl-space opens the popup");
+        assert_eq!(
+            sql_editor_text(view),
+            "select * from us",
+            "and types nothing"
+        );
+    });
+
+    cx.simulate_keystrokes("space");
+    view.update(cx, |view, _| {
+        assert!(view.completion.is_none(), "a space ends the word");
+        assert_eq!(sql_editor_text(view), "select * from us ");
     });
 }
 

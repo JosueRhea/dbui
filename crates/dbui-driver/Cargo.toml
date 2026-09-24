@@ -12,6 +12,8 @@ description = "The DatabaseDriver port and its PostgreSQL and MySQL adapters."
 dbui-domain = { workspace = true }
 sqlx = { workspace = true }
 async-trait = { workspace = true }
+futures-util = { workspace = true }
+libsqlite3-sys = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 
