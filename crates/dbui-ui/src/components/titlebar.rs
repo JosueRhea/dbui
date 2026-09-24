@@ -410,7 +410,21 @@ impl DbUi {
                     .into_any_element(),
             );
         } else {
-            for entry in self.workspace.entries() {
+            for (header, entry) in dbui_app::workspace::grouped(self.workspace.entries()) {
+                // A folder's name above its first connection.
+                if let Some(group) = header {
+                    rows.push(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .pb_0p5()
+                            .text_size(metrics::scaled(10.))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(group.to_uppercase()))
+                            .into_any_element(),
+                    );
+                }
+                let tag = theme.environment_color(entry.config.environment);
                 let id = entry.id();
                 let is_active = active == Some(id);
                 let is_open = self.workspace.is_open(id);
@@ -446,7 +460,14 @@ impl DbUi {
                                 .overflow_hidden()
                                 .flex()
                                 .flex_col()
-                                .child(div().truncate().text_color(theme.text).child(name))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(div().truncate().text_color(theme.text).child(name))
+                                        .children(tag.map(dot)),
+                                )
                                 .child(caption(summary, theme).truncate()),
                         )
                         // Says which of these already have a tab, so clicking

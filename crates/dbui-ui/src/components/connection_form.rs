@@ -21,6 +21,8 @@ pub enum Field {
     Database,
     /// Seconds before a statement is stopped. Blank for no limit.
     Timeout,
+    /// A folder in the connection list. Blank for none.
+    Group,
     SshHost,
     SshPort,
     SshUser,
@@ -39,7 +41,10 @@ impl Field {
             return true;
         }
         // A runaway query is as much a thing on a local file as on a server.
-        matches!(self, Field::Name | Field::Database | Field::Timeout)
+        matches!(
+            self,
+            Field::Name | Field::Database | Field::Timeout | Field::Group
+        )
     }
 
     /// Part of the SSH tunnel, drawn only while the tunnel is switched on.
@@ -51,7 +56,7 @@ impl Field {
     }
 
     /// Tab order, which is also the order they are drawn in.
-    pub const ORDER: [Field; 12] = [
+    pub const ORDER: [Field; 13] = [
         Field::Name,
         Field::Host,
         Field::Port,
@@ -59,6 +64,7 @@ impl Field {
         Field::Password,
         Field::Database,
         Field::Timeout,
+        Field::Group,
         Field::SshHost,
         Field::SshPort,
         Field::SshUser,
@@ -75,6 +81,7 @@ impl Field {
             Field::Password => "Password",
             Field::Database => "Database",
             Field::Timeout => "Timeout",
+            Field::Group => "Group",
             Field::SshHost => "SSH host",
             Field::SshPort => "SSH port",
             Field::SshUser => "SSH user",
@@ -87,6 +94,7 @@ impl Field {
     fn placeholder(self) -> Option<&'static str> {
         match self {
             Field::Timeout => Some("None · seconds"),
+            Field::Group => Some("None · e.g. Acme"),
             Field::SshUser => Some("From ~/.ssh/config"),
             Field::SshKey => Some("Agent · ~/.ssh/config"),
             Field::SshPassword => Some("Password or key passphrase"),
@@ -209,6 +217,7 @@ impl ConnectionForm {
         // Anything that is not a whole number of seconds is no limit, which
         // is what an empty field says too.
         config.query_timeout_secs = self.text(Field::Timeout).trim().parse().unwrap_or(0);
+        config.group = self.text(Field::Group).trim().to_string();
         config.ssh.host = self.text(Field::SshHost).trim().to_string();
         // Same rule as the database port: half-typed is the default, not zero.
         config.ssh.port = self
@@ -404,6 +413,7 @@ fn field_value(config: &ConnectionConfig, field: Field) -> String {
             0 => String::new(),
             seconds => seconds.to_string(),
         },
+        Field::Group => config.group.clone(),
         Field::SshHost => config.ssh.host.clone(),
         Field::SshPort => config.ssh.port.to_string(),
         Field::SshUser => config.ssh.username.clone(),

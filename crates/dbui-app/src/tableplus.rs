@@ -208,6 +208,7 @@ pub fn import_from_plist(
             read_only: false,
             query_timeout_secs: 0,
             ssh,
+            group: String::new(),
             environment: map_environment(
                 plist_string(dict.get("Enviroment"))
                     .or_else(|| plist_string(dict.get("Environment"))),

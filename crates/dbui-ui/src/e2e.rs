@@ -236,6 +236,20 @@ fn tab_skips_the_fields_an_engine_hides(cx: &mut TestAppContext) {
     });
 }
 
+/// The Group field files the connection into a folder.
+#[gpui::test]
+fn the_sheet_files_a_connection_into_a_group(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, _| {
+        view.modal.as_mut().unwrap().focus(Field::Group)
+    });
+    cx.simulate_keystrokes(&typing(" Acme "));
+    view.update(cx, |view, _| {
+        assert_eq!(view.modal.as_ref().unwrap().to_config().group, "Acme");
+    });
+}
+
 /// Ticking the tunnel shows its fields and moves into the first of them;
 /// Tab walks them; unticking hides them again but keeps what was typed.
 #[gpui::test]
@@ -402,9 +416,9 @@ fn tab_walks_the_fields_and_wraps(cx: &mut TestAppContext) {
         assert_eq!(config.name, "New PostgreSQL", "the name was left alone");
     });
 
-    // Port, User, Password, Database, Timeout, then Cancel / Test / Save,
-    // then wrap to Name.
-    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab tab");
+    // Port, User, Password, Database, Timeout, Group, then Cancel / Test /
+    // Save, then wrap to Name.
+    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab tab tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("wrapped"));
 
@@ -423,8 +437,8 @@ fn shift_tab_walks_backwards(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
     cx.simulate_keystrokes("cmd-n");
 
-    // From Name: Save → Test → Cancel → Timeout → Database.
-    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab");
+    // From Name: Save → Test → Cancel → Group → Timeout → Database.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab shift-tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("shop"));
 

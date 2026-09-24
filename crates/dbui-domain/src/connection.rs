@@ -321,6 +321,10 @@ pub struct ConnectionConfig {
     /// Local, staging, production... `default` so older files load untagged.
     #[serde(default)]
     pub environment: Environment,
+    /// A folder in the connection list -- a client, a project. Empty for
+    /// none; `default` so older files load ungrouped.
+    #[serde(default)]
+    pub group: String,
 }
 
 impl ConnectionConfig {
@@ -344,6 +348,7 @@ impl ConnectionConfig {
             query_timeout_secs: 0,
             ssh: SshConfig::default(),
             environment: Environment::None,
+            group: String::new(),
         }
     }
 
