@@ -22,7 +22,9 @@
 //! single shared fixture looks tidier right up until one test's `DELETE`
 //! changes another's row count, and until two of them race to create it.
 
-use dbui_domain::{ConnectionConfig, Driver, Page, QueryOutcome, TableRef, TlsMode, Value};
+use dbui_domain::{
+    ConnectionConfig, Driver, ObjectKind, Page, QueryOutcome, TableRef, TlsMode, Value,
+};
 use dbui_driver::{DatabaseDriver, DriverError};
 use std::sync::Arc;
 
@@ -236,6 +238,108 @@ macro_rules! both_engines {
 }
 
 // -- the tests -------------------------------------------------------------
+
+both_engines!(
+    routines_and_triggers_are_listed_with_their_definitions,
+    |fx: Fixture| async move {
+        let schema = fx.schema().to_string();
+        let q = |name: &str| {
+            format!(
+                "{}.{}",
+                fx.driver().quote_identifier(&schema),
+                fx.driver().quote_identifier(name)
+            )
+        };
+        let statements: Vec<String> = match fx.driver() {
+            Driver::Postgres => vec![
+                format!(
+                    "CREATE FUNCTION {}(x integer) RETURNS integer LANGUAGE sql AS 'SELECT x * 2'",
+                    q("double_it")
+                ),
+                format!(
+                    "CREATE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql AS \
+                     'BEGIN NEW.name := trim(NEW.name); RETURN NEW; END'",
+                    q("trim_name")
+                ),
+                format!(
+                    "CREATE TRIGGER people_trim BEFORE INSERT ON {} \
+                     FOR EACH ROW EXECUTE FUNCTION {}()",
+                    q("people"),
+                    q("trim_name")
+                ),
+                format!("CREATE TYPE {} AS ENUM ('low', 'high')", q("level")),
+                format!("CREATE SEQUENCE {} START 40", q("ticket_seq")),
+            ],
+            Driver::MySql => vec![
+                format!(
+                    "CREATE FUNCTION {}(x INT) RETURNS INT DETERMINISTIC RETURN x * 2",
+                    q("double_it")
+                ),
+                format!(
+                    "CREATE TRIGGER {} BEFORE INSERT ON {} \
+                     FOR EACH ROW SET NEW.name = TRIM(NEW.name)",
+                    q("people_trim"),
+                    q("people")
+                ),
+            ],
+            Driver::Sqlite => unreachable!(),
+        };
+        for sql in &statements {
+            fx.execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("{error}\n{sql}"));
+        }
+
+        let catalog = fx.catalog().await.expect("catalog");
+        let find = |kind: ObjectKind, name: &str| {
+            catalog
+                .objects_of(&schema, kind)
+                .find(|object| object.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {} {name} in {:?}", kind.label(), catalog.objects))
+        };
+
+        let function = find(ObjectKind::Function, "double_it");
+        let body = fx.definition(&function).await.expect("function definition");
+        assert!(
+            body.contains("double_it") && body.contains("x * 2"),
+            "{body}"
+        );
+        assert!(body.to_uppercase().contains("CREATE"), "{body}");
+
+        let trigger = find(ObjectKind::Trigger, "people_trim");
+        assert_eq!(
+            trigger.detail.as_deref(),
+            Some("people"),
+            "the table it is on"
+        );
+        let body = fx.definition(&trigger).await.expect("trigger definition");
+        assert!(
+            body.to_uppercase().contains("TRIGGER") && body.contains("people"),
+            "{body}"
+        );
+
+        if fx.driver() == Driver::Postgres {
+            let level = find(ObjectKind::Type, "level");
+            assert_eq!(level.detail.as_deref(), Some("enum"));
+            let body = fx.definition(&level).await.expect("enum definition");
+            assert!(body.contains("ENUM") && body.contains("'high'"), "{body}");
+
+            let sequence = find(ObjectKind::Sequence, "ticket_seq");
+            let body = fx.definition(&sequence).await.expect("sequence definition");
+            assert!(body.contains("START WITH 40"), "{body}");
+        }
+
+        // The tree's lists are the user's: nothing the server ships comes along.
+        assert!(
+            catalog
+                .objects
+                .iter()
+                .all(|object| object.schema != "pg_catalog" && object.schema != "mysql"),
+            "system objects leaked into the tree"
+        );
+    }
+);
 
 both_engines!(a_live_connection_answers, |fx: Fixture| async move {
     fx.ping().await.expect("ping");

@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
     pub schemas: Vec<Schema>,
+    /// Everything that is not a table or view: functions, triggers,
+    /// sequences, types, extensions. Kept apart from `schemas` because only
+    /// the tree lists them; everything that pages, sorts or edits rows walks
+    /// tables and would only have to skip these.
+    #[serde(default)]
+    pub objects: Vec<DbObject>,
 }
 
 impl Catalog {
@@ -21,6 +27,80 @@ impl Catalog {
             .flat_map(|schema| &schema.tables)
             .find(|table| table.name == reference.name)
     }
+}
+
+impl Catalog {
+    /// The objects of one kind in one schema, in the order the adapter gave.
+    pub fn objects_of<'a>(
+        &'a self,
+        schema: &'a str,
+        kind: ObjectKind,
+    ) -> impl Iterator<Item = &'a DbObject> + 'a {
+        self.objects
+            .iter()
+            .filter(move |object| object.schema == schema && object.kind == kind)
+    }
+}
+
+/// The non-table things a schema can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ObjectKind {
+    Function,
+    Procedure,
+    Trigger,
+    Sequence,
+    /// Enums, domains, composite and range types.
+    Type,
+    Extension,
+}
+
+impl ObjectKind {
+    /// Tree order.
+    pub const ALL: [ObjectKind; 6] = [
+        ObjectKind::Function,
+        ObjectKind::Procedure,
+        ObjectKind::Trigger,
+        ObjectKind::Sequence,
+        ObjectKind::Type,
+        ObjectKind::Extension,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ObjectKind::Function => "function",
+            ObjectKind::Procedure => "procedure",
+            ObjectKind::Trigger => "trigger",
+            ObjectKind::Sequence => "sequence",
+            ObjectKind::Type => "type",
+            ObjectKind::Extension => "extension",
+        }
+    }
+
+    /// The group heading in the tree.
+    pub fn plural(self) -> &'static str {
+        match self {
+            ObjectKind::Function => "Functions",
+            ObjectKind::Procedure => "Procedures",
+            ObjectKind::Trigger => "Triggers",
+            ObjectKind::Sequence => "Sequences",
+            ObjectKind::Type => "Types",
+            ObjectKind::Extension => "Extensions",
+        }
+    }
+}
+
+/// One function, trigger, sequence... as the tree lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DbObject {
+    pub schema: String,
+    pub name: String,
+    pub kind: ObjectKind,
+    /// A few words beside the name: a function's arguments, the table a
+    /// trigger is on, what sort of type a type is, an extension's version.
+    pub detail: Option<String>,
+    /// What the adapter needs to find this object again to read its
+    /// definition -- a Postgres OID, say. Opaque above the adapter.
+    pub key: String,
 }
 
 /// A namespace of tables.

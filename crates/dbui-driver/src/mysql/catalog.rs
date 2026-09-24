@@ -36,6 +36,26 @@ pub const RELATIONS: &str = "
      ORDER BY TABLE_SCHEMA, TABLE_NAME
 ";
 
+/// Stored functions and procedures, then triggers. Events are left out:
+/// they are scheduled jobs, closer to cron than to the schema.
+pub const OBJECTS: &str = "
+    SELECT ROUTINE_SCHEMA      AS schema_name,
+           ROUTINE_NAME        AS object_name,
+           LOWER(ROUTINE_TYPE) AS object_kind,
+           CAST(NULL AS CHAR)  AS detail
+      FROM information_schema.ROUTINES
+     WHERE ROUTINE_SCHEMA NOT IN (
+         'mysql', 'information_schema', 'performance_schema', 'sys', '_vt'
+     )
+    UNION ALL
+    SELECT TRIGGER_SCHEMA, TRIGGER_NAME, 'trigger', EVENT_OBJECT_TABLE
+      FROM information_schema.TRIGGERS
+     WHERE TRIGGER_SCHEMA NOT IN (
+         'mysql', 'information_schema', 'performance_schema', 'sys', '_vt'
+     )
+     ORDER BY 1, 3, 2
+";
+
 /// `COLUMN_TYPE` rather than `DATA_TYPE`: the former is `varchar(255)` and
 /// `int unsigned`, the latter just `varchar` and `int`.
 pub const COLUMNS: &str = "

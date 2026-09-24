@@ -9,14 +9,27 @@ use crate::sessions::{Lease, SessionId, Sessions};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
-    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, TlsMode, TransactionState, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
+    ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
+    SortKey, Table, TableRef, TlsMode, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, SqlSafeStr as _, TypeInfo as _};
 use std::time::{Duration, Instant};
+
+/// The `object_kind` column of `catalog::OBJECTS`.
+fn object_kind(kind: &str) -> Option<ObjectKind> {
+    Some(match kind {
+        "function" => ObjectKind::Function,
+        "procedure" => ObjectKind::Procedure,
+        "trigger" => ObjectKind::Trigger,
+        "sequence" => ObjectKind::Sequence,
+        "type" => ObjectKind::Type,
+        "extension" => ObjectKind::Extension,
+        _ => return None,
+    })
+}
 
 pub struct PostgresDriver {
     pool: PgPool,
@@ -216,7 +229,56 @@ impl DatabaseDriver for PostgresDriver {
             }
         }
 
-        Ok(Catalog { schemas })
+        // Best effort: `prokind` is Postgres 11 and `pg_sequences` 10, and a
+        // server older than either still has tables worth listing.
+        let object_rows = sqlx::query(catalog::OBJECTS)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+        let objects = object_rows
+            .iter()
+            .filter_map(|row| {
+                Some(DbObject {
+                    schema: row.try_get("schema_name").ok()?,
+                    name: row.try_get("object_name").ok()?,
+                    kind: object_kind(&row.try_get::<String, _>("object_kind").ok()?)?,
+                    detail: row
+                        .try_get::<Option<String>, _>("detail")
+                        .ok()
+                        .flatten()
+                        .filter(|detail| !detail.is_empty()),
+                    key: row.try_get("object_key").ok()?,
+                })
+            })
+            .collect();
+
+        Ok(Catalog { schemas, objects })
+    }
+
+    async fn definition(&self, object: &DbObject) -> Result<String> {
+        let sql = match (object.kind, object.detail.as_deref()) {
+            (ObjectKind::Function | ObjectKind::Procedure, _) => catalog::FUNCTION_DEFINITION,
+            (ObjectKind::Trigger, _) => catalog::TRIGGER_DEFINITION,
+            (ObjectKind::Sequence, _) => catalog::SEQUENCE_DEFINITION,
+            (ObjectKind::Type, Some("enum")) => catalog::ENUM_DEFINITION,
+            (ObjectKind::Type, Some("domain")) => catalog::DOMAIN_DEFINITION,
+            (ObjectKind::Type, Some("range")) => catalog::RANGE_DEFINITION,
+            (ObjectKind::Type, _) => catalog::COMPOSITE_DEFINITION,
+            (ObjectKind::Extension, _) => catalog::EXTENSION_DEFINITION,
+        };
+        let text: Option<String> = sqlx::query_scalar(sql)
+            .bind(&object.key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(sql, &error))?
+            .flatten();
+        let text = text.ok_or_else(|| {
+            DriverError::message(
+                sql,
+                format!("{} {} no longer exists", object.kind.label(), object.name),
+            )
+        })?;
+        Ok(format!("{}\n", text.trim_end()))
     }
 
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>> {

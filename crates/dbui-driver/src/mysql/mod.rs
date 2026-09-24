@@ -9,9 +9,9 @@ use crate::sessions::{Lease, SessionId, Sessions};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
-    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, TlsMode, TransactionState, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
+    ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
+    SortKey, Table, TableRef, TlsMode, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
@@ -208,7 +208,83 @@ impl DatabaseDriver for MySqlDriver {
             }
         }
 
-        Ok(Catalog { schemas })
+        // Best effort: a server that hides routines from this user, or a
+        // Vitess keyspace that does not answer for them, still has a tree
+        // of tables worth showing.
+        let objects = sqlx::query(catalog::OBJECTS)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let schema: String = row.try_get("schema_name").ok()?;
+                        let name: String = row.try_get("object_name").ok()?;
+                        let kind = match row.try_get::<String, _>("object_kind").ok()?.as_str() {
+                            "function" => ObjectKind::Function,
+                            "procedure" => ObjectKind::Procedure,
+                            "trigger" => ObjectKind::Trigger,
+                            _ => return None,
+                        };
+                        Some(DbObject {
+                            key: String::new(),
+                            detail: row.try_get::<Option<String>, _>("detail").ok().flatten(),
+                            schema,
+                            name,
+                            kind,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Catalog { schemas, objects })
+    }
+
+    async fn definition(&self, object: &DbObject) -> Result<String> {
+        let what = match object.kind {
+            ObjectKind::Function => "FUNCTION",
+            ObjectKind::Procedure => "PROCEDURE",
+            ObjectKind::Trigger => "TRIGGER",
+            other => {
+                return Err(DriverError::message(
+                    "",
+                    format!("MySQL has no {}s", other.label()),
+                ))
+            }
+        };
+        let sql = format!(
+            "SHOW CREATE {what} {}.{}",
+            Driver::MySql.quote_identifier(&object.schema),
+            Driver::MySql.quote_identifier(&object.name)
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.clone()))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(&sql, &error))?;
+        // The third column in all three: `Create Function`, `Create
+        // Procedure`, `SQL Original Statement`. NULL when this user may see
+        // that the routine exists but not its body.
+        let body = row
+            .try_get::<Option<String>, _>(2)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                row.try_get::<Option<Vec<u8>>, _>(2)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .ok_or_else(|| {
+                DriverError::message(
+                    &sql,
+                    format!(
+                        "The server did not show the body of {} -- this user may lack the \
+                         privilege to read it",
+                        object.name
+                    ),
+                )
+            })?;
+        Ok(format!("{};\n", body.trim_end().trim_end_matches(';')))
     }
 
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>> {

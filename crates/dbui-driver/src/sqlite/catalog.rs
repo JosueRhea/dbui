@@ -20,6 +20,20 @@ pub const RELATIONS: &str = "
      ORDER BY name
 ";
 
+/// Triggers, the only non-table object a SQLite file keeps. `sql` is the
+/// statement that created each one, which is its definition verbatim.
+pub const TRIGGERS: &str = "
+    SELECT name     AS trigger_name,
+           tbl_name AS table_name
+      FROM sqlite_master
+     WHERE type = 'trigger'
+     ORDER BY name
+";
+
+pub const TRIGGER_SQL: &str = "
+    SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?
+";
+
 /// Columns of one table.
 ///
 /// `pragma_table_info` reports the declared type, nullability and which

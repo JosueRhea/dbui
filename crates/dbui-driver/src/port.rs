@@ -4,10 +4,10 @@
 //! engine. Adding SQLite would mean one more implementation here and one more
 //! arm in [`crate::connect`] -- and no change at all in the UI.
 
-use crate::error::Result;
+use crate::error::{DriverError, Result};
 use async_trait::async_trait;
 use dbui_domain::{
-    Catalog, Column, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef,
+    Catalog, Column, DbObject, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef,
     TransactionState, Value,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,19 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// The columns of one table, in declaration order.
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>>;
+
+    /// The statement that would create `object` as it stands: a function's
+    /// `CREATE OR REPLACE FUNCTION`, a trigger's `CREATE TRIGGER`, and so on.
+    /// Opened in an editor, where it can be read, changed and run again.
+    async fn definition(&self, object: &DbObject) -> Result<String> {
+        Err(DriverError::message(
+            "",
+            format!(
+                "Reading a {}'s definition is not supported on this engine",
+                object.kind.label()
+            ),
+        ))
+    }
 
     /// One table's indexes, by name, each with its columns in index order.
     async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {

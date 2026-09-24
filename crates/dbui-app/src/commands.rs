@@ -7,8 +7,8 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ColumnInfo, ConnectionConfig, Index, Page, QueryOutcome, QueryResult,
-    ResultSet, SortKey, TableKind, TableRef, Value,
+    Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Index, Page, QueryOutcome,
+    QueryResult, ResultSet, SortKey, TableKind, TableRef, Value,
 };
 use dbui_driver::{DatabaseDriver, DriverError, QueryToken, RowBatch, RowUpdate};
 use std::sync::Arc;
@@ -393,6 +393,16 @@ pub fn fetch_indexes(
     table: TableRef,
 ) -> Task<Outcome<Vec<Index>>> {
     runtime.spawn(async move { driver.indexes(&table).await })
+}
+
+/// The statement that creates one function, trigger, sequence... for the
+/// tree to open in an editor.
+pub fn fetch_definition(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    object: DbObject,
+) -> Task<Outcome<String>> {
+    runtime.spawn(async move { driver.definition(&object).await })
 }
 
 /// Run the statements a structure change is made of, in order, stopping at

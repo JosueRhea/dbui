@@ -25,6 +25,12 @@ server. It runs your own `ssh`, so `~/.ssh/config`, the agent and `known_hosts`
 all apply; a password or key passphrase is kept in the keychain beside the
 database one. TablePlus connections that go over SSH import with their tunnel.
 
+**More than tables.** Under each schema's tables the tree folds away its
+functions, procedures, triggers, sequences, types and extensions (MySQL: routines
+and triggers; SQLite: triggers). Open one and its `CREATE` statement lands in a
+query tab, ready to read, change and run back. Objects an extension installed
+are left out; the extension is listed instead.
+
 **Production looks like production.** Tag a connection Local, Testing, Staging or
 Production and its colour runs under the title bar and its tab. On Production,
 ⌘S and any writing statement stop for a confirmation that names the server and

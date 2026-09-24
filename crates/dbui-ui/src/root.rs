@@ -80,6 +80,25 @@ pub enum SidebarItem {
         connection: ConnectionId,
         table: TableRef,
     },
+    /// "Functions", "Triggers"... under a schema, folded until opened.
+    Group {
+        connection: ConnectionId,
+        schema: String,
+        kind: dbui_app::domain::ObjectKind,
+    },
+    Object {
+        connection: ConnectionId,
+        object: dbui_app::domain::DbObject,
+    },
+}
+
+impl SidebarItem {
+    /// The fold key for an object group. Kept in the same list as schema
+    /// names -- and so in the session -- with a separator no schema name
+    /// can contain.
+    pub fn group_key(schema: &str, kind: dbui_app::domain::ObjectKind) -> String {
+        format!("{schema}\u{1f}{}", kind.label())
+    }
 }
 
 /// Where the rows on screen came from.
@@ -1797,7 +1816,9 @@ impl DbUi {
             .into_iter()
             .find_map(|item| match item {
                 SidebarItem::Table { table, .. } => Some(table),
-                SidebarItem::Schema { .. } => None,
+                SidebarItem::Schema { .. }
+                | SidebarItem::Group { .. }
+                | SidebarItem::Object { .. } => None,
             });
         let Some(table) = first else {
             return;
@@ -2425,6 +2446,49 @@ impl DbUi {
     /// As one edit, so ⌘Z brings back what it replaced: the tab has one
     /// editor, and whatever was being written in it is not lost to a
     /// mis-picked history row or saved query.
+    /// Read a function's, trigger's... definition and open it in a new query
+    /// tab, where it can be read, changed and run back.
+    pub(crate) fn open_definition(
+        &mut self,
+        object: dbui_app::domain::DbObject,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(driver) = self.workspace.active_driver() else {
+            self.status = Status::error("Not connected");
+            cx.notify();
+            return;
+        };
+        let connection = self.workspace.active_id();
+        let label = format!("{} {}", object.kind.label(), object.name);
+        self.status = Status::busy(format!("Reading {label}…"));
+        cx.notify();
+        let task = commands::fetch_definition(&self.runtime, driver, object);
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                // Opened on the connection it came from, or not at all: a
+                // definition dropped into another server's editor is one
+                // ⌘↵ away from being created there.
+                if this.workspace.active_id() != connection {
+                    return;
+                }
+                match landed {
+                    Some(Ok(sql)) => {
+                        this.load_sql_into_editor(&sql, &format!("Opened the {label}"), cx);
+                        if let Some(WorkspaceTab::Sql { editor, .. }) = this.tabs.active_mut() {
+                            editor.move_to(0);
+                        }
+                    }
+                    Some(Err(error)) => this.status = Status::error(error.to_string()),
+                    None => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn load_sql_into_editor(&mut self, sql: &str, said: &str, cx: &mut Context<Self>) {
         self.open_sql_tab(cx);
         if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
@@ -7342,6 +7406,7 @@ mod tests {
 
     fn catalog_of(names: &[&str]) -> Catalog {
         Catalog {
+            objects: Vec::new(),
             schemas: names
                 .iter()
                 .map(|name| dbui_app::domain::Schema {

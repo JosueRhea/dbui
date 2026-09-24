@@ -17,7 +17,9 @@ pub mod sql_split;
 pub mod statement;
 pub mod value;
 
-pub use catalog::{Catalog, Column, ForeignKey, Schema, Table, TableKind, TableRef};
+pub use catalog::{
+    Catalog, Column, DbObject, ForeignKey, ObjectKind, Schema, Table, TableKind, TableRef,
+};
 pub use connection::{ConnectionConfig, ConnectionId, Driver, Environment, SshConfig, TlsMode};
 pub use ddl::{ColumnSpec, Index};
 pub use query::{

@@ -27,6 +27,132 @@ pub const RELATIONS: &str = "
      ORDER BY n.nspname, c.relname
 ";
 
+/// Everything the tree lists besides relations, in one pass.
+///
+/// Objects that belong to an extension (`pg_depend.deptype = 'e'`) are left
+/// out: installing `pgcrypto` adds forty functions nobody wrote, and listing
+/// them would bury the three that somebody did. The extension itself is
+/// listed instead. `key` is the OID, which is what the definition queries
+/// below look an object up by.
+pub const OBJECTS: &str = "
+    WITH user_schemas AS (
+        SELECT oid, nspname
+          FROM pg_catalog.pg_namespace
+         WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+           AND nspname NOT LIKE 'pg_toast%'
+           AND nspname NOT LIKE 'pg_temp%'
+    ),
+    extension_owned AS (
+        SELECT classid, objid FROM pg_catalog.pg_depend WHERE deptype = 'e'
+    )
+    SELECT n.nspname AS schema_name, p.proname AS object_name,
+           CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END AS object_kind,
+           pg_catalog.pg_get_function_identity_arguments(p.oid) AS detail,
+           p.oid::text AS object_key
+      FROM pg_catalog.pg_proc p
+      JOIN user_schemas n ON n.oid = p.pronamespace
+     WHERE p.prokind IN ('f', 'p')
+       AND (p.tableoid, p.oid) NOT IN (SELECT classid, objid FROM extension_owned)
+    UNION ALL
+    SELECT n.nspname, t.tgname, 'trigger', c.relname, t.oid::text
+      FROM pg_catalog.pg_trigger t
+      JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+      JOIN user_schemas n ON n.oid = c.relnamespace
+     WHERE NOT t.tgisinternal
+    UNION ALL
+    SELECT n.nspname, c.relname, 'sequence', NULL, c.oid::text
+      FROM pg_catalog.pg_class c
+      JOIN user_schemas n ON n.oid = c.relnamespace
+     WHERE c.relkind = 'S'
+       AND (c.tableoid, c.oid) NOT IN (SELECT classid, objid FROM extension_owned)
+    UNION ALL
+    SELECT n.nspname, t.typname, 'type',
+           CASE t.typtype WHEN 'e' THEN 'enum' WHEN 'd' THEN 'domain'
+                          WHEN 'r' THEN 'range' ELSE 'composite' END,
+           t.oid::text
+      FROM pg_catalog.pg_type t
+      JOIN user_schemas n ON n.oid = t.typnamespace
+     WHERE (t.typtype IN ('e', 'd', 'r')
+            OR (t.typtype = 'c'
+                AND (SELECT relkind FROM pg_catalog.pg_class WHERE oid = t.typrelid) = 'c'))
+       AND (t.tableoid, t.oid) NOT IN (SELECT classid, objid FROM extension_owned)
+    UNION ALL
+    SELECT n.nspname, e.extname, 'extension', e.extversion, e.oid::text
+      FROM pg_catalog.pg_extension e
+      JOIN user_schemas n ON n.oid = e.extnamespace
+     ORDER BY 1, 3, 2
+";
+
+/// `CREATE OR REPLACE FUNCTION ...` / `PROCEDURE`, exactly as Postgres
+/// would write it back.
+pub const FUNCTION_DEFINITION: &str = "SELECT pg_catalog.pg_get_functiondef($1::text::oid)";
+
+pub const TRIGGER_DEFINITION: &str =
+    "SELECT pg_catalog.pg_get_triggerdef($1::text::oid, true) || ';'";
+
+/// Postgres has no `pg_get_sequencedef`; this spells one out from
+/// `pg_sequences`, with the current value as a comment -- it is usually the
+/// thing someone opened a sequence to find out.
+pub const SEQUENCE_DEFINITION: &str = "
+    SELECT format(
+               E'CREATE SEQUENCE %I.%I\n    AS %s\n    INCREMENT BY %s\n    MINVALUE %s\n    MAXVALUE %s\n    START WITH %s\n    CACHE %s%s;\n\n-- Last value: %s',
+               s.schemaname, s.sequencename, s.data_type::text, s.increment_by,
+               s.min_value, s.max_value, s.start_value, s.cache_size,
+               CASE WHEN s.cycle THEN E'\n    CYCLE' ELSE '' END,
+               COALESCE(s.last_value::text, 'never used'))
+      FROM pg_catalog.pg_sequences s
+      JOIN pg_catalog.pg_namespace n ON n.nspname = s.schemaname
+      JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = s.sequencename
+     WHERE c.oid = $1::text::oid
+";
+
+pub const ENUM_DEFINITION: &str = "
+    SELECT format(E'CREATE TYPE %s AS ENUM (\n    %s\n);',
+                  $1::text::oid::regtype,
+                  string_agg(quote_literal(enumlabel), E',\n    ' ORDER BY enumsortorder))
+      FROM pg_catalog.pg_enum
+     WHERE enumtypid = $1::text::oid
+";
+
+pub const DOMAIN_DEFINITION: &str = "
+    SELECT format('CREATE DOMAIN %s AS %s%s%s', t.oid::regtype,
+                  pg_catalog.format_type(t.typbasetype, t.typtypmod),
+                  CASE WHEN t.typnotnull THEN ' NOT NULL' ELSE '' END,
+                  COALESCE(' DEFAULT ' || t.typdefault, ''))
+           || COALESCE((SELECT string_agg(E'\n    CONSTRAINT ' || quote_ident(conname) || ' '
+                                          || pg_catalog.pg_get_constraintdef(oid), '')
+                          FROM pg_catalog.pg_constraint WHERE contypid = t.oid), '')
+           || ';'
+      FROM pg_catalog.pg_type t
+     WHERE t.oid = $1::text::oid
+";
+
+pub const COMPOSITE_DEFINITION: &str = "
+    SELECT format(E'CREATE TYPE %s AS (\n    %s\n);', t.oid::regtype,
+                  string_agg(quote_ident(a.attname) || ' '
+                             || pg_catalog.format_type(a.atttypid, a.atttypmod),
+                             E',\n    ' ORDER BY a.attnum))
+      FROM pg_catalog.pg_type t
+      JOIN pg_catalog.pg_attribute a ON a.attrelid = t.typrelid
+     WHERE t.oid = $1::text::oid AND a.attnum > 0 AND NOT a.attisdropped
+     GROUP BY t.oid
+";
+
+pub const RANGE_DEFINITION: &str = "
+    SELECT format('CREATE TYPE %s AS RANGE (SUBTYPE = %s);', r.rngtypid::regtype,
+                  r.rngsubtype::regtype)
+      FROM pg_catalog.pg_range r
+     WHERE r.rngtypid = $1::text::oid
+";
+
+pub const EXTENSION_DEFINITION: &str = "
+    SELECT format('CREATE EXTENSION %I WITH SCHEMA %I VERSION %L;',
+                  e.extname, n.nspname, e.extversion)
+      FROM pg_catalog.pg_extension e
+      JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.oid = $1::text::oid
+";
+
 /// Every schema, including the empty ones.
 ///
 /// A schema with no tables yet still belongs in the tree -- otherwise creating

@@ -22,7 +22,7 @@
 //! `crates/dbui-driver/tests/live.rs`.
 
 use crate::components::connection_form::Field;
-use crate::root::{DbUi, Focus, Status};
+use crate::root::{DbUi, Focus, SidebarItem, Status};
 use crate::tabs::WorkspaceTab;
 use dbui_app::domain::{ConnectionConfig, Driver, TableRef};
 use dbui_app::{DbRuntime, Workspace};
@@ -4179,6 +4179,81 @@ fn explain_draws_the_plan_and_runs_nothing(cx: &mut TestAppContext) {
     );
 }
 
+/// A trigger shows up in the tree under its own folded group, and opening it
+/// puts the statement that created it in a new query tab.
+#[gpui::test]
+fn a_trigger_is_listed_and_opens_its_definition(cx: &mut TestAppContext) {
+    use dbui_app::domain::ObjectKind;
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "objects");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "CREATE TRIGGER members_trim AFTER INSERT ON members \
+             BEGIN UPDATE members SET name = trim(name) WHERE id = NEW.id; END",
+            cx,
+        );
+        view.run_query(cx);
+    });
+    // A CREATE refreshes the catalog on its own.
+    settle(&view, cx, |view| {
+        view.workspace
+            .active()
+            .and_then(|entry| entry.catalog.as_ref())
+            .is_some_and(|catalog| !catalog.objects.is_empty())
+    });
+
+    let group = SidebarItem::Group {
+        connection: view.update(cx, |view, _| view.workspace.active_id().unwrap()),
+        schema: "main".into(),
+        kind: ObjectKind::Trigger,
+    };
+    view.update(cx, |view, cx| {
+        let items = view.sidebar_visible_items();
+        assert!(items.contains(&group), "the group is listed: {items:?}");
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, SidebarItem::Object { .. })),
+            "and folded until opened"
+        );
+        view.set_sidebar_cursor(group.clone(), cx);
+        view.sidebar_activate(cx);
+        let object = view
+            .sidebar_visible_items()
+            .into_iter()
+            .find(|item| matches!(item, SidebarItem::Object { .. }))
+            .expect("opening the group lists the trigger");
+        view.set_sidebar_cursor(object, cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    let tabs_before = view.update(cx, |view, _| view.tabs.items.len());
+    view.update(cx, |view, cx| view.sidebar_activate(cx));
+    settle(&view, cx, |view| view.tabs.items.len() > tabs_before);
+    view.update(cx, |view, _| {
+        let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active() else {
+            panic!("a query tab opened");
+        };
+        assert!(
+            editor.text().starts_with("CREATE TRIGGER members_trim"),
+            "{}",
+            editor.text()
+        );
+    });
+
+    // Left from the object goes back up to its group.
+    view.update(cx, |view, cx| {
+        let object = view
+            .sidebar_visible_items()
+            .into_iter()
+            .find(|item| matches!(item, SidebarItem::Object { .. }))
+            .unwrap();
+        view.set_sidebar_cursor(object, cx);
+        view.sidebar_expand(false, cx);
+        assert_eq!(view.sidebar_cursor.as_ref(), Some(&group));
+    });
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]
@@ -5441,6 +5516,7 @@ fn with_catalog<'a>(
 
     let (view, cx) = open_with(cx, saved_connections(1));
     let catalog = Catalog {
+        objects: Vec::new(),
         schemas: vec![Schema {
             name: "public".into(),
             tables: tables

@@ -7,7 +7,7 @@ use super::context_menu::ContextTarget;
 use super::{caption, motion};
 use crate::root::{DbUi, Focus, SidebarItem};
 use crate::theme::metrics;
-use dbui_app::domain::ConnectionId;
+use dbui_app::domain::{ConnectionId, ObjectKind};
 use gpui::{
     div, prelude::*, px, AnyElement, Context, MouseButton, MouseDownEvent, SharedString, Window,
 };
@@ -60,6 +60,28 @@ impl DbUi {
                     table: table.reference(),
                 });
             }
+            // Functions, triggers and the rest, each kind folded into a group
+            // under the tables. Not while filtering: the filter is for tables,
+            // and a group that matched nothing would only be noise.
+            if query.is_empty() {
+                for kind in ObjectKind::ALL {
+                    let objects: Vec<_> = catalog.objects_of(&schema.name, kind).collect();
+                    if objects.is_empty() {
+                        continue;
+                    }
+                    items.push(SidebarItem::Group {
+                        connection: id,
+                        schema: schema.name.clone(),
+                        kind,
+                    });
+                    if entry.is_expanded(&SidebarItem::group_key(&schema.name, kind)) {
+                        items.extend(objects.into_iter().map(|object| SidebarItem::Object {
+                            connection: id,
+                            object: object.clone(),
+                        }));
+                    }
+                }
+            }
         }
         items
     }
@@ -103,6 +125,16 @@ impl DbUi {
             SidebarItem::Table { table, .. } => {
                 self.open_table_tab(table, cx);
             }
+            SidebarItem::Group {
+                connection,
+                schema,
+                kind,
+            } => {
+                self.toggle_schema(connection, &SidebarItem::group_key(&schema, kind), cx);
+            }
+            SidebarItem::Object { object, .. } => {
+                self.open_definition(object, cx);
+            }
         }
     }
 
@@ -142,6 +174,36 @@ impl DbUi {
                     cx.notify();
                 } else if !expand && is_expanded {
                     self.toggle_schema(connection, &name, cx);
+                }
+            }
+            SidebarItem::Group {
+                connection,
+                ref schema,
+                kind,
+            } => {
+                let key = SidebarItem::group_key(schema, kind);
+                let is_expanded = self
+                    .workspace
+                    .get(connection)
+                    .is_some_and(|entry| entry.is_expanded(&key));
+                if expand != is_expanded {
+                    self.toggle_schema(connection, &key, cx);
+                }
+            }
+            // Left from an object goes up to its group, the way it goes from
+            // a table to its schema.
+            SidebarItem::Object { connection, .. } => {
+                if !expand {
+                    let items = self.sidebar_visible_items();
+                    if let Some(pos) = items.iter().position(|i| i == &item) {
+                        if let Some(group) = items[..pos].iter().rev().find(
+                            |i| matches!(i, SidebarItem::Group { connection: c, .. } if *c == connection),
+                        ) {
+                            self.sidebar_cursor = Some(group.clone());
+                            self.reveal_sidebar_cursor();
+                            cx.notify();
+                        }
+                    }
                 }
             }
             SidebarItem::Table { connection, .. } => {
@@ -561,6 +623,10 @@ impl DbUi {
                     rows.push(row.into_any_element());
                 }
             }
+
+            if query.is_empty() {
+                rows.extend(self.render_object_groups(id, schema_index, &schema.name, cx));
+            }
         }
 
         // A filter that found nothing has to say so: an empty tree otherwise
@@ -577,6 +643,149 @@ impl DbUi {
         }
 
         rows
+    }
+}
+
+impl DbUi {
+    /// The folded groups of functions, triggers... under one schema's
+    /// tables, and the objects of the groups that are open. Has to agree
+    /// with `sidebar_visible_items`, like the rest of the tree.
+    fn render_object_groups(
+        &self,
+        id: ConnectionId,
+        schema_index: usize,
+        schema: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let chrome = self.chrome_theme();
+        let theme = &chrome;
+        let cursor_shown = self.focus == Focus::Sidebar;
+        let Some(entry) = self.workspace.get(id) else {
+            return Vec::new();
+        };
+        let Some(catalog) = entry.catalog.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+
+        for kind in ObjectKind::ALL {
+            let objects: Vec<_> = catalog.objects_of(schema, kind).collect();
+            if objects.is_empty() {
+                continue;
+            }
+            let expanded = entry.is_expanded(&SidebarItem::group_key(schema, kind));
+            let group = SidebarItem::Group {
+                connection: id,
+                schema: schema.to_string(),
+                kind,
+            };
+            let is_cursor = self.sidebar_cursor.as_ref() == Some(&group);
+            let row_key = schema_index * 16 + kind as usize;
+            rows.push(
+                div()
+                    .id(("object-group", row_key))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl(metrics::scaled(24.))
+                    .pr_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme.hover))
+                    .children((is_cursor && cursor_shown).then(|| cursor_marker(theme)))
+                    .on_click(cx.listener({
+                        let group = group.clone();
+                        let key = SidebarItem::group_key(schema, kind);
+                        move |this, _, _window, cx| {
+                            this.set_sidebar_cursor(group.clone(), cx);
+                            this.toggle_schema(id, &key, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .w(metrics::scaled(12.))
+                            .text_color(theme.text_faint)
+                            .child(if expanded { "▾" } else { "▸" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme.text_muted)
+                            .child(kind.plural()),
+                    )
+                    .child(caption(objects.len().to_string(), theme))
+                    .into_any_element(),
+            );
+            if !expanded {
+                continue;
+            }
+            for (object_index, object) in objects.into_iter().enumerate() {
+                let item = SidebarItem::Object {
+                    connection: id,
+                    object: object.clone(),
+                };
+                let is_cursor = self.sidebar_cursor.as_ref() == Some(&item);
+                rows.push(
+                    div()
+                        .id(("object", row_key * 100_000 + object_index))
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl(metrics::scaled(42.))
+                        .pr_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(theme.hover))
+                        .children((is_cursor && cursor_shown).then(|| cursor_marker(theme)))
+                        .on_click(cx.listener({
+                            let item = item.clone();
+                            let object = object.clone();
+                            move |this, _, _window, cx| {
+                                this.set_sidebar_cursor(item.clone(), cx);
+                                this.open_definition(object.clone(), cx);
+                            }
+                        }))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(metrics::scaled(18.))
+                                .text_size(metrics::scaled(9.))
+                                .text_color(theme.value_structured)
+                                .child(object_badge(kind)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(theme.text)
+                                .child(SharedString::from(object.name.clone())),
+                        )
+                        .children(object.detail.clone().map(|detail| {
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(metrics::scaled(11.))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(detail))
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
+    }
+}
+
+/// Two letters for an object's kind, where a table row has its icon.
+fn object_badge(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Function => "FN",
+        ObjectKind::Procedure => "PR",
+        ObjectKind::Trigger => "TG",
+        ObjectKind::Sequence => "SQ",
+        ObjectKind::Type => "TY",
+        ObjectKind::Extension => "EX",
     }
 }
 

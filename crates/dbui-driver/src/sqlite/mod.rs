@@ -12,9 +12,9 @@ use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sql_build;
 use async_trait::async_trait;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
-    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, TransactionState, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
+    ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
+    SortKey, Table, TableRef, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::pool::PoolConnection;
@@ -135,13 +135,46 @@ impl DatabaseDriver for SqliteDriver {
             })
             .collect();
 
+        let objects = sqlx::query(catalog::TRIGGERS)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::catalog(&error))?
+            .iter()
+            .filter_map(|row| {
+                let name: String = row.try_get("trigger_name").ok()?;
+                Some(DbObject {
+                    schema: catalog::SCHEMA_NAME.to_string(),
+                    key: name.clone(),
+                    name,
+                    kind: ObjectKind::Trigger,
+                    detail: row.try_get::<String, _>("table_name").ok(),
+                })
+            })
+            .collect();
+
         // One schema, always -- the tree needs a folder to put them in.
         Ok(Catalog {
             schemas: vec![Schema {
                 name: catalog::SCHEMA_NAME.to_string(),
                 tables,
             }],
+            objects,
         })
+    }
+
+    async fn definition(&self, object: &DbObject) -> Result<String> {
+        if object.kind != ObjectKind::Trigger {
+            return Err(DriverError::message(
+                "",
+                format!("SQLite has no {}s", object.kind.label()),
+            ));
+        }
+        let sql: String = sqlx::query_scalar(catalog::TRIGGER_SQL)
+            .bind(&object.key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(catalog::TRIGGER_SQL, &error))?;
+        Ok(format!("{};\n", sql.trim_end().trim_end_matches(';')))
     }
 
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>> {
