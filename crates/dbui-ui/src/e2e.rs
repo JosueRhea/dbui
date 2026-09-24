@@ -463,8 +463,8 @@ fn the_query_timeout_is_typed_in_seconds(cx: &mut TestAppContext) {
         );
     });
 
-    // From Name: Save → Test → Cancel → Timeout.
-    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab");
+    // From Name: Save → Test → Cancel → Group → Timeout.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab");
     cx.simulate_keystrokes(&typing("30"));
     view.update(cx, |view, _| {
         let config = view.modal.as_ref().unwrap().to_config();
