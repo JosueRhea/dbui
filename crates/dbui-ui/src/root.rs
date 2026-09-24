@@ -480,6 +480,10 @@ pub struct DbUi {
     /// selection moves down the table, and a different table -- with different
     /// column names -- starts fresh.
     pub(crate) detail_collapsed: HashSet<String>,
+    /// JSON fields shown as a tree, by column name.
+    pub(crate) json_tree_fields: HashSet<String>,
+    /// Folded branches of those trees, as `field\u{1f}$.path`.
+    pub(crate) json_tree_closed: HashSet<String>,
     /// SQL editor pane height (dragged by the strip under the editor).
     pub(crate) editor_height: Pixels,
     /// Live drag for the SQL editor resize: `(pointer y, height)`.
@@ -760,6 +764,8 @@ impl DbUi {
             glass_blur: store::default_glass_blur(),
             detail_drag: None,
             detail_collapsed: HashSet::new(),
+            json_tree_fields: HashSet::new(),
+            json_tree_closed: HashSet::new(),
             change_bubble_height: px(BUBBLE_HEIGHT_DEFAULT),
             change_bubble_drag: None,
             editor_height: px(EDITOR_HEIGHT_DEFAULT),

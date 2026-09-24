@@ -51,6 +51,12 @@ with its columns -- referenced tables to the left of the ones that reference the
 and draws each foreign key from its column to the column it points at. Hover a table
 to light up its keys both ways, `⌘=`/`⌘-` to zoom the drawing, click a table to open it.
 
+**Small things.** `:name` placeholders are asked for before a statement runs, and
+remembered. *Pin* keeps a result in its own tab to compare against the next run. A
+result cut off at 10,000 rows exports every row. JSON cells read as a foldable tree
+in the row details, where clicking a value copies it and names its path. Connections
+can be filed into groups.
+
 **Production looks like production.** Tag a connection Local, Testing, Staging or
 Production and its colour runs under the title bar and its tab. On Production,
 ⌘S and any writing statement stop for a confirmation that names the server and

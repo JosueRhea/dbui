@@ -4592,6 +4592,45 @@ fn named_parameters_are_asked_for_and_remembered(cx: &mut TestAppContext) {
     });
 }
 
+/// A JSON cell can be read as a tree in the detail sidebar: branches fold,
+/// and clicking a value copies it and names its path.
+#[gpui::test]
+fn a_json_value_reads_as_a_tree(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "json-tree");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            r#"SELECT 1 AS id, '{"customer": {"name": "Ada", "tags": ["vip", 2]}, "ok": true}' AS meta"#,
+            cx,
+        );
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|t| t.result()).is_some()
+    });
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        view.toggle_json_tree("meta", cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.json_tree_closed.insert("meta\u{1f}$.customer".into());
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+    let value: serde_json::Value =
+        serde_json::from_str(r#"{"customer": {"name": "Ada"}, "ok": true}"#).unwrap();
+    let closed: std::collections::HashSet<String> = ["$.customer".to_string()].into();
+    let rows = crate::components::json_tree::rows(&value, &closed);
+    assert_eq!(rows.len(), 3, "the folded branch keeps its own row only");
+
+    view.update(cx, |view, cx| {
+        view.toggle_json_tree("meta", cx);
+        assert!(view.json_tree_fields.is_empty(), "and back to text");
+    });
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

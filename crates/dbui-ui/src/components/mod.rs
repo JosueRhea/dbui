@@ -17,6 +17,7 @@ pub(crate) mod er_diagram;
 mod filters;
 mod grid;
 mod icons;
+pub(crate) mod json_tree;
 mod main_pane;
 pub(crate) mod motion;
 pub(crate) mod palette;

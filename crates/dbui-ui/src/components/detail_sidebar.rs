@@ -124,6 +124,7 @@ impl DbUi {
                         self.detail_input,
                         self.copied_field,
                         &self.detail_collapsed,
+                        (&self.json_tree_fields, &self.json_tree_closed),
                         theme,
                         cx,
                     )
@@ -303,6 +304,7 @@ fn render_table_draft(
     detail_input: Option<DetailInput>,
     copied: Option<usize>,
     collapsed: &HashSet<String>,
+    (json_tree_fields, json_tree_closed): (&HashSet<String>, &HashSet<String>),
     theme: &Theme,
     cx: &mut Context<DbUi>,
 ) -> Vec<AnyElement> {
@@ -330,6 +332,13 @@ fn render_table_draft(
                 bulk,
                 temporal: type_name.is_some_and(is_temporal_type),
             };
+            let structured = json_format::is_structured_json(input.text());
+            let as_tree = structured && json_tree_fields.contains(name.as_str());
+            let tree = as_tree
+                .then(|| {
+                    super::json_tree::render(name, index, input.text(), json_tree_closed, theme, cx)
+                })
+                .flatten();
             div()
                 .id(("detail-field", index))
                 .w_full()
@@ -343,13 +352,16 @@ fn render_table_draft(
                         name,
                         is_pk: *is_pk,
                         type_name,
-                        fold: foldable(input, *is_pk).then_some(height),
+                        fold: (foldable(input, *is_pk) && tree.is_none()).then_some(height),
                         just_copied,
+                        tree: structured.then_some(as_tree),
                     },
                     theme,
                     cx,
                 ))
-                .child(if *is_pk {
+                .child(if let Some(tree) = tree {
+                    tree
+                } else if *is_pk {
                     read_only_field(index, input.text(), true, height, just_copied, theme, cx)
                         .into_any_element()
                 } else {
@@ -439,6 +451,8 @@ fn render_insert_draft(
                         // A staged insert has no key to copy: it has no
                         // identity until the server gives it one.
                         just_copied: false,
+                        // Being typed, so shown as the text being typed.
+                        tree: None,
                     },
                     theme,
                     cx,
@@ -556,6 +570,8 @@ struct FieldHeader<'a> {
     fold: Option<FieldHeight>,
     /// This field's value was the last one copied.
     just_copied: bool,
+    /// For a JSON object or array: whether it is shown as a tree.
+    tree: Option<bool>,
 }
 
 /// An editable field, plus the button that opens what can be written to it.
@@ -636,6 +652,7 @@ fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) 
         type_name,
         fold,
         just_copied,
+        tree,
     } = header;
     let label_color = if is_pk {
         theme.warning
@@ -658,6 +675,24 @@ fn field_header(header: FieldHeader<'_>, theme: &Theme, cx: &mut Context<DbUi>) 
                 .text_size(metrics::text_size_small())
                 .child(SharedString::from(name.to_string())),
         );
+
+    if let Some(on) = tree {
+        let field = name.to_string();
+        row = row.child(
+            div()
+                .id(("detail-field-tree", index))
+                .px_1()
+                .rounded_sm()
+                .text_size(metrics::scaled(10.))
+                .text_color(if on { theme.accent } else { theme.text_faint })
+                .cursor_pointer()
+                .hover(|btn| btn.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_json_tree(&field, cx);
+                }))
+                .child(if on { "TEXT" } else { "TREE" }),
+        );
+    }
 
     if let Some(height) = fold {
         let open = height == FieldHeight::Full;
