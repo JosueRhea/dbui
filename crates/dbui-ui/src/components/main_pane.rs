@@ -642,9 +642,10 @@ impl DbUi {
         let completion = self.completion.clone();
         let find_bar = self.render_editor_find(cx);
 
-        let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
+        let Some(WorkspaceTab::Sql { editor, result, .. }) = self.tabs.active() else {
             return div().id("editor-empty").into_any_element();
         };
+        let has_result = result.is_some();
 
         let layout = editor.layout();
         let empty = editor.is_empty();
@@ -796,7 +797,13 @@ impl DbUi {
                             )
                             .child(button("run-all", "Run all  ⌘⇧↵", theme, false).on_click(
                                 cx.listener(|this, _, _window, cx| this.run_all_queries(cx)),
-                            )),
+                            ))
+                            // Keep this result to compare the next run against.
+                            .when(has_result, |row| {
+                                row.child(button("pin-result", "Pin", theme, false).on_click(
+                                    cx.listener(|this, _, _window, cx| this.pin_result(cx)),
+                                ))
+                            }),
                     ),
             )
             .children(find_bar)

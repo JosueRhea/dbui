@@ -120,6 +120,7 @@ pub enum ResultSource {
 
 /// A result set, plus everything derived from it that the grid would otherwise
 /// recompute every frame.
+#[derive(Clone)]
 pub struct ResultView {
     pub set: ResultSet,
     /// Per-column pixel widths, measured once when the rows arrive.
@@ -2451,6 +2452,20 @@ impl DbUi {
             .map(|sql| dbui_app::plan::explain_sql(driver, sql))
             .collect();
         self.dispatch_statements(explained, cx);
+    }
+
+    /// Keep the result on screen in a tab of its own, to compare the next
+    /// run against. The query tab stays in front, ready for that run.
+    pub(crate) fn pin_result(&mut self, cx: &mut Context<Self>) {
+        match self.tabs.pin_active() {
+            Some(_) => {
+                self.status =
+                    Status::info("Pinned the result as a tab — run the next query to compare");
+                self.persist_session();
+            }
+            None => self.status = Status::info("Run a query first, then pin its result"),
+        }
+        cx.notify();
     }
 
     pub(crate) fn run_all_queries(&mut self, cx: &mut Context<Self>) {
@@ -7088,6 +7103,9 @@ impl Render for DbUi {
                 .on_action(cx.listener(|this, _: &crate::ServerActivity, _window, cx| {
                     this.open_activity(cx)
                 }))
+                .on_action(
+                    cx.listener(|this, _: &crate::PinResult, _window, cx| this.pin_result(cx)),
+                )
                 .on_action(
                     cx.listener(|this, _: &crate::ErDiagram, _window, cx| this.open_er_diagram(cx)),
                 )

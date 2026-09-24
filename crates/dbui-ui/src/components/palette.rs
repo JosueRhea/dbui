@@ -63,6 +63,7 @@ enum ActionId {
     RunQuery,
     RunAllQueries,
     ExplainQuery,
+    PinResult,
     StopQuery,
     SaveQuery,
     OpenSavedQuery,
@@ -270,6 +271,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::ExplainQuery,
         label: "Explain Query",
         shortcut: Some("⌘⌥E"),
+        section: "Query",
+    },
+    ActionDef {
+        id: ActionId::PinResult,
+        label: "Pin Result",
+        shortcut: Some("⌘⌥P"),
         section: "Query",
     },
     ActionDef {
@@ -1012,6 +1019,9 @@ impl DbUi {
             ActionId::RefreshResult => connected && (is_table || is_sql),
             ActionId::RunQuery | ActionId::RunAllQueries | ActionId::ClearSql => is_sql,
             ActionId::ExplainQuery => is_sql && connected,
+            ActionId::PinResult => {
+                is_sql && self.tabs.active().and_then(|tab| tab.result()).is_some()
+            }
             ActionId::StopQuery => self.active_run_is_stoppable(),
             ActionId::SaveQuery => is_sql,
             ActionId::OpenSavedQuery => true,
@@ -1156,6 +1166,7 @@ impl DbUi {
             ActionId::RunQuery => self.run_query(cx),
             ActionId::RunAllQueries => self.run_all_queries(cx),
             ActionId::ExplainQuery => self.explain_query(cx),
+            ActionId::PinResult => self.pin_result(cx),
             ActionId::StopQuery => self.stop_query(cx),
             ActionId::SaveQuery => self.open_save_query(cx),
             ActionId::OpenSavedQuery => self.open_palette(PaletteKind::SavedQueries, cx),

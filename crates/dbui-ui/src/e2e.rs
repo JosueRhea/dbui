@@ -4483,6 +4483,57 @@ fn a_capped_result_exports_every_row(cx: &mut TestAppContext) {
     assert!(text.lines().last().unwrap().starts_with("12000,"));
 }
 
+/// A pinned result stays put while the query tab runs the next one; ⌘E and
+/// history go to the query tab, never the pinned one; and a pinned tab is
+/// not written to the session.
+#[gpui::test]
+fn a_pinned_result_survives_the_next_query(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "pin");
+    let first_cell = |view: &DbUi, index: usize| {
+        view.tabs.items[index]
+            .result()
+            .and_then(|r| r.set.rows.first())
+            .map(|row| row.0[0].to_text())
+    };
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT count(*) FROM members", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|t| t.result()).is_some()
+    });
+    cx.simulate_keystrokes("cmd-alt-p");
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.items.len(), 2);
+        assert!(view.tabs.items[1].is_pinned());
+        assert!(view.tabs.items[1]
+            .label()
+            .starts_with("Pinned · SELECT count"));
+        assert_eq!(view.tabs.active, 0, "the query tab stays in front");
+        assert_eq!(first_cell(view, 1).as_deref(), Some("2"));
+    });
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT 42", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        first_cell(view, 0).as_deref() == Some("42")
+    });
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            first_cell(view, 1).as_deref(),
+            Some("2"),
+            "the pin kept its rows"
+        );
+        view.activate_tab(1, cx);
+        view.open_sql_tab(cx);
+        assert_eq!(view.tabs.active, 0, "⌘E goes to the query tab, not the pin");
+        let (saved, _) = view.tabs.to_saved();
+        assert_eq!(saved.len(), 1, "the pin is not saved");
+    });
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]
