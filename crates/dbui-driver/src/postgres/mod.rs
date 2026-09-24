@@ -24,6 +24,9 @@ pub struct PostgresDriver {
     /// Connections kept with their session ids, for statements that may have
     /// to be cancelled. See `sessions`.
     sessions: Sessions<sqlx::Postgres>,
+    /// The SSH tunnel this pool dials through, when there is one. Held, never
+    /// read: dropping the driver is what closes it.
+    pub(crate) tunnel: Option<crate::tunnel::SshTunnel>,
 }
 
 impl PostgresDriver {
@@ -81,6 +84,7 @@ impl PostgresDriver {
         Ok(Self {
             pool,
             sessions: Sessions::new(),
+            tunnel: None,
             server_version: short_version(&server_version),
         })
     }

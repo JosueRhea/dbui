@@ -16,6 +16,9 @@ futures-util = { workspace = true }
 libsqlite3-sys = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+# Only its timer: the SSH tunnel waits for ssh's forward to come up without
+# holding a runtime thread. sqlx already runs on tokio, so this adds nothing.
+tokio = { workspace = true }
 
 # `tests/live.rs` needs a runtime of its own to await the adapters. It is the
 # only thing in this crate that does; the app supplies one in production.

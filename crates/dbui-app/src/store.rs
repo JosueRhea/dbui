@@ -3,7 +3,9 @@
 //! [`ConnectionConfig::password`] is `skip_serializing`, so
 //! `connections.json` holds hosts and usernames and nothing that grants
 //! access on its own. Passwords are stored under the service name `dbui`,
-//! keyed by connection id, and hydrated back into memory on load.
+//! keyed by connection id, and hydrated back into memory on load. An SSH
+//! tunnel's password is a second secret beside the first, under its own
+//! account, and goes through exactly the same rules.
 
 use dbui_domain::{ConnectionConfig, ConnectionId};
 use keyring::Entry;
@@ -233,20 +235,24 @@ pub fn load(path: &Path) -> Result<Vec<ConnectionConfig>, StoreError> {
     set_unloaded(path, false);
 
     for config in &mut configs {
-        match load_password(config.id) {
-            Ok(password) => {
-                config.password = password;
-                set_password_unread(config.id, false);
-            }
-            // A locked keychain, or a user who pressed Deny on the prompt,
-            // leaves us with no password for a connection that may well have
-            // one. The field has to be empty because there is nothing to put
-            // in it, so remember that the emptiness is ours and not the
-            // user's before `save` reads it as an instruction to delete.
-            Err(_) => {
-                config.password = String::new();
-                set_password_unread(config.id, true);
-            }
+        for secret in Secret::ALL {
+            let value = match load_secret(config.id, secret) {
+                Ok(password) => {
+                    set_secret_unread(config.id, secret, false);
+                    password
+                }
+                // A locked keychain, or a user who pressed Deny on the prompt,
+                // leaves us with no password for a connection that may well
+                // have one. The field has to be empty because there is nothing
+                // to put in it, so remember that the emptiness is ours and not
+                // the user's before `save` reads it as an instruction to
+                // delete.
+                Err(_) => {
+                    set_secret_unread(config.id, secret, true);
+                    String::new()
+                }
+            };
+            *secret.field_mut(config) = value;
         }
     }
 
@@ -286,16 +292,20 @@ pub fn save(path: &Path, configs: &[ConnectionConfig]) -> Result<(), StoreError>
     write_atomic(path, &text)?;
 
     for config in configs {
-        match password_sync(&config.password, password_unread(config.id)) {
-            PasswordSync::Keep => {}
-            PasswordSync::Delete => {
-                let _ = store_password(config.id, "");
-            }
-            PasswordSync::Set => {
-                // Having written it, we now know it, so a later empty field
-                // for this id is the user clearing it rather than our own gap.
-                if store_password(config.id, &config.password).is_ok() {
-                    set_password_unread(config.id, false);
+        for secret in Secret::ALL {
+            let value = secret.field(config);
+            match password_sync(value, secret_unread(config.id, secret)) {
+                PasswordSync::Keep => {}
+                PasswordSync::Delete => {
+                    let _ = store_secret(config.id, secret, "");
+                }
+                PasswordSync::Set => {
+                    // Having written it, we now know it, so a later empty
+                    // field for this id is the user clearing it rather than
+                    // our own gap.
+                    if store_secret(config.id, secret, value).is_ok() {
+                        set_secret_unread(config.id, secret, false);
+                    }
                 }
             }
         }
@@ -328,30 +338,71 @@ fn password_sync(password: &str, unread: bool) -> PasswordSync {
     }
 }
 
+/// The secrets one connection can keep in the keychain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Secret {
+    /// The database password.
+    Database,
+    /// The SSH tunnel's password or key passphrase.
+    Ssh,
+}
+
+impl Secret {
+    const ALL: [Secret; 2] = [Secret::Database, Secret::Ssh];
+
+    /// The keychain account. The database one keeps the name it had before
+    /// there was a second, so upgrading loses nobody's password.
+    fn account(self, id: ConnectionId) -> String {
+        match self {
+            Secret::Database => format!("connection-{id}"),
+            Secret::Ssh => format!("connection-{id}-ssh"),
+        }
+    }
+
+    fn field(self, config: &ConnectionConfig) -> &str {
+        match self {
+            Secret::Database => &config.password,
+            Secret::Ssh => &config.ssh.password,
+        }
+    }
+
+    fn field_mut(self, config: &mut ConnectionConfig) -> &mut String {
+        match self {
+            Secret::Database => &mut config.password,
+            Secret::Ssh => &mut config.ssh.password,
+        }
+    }
+}
+
 /// Connections whose password this process failed to read.
 ///
 /// Kept here rather than on `ConnectionConfig` because the flag is about this
 /// process's luck with the keychain, not about the connection: it must never
 /// reach disk, and it has to survive the config being cloned through the
 /// workspace and rebuilt by the connection form.
-static UNREAD_PASSWORDS: Mutex<BTreeSet<ConnectionId>> = Mutex::new(BTreeSet::new());
+static UNREAD_PASSWORDS: Mutex<BTreeSet<(ConnectionId, Secret)>> = Mutex::new(BTreeSet::new());
 
-fn set_password_unread(id: ConnectionId, unread: bool) {
+fn set_secret_unread(id: ConnectionId, secret: Secret, unread: bool) {
     let mut ids = UNREAD_PASSWORDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if unread {
-        ids.insert(id);
+        ids.insert((id, secret));
     } else {
-        ids.remove(&id);
+        ids.remove(&(id, secret));
     }
 }
 
-fn password_unread(id: ConnectionId) -> bool {
+fn secret_unread(id: ConnectionId, secret: Secret) -> bool {
     UNREAD_PASSWORDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(&id)
+        .contains(&(id, secret))
+}
+
+#[cfg(test)]
+fn set_password_unread(id: ConnectionId, unread: bool) {
+    set_secret_unread(id, Secret::Database, unread);
 }
 
 /// Files whose last [`load`] failed, and which [`save`] must therefore leave
@@ -419,19 +470,32 @@ fn delete_password_at(connections: &Path, id: ConnectionId) -> bool {
     if is_unloaded(connections) {
         return false;
     }
-    let Ok(entry) = password_entry(id) else {
-        return false;
-    };
-    let _ = entry.delete_credential();
-    true
+    let mut reached = false;
+    for secret in Secret::ALL {
+        if let Ok(entry) = secret_entry(id, secret) {
+            let _ = entry.delete_credential();
+            reached = true;
+        }
+    }
+    reached
 }
 
-fn password_entry(id: ConnectionId) -> keyring::Result<Entry> {
-    Entry::new(KEYCHAIN_SERVICE, &format!("connection-{id}"))
+fn secret_entry(id: ConnectionId, secret: Secret) -> keyring::Result<Entry> {
+    Entry::new(KEYCHAIN_SERVICE, &secret.account(id))
 }
 
+#[cfg(test)]
 fn store_password(id: ConnectionId, password: &str) -> keyring::Result<()> {
-    let entry = password_entry(id)?;
+    store_secret(id, Secret::Database, password)
+}
+
+#[cfg(test)]
+fn load_password(id: ConnectionId) -> keyring::Result<String> {
+    load_secret(id, Secret::Database)
+}
+
+fn store_secret(id: ConnectionId, secret: Secret, password: &str) -> keyring::Result<()> {
+    let entry = secret_entry(id, secret)?;
     if password.is_empty() {
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -442,8 +506,8 @@ fn store_password(id: ConnectionId, password: &str) -> keyring::Result<()> {
     }
 }
 
-fn load_password(id: ConnectionId) -> keyring::Result<String> {
-    match password_entry(id)?.get_password() {
+fn load_secret(id: ConnectionId, secret: Secret) -> keyring::Result<String> {
+    match secret_entry(id, secret)?.get_password() {
         Ok(password) => Ok(password),
         Err(keyring::Error::NoEntry) => Ok(String::new()),
         Err(error) => Err(error),

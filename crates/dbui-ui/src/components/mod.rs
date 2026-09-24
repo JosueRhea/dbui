@@ -7,7 +7,7 @@
 
 mod change_bubble;
 pub(crate) mod close_guard;
-mod connection_form;
+pub(crate) mod connection_form;
 pub(crate) mod context_menu;
 mod detail_sidebar;
 mod drag_ghost;

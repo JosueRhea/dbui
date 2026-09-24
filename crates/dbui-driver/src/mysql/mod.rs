@@ -24,6 +24,9 @@ pub struct MySqlDriver {
     /// Connections kept with their session ids, for statements that may have
     /// to be cancelled. See `sessions`.
     sessions: Sessions<sqlx::MySql>,
+    /// The SSH tunnel this pool dials through, when there is one. Held, never
+    /// read: dropping the driver is what closes it.
+    pub(crate) tunnel: Option<crate::tunnel::SshTunnel>,
 }
 
 impl MySqlDriver {
@@ -79,6 +82,7 @@ impl MySqlDriver {
         Ok(Self {
             pool,
             sessions: Sessions::new(),
+            tunnel: None,
             server_version: format!("MySQL {server_version}"),
         })
     }

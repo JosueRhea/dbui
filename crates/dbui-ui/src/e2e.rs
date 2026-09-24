@@ -21,6 +21,7 @@
 //! For the engines' own behaviour, under the UI, see
 //! `crates/dbui-driver/tests/live.rs`.
 
+use crate::components::connection_form::Field;
 use crate::root::{DbUi, Focus, Status};
 use crate::tabs::WorkspaceTab;
 use dbui_app::domain::{ConnectionConfig, Driver, TableRef};
@@ -233,6 +234,90 @@ fn tab_skips_the_fields_an_engine_hides(cx: &mut TestAppContext) {
     view.update(cx, |view, _| {
         assert_eq!(view.modal.as_ref().unwrap().to_config().name, "Local");
     });
+}
+
+/// Ticking the tunnel shows its fields and moves into the first of them;
+/// Tab walks them; unticking hides them again but keeps what was typed.
+#[gpui::test]
+fn the_ssh_tunnel_fields_open_with_the_toggle(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        let form = view.modal.as_mut().unwrap();
+        assert!(!form.shows(Field::SshHost), "hidden until asked for");
+        form.toggle_ssh();
+        assert!(form.shows(Field::SshHost));
+        cx.notify();
+    });
+
+    cx.simulate_keystrokes(&typing("bastion.example.com"));
+    // SSH port, then SSH user.
+    cx.simulate_keystrokes("tab tab");
+    cx.simulate_keystrokes(&typing("deploy"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert!(config.uses_ssh());
+        assert_eq!(config.ssh.host, "bastion.example.com");
+        assert_eq!(config.ssh.port, 22);
+        assert_eq!(config.ssh.username, "deploy");
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    });
+
+    view.update(cx, |view, cx| {
+        let form = view.modal.as_mut().unwrap();
+        form.toggle_ssh();
+        assert!(!form.shows(Field::SshHost));
+        let config = form.to_config();
+        assert!(!config.uses_ssh());
+        assert_eq!(config.ssh.host, "bastion.example.com", "kept for next time");
+        cx.notify();
+    });
+    // Focus left the hidden field, so typing lands somewhere visible.
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("Prod"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.modal.as_ref().unwrap().to_config().name, "Prod");
+    });
+}
+
+/// A switched-on tunnel with no host is a complaint, not a dial.
+#[gpui::test]
+fn an_ssh_tunnel_without_a_host_is_refused(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().toggle_ssh();
+        view.save_connection(cx);
+        let form = view.modal.as_ref().expect("still open");
+        assert!(form.has_problem());
+    });
+}
+
+/// SQLite has no server, so it has no tunnel to offer either.
+#[gpui::test]
+fn a_file_engine_hides_the_tunnel(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, _| {
+        let form = view.modal.as_mut().unwrap();
+        form.toggle_ssh();
+        form.set_driver(Driver::Sqlite);
+        assert!(!form.ssh_enabled());
+        assert!(!form.shows(Field::SshHost));
+    });
+}
+
+/// The sheet with every tunnel field open still paints at every size.
+#[gpui::test]
+fn the_sheet_with_a_tunnel_draws(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().toggle_ssh();
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
 }
 
 /// A path longer than the box pans under the caret; the box and the sheet

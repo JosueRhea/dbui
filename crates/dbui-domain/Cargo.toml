@@ -11,3 +11,6 @@ description = "Database-agnostic domain model: connections, catalog, values, res
 # runtime and no UI toolkit in this crate.
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

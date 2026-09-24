@@ -20,6 +20,11 @@ transaction; `⌘Z` throws it away. With several rows selected, the panel on the
 edits all of them at once — `MIXED` marks a column they disagree on, and a field left
 reading `MIXED` is written to nobody.
 
+**Through a bastion.** Tick *Tunnel* on a connection to reach it through an SSH
+server. It runs your own `ssh`, so `~/.ssh/config`, the agent and `known_hosts`
+all apply; a password or key passphrase is kept in the keychain beside the
+database one. TablePlus connections that go over SSH import with their tunnel.
+
 **SQL, with the catalog behind it.** `⌘↵` runs the statement under the caret, `⌘⇧↵`
 runs every statement in the buffer, and `⌃Space` completes against the schemas, tables
 and columns the connection actually has. Results land in the same typed grid, timed.

@@ -165,6 +165,81 @@ impl fmt::Display for ConnectionId {
     }
 }
 
+/// A hop through an SSH server to reach a database that only it can see.
+///
+/// The usual shape of a production database: it listens on a private network,
+/// and the one way in is a bastion host. The tunnel forwards a local port to
+/// the database's `host:port` *as the bastion resolves them*, so the
+/// connection's own host is typically a private name or address.
+///
+/// Kept whole while switched off, so unticking the box to try a direct
+/// connection does not throw away what was typed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "SshConfig::default_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    /// A private key file. Empty means whatever `ssh` would use on its own:
+    /// the agent, then `~/.ssh/config`, then the default key names.
+    #[serde(default)]
+    pub key_path: String,
+    /// The SSH password, or the key's passphrase -- `ssh` asks for whichever
+    /// it needs, and this is the answer to either. Never written to the
+    /// connections file; the keychain holds it, like the database password.
+    #[serde(default, skip_serializing)]
+    pub password: String,
+}
+
+impl SshConfig {
+    pub const DEFAULT_PORT: u16 = 22;
+
+    fn default_port() -> u16 {
+        Self::DEFAULT_PORT
+    }
+
+    /// `user@host:port`, for the sidebar subtitle.
+    pub fn summary(&self) -> String {
+        let mut s = String::new();
+        if !self.username.is_empty() {
+            s.push_str(&self.username);
+            s.push('@');
+        }
+        s.push_str(&self.host);
+        if self.port != Self::DEFAULT_PORT {
+            s.push(':');
+            s.push_str(&self.port.to_string());
+        }
+        s
+    }
+
+    fn validate(&self, problems: &mut Vec<&'static str>) {
+        if self.host.trim().is_empty() {
+            problems.push("SSH host is required");
+        }
+        if self.port == 0 {
+            problems.push("SSH port must be greater than zero");
+        }
+    }
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: Self::DEFAULT_PORT,
+            username: String::new(),
+            key_path: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
 /// Everything needed to open a connection, plus the name shown in the sidebar.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
@@ -198,6 +273,10 @@ pub struct ConnectionConfig {
     /// written before this existed loads as -- waits for as long as it takes.
     #[serde(default)]
     pub query_timeout_secs: u32,
+    /// Reach the server through an SSH tunnel. Ignored by file-based engines.
+    /// `default` so a connections file written before tunnels existed loads.
+    #[serde(default)]
+    pub ssh: SshConfig,
 }
 
 impl ConnectionConfig {
@@ -219,7 +298,13 @@ impl ConnectionConfig {
             tls: TlsMode::default(),
             read_only: false,
             query_timeout_secs: 0,
+            ssh: SshConfig::default(),
         }
+    }
+
+    /// Whether opening this connection means dialing an SSH server first.
+    pub fn uses_ssh(&self) -> bool {
+        self.ssh.enabled && !self.driver.is_file_based()
     }
 
     /// `user@host:port/database`, for the sidebar subtitle and the status bar.
@@ -237,6 +322,10 @@ impl ConnectionConfig {
         if !self.database.is_empty() {
             s.push('/');
             s.push_str(&self.database);
+        }
+        if self.uses_ssh() && !self.ssh.host.is_empty() {
+            s.push_str(" via ");
+            s.push_str(&self.ssh.host);
         }
         s
     }
@@ -270,6 +359,9 @@ impl ConnectionConfig {
         if self.driver == Driver::Postgres && self.database.trim().is_empty() {
             problems.push("PostgreSQL requires a database name");
         }
+        if self.uses_ssh() {
+            self.ssh.validate(&mut problems);
+        }
         problems
     }
 }
@@ -296,6 +388,13 @@ mod tests {
 
         config.port = 6543;
         assert_eq!(config.summary(), "postgres@db.internal:6543/shop");
+
+        config.ssh.enabled = true;
+        config.ssh.host = "bastion".into();
+        assert_eq!(
+            config.summary(),
+            "postgres@db.internal:6543/shop via bastion"
+        );
     }
 
     #[test]
@@ -315,5 +414,41 @@ mod tests {
             .validate()
             .is_empty());
         assert!(ConnectionConfig::new(Driver::MySql).validate().is_empty());
+    }
+
+    #[test]
+    fn a_tunnel_needs_a_host_only_when_it_is_switched_on() {
+        let mut config = ConnectionConfig::new(Driver::Postgres);
+        config.ssh.host = String::new();
+        assert!(config.validate().is_empty());
+
+        config.ssh.enabled = true;
+        assert_eq!(config.validate(), vec!["SSH host is required"]);
+
+        config.ssh.host = "bastion.example.com".into();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn a_file_never_goes_through_a_tunnel() {
+        let mut config = ConnectionConfig::new(Driver::Sqlite);
+        config.ssh.enabled = true;
+        assert!(!config.uses_ssh());
+    }
+
+    #[test]
+    fn a_file_written_before_tunnels_loads_without_one() {
+        let json = r#"{"id":1,"name":"a","driver":"postgres","host":"h","port":5432,
+            "username":"u","database":"d"}"#;
+        let config: ConnectionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ssh, SshConfig::default());
+    }
+
+    #[test]
+    fn the_ssh_password_never_reaches_the_file() {
+        let mut config = ConnectionConfig::new(Driver::Postgres);
+        config.ssh.password = "hunter2".into();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("hunter2"));
     }
 }

@@ -183,6 +183,22 @@ in front dials out; the rest connect when clicked. Coming back from lunch is
 not a reason to reach for every server the user has ever saved, including the
 production one they left open last week.
 
+**SSH tunnels use the system `ssh`, not a library.** A tunnel is
+`ssh -N -L 127.0.0.1:<free port>:<db host>:<db port> <bastion>`, and the
+adapter that connected through it owns the child process, so dropping the
+driver closes the tunnel. The system client is the one that already honours
+the user's `~/.ssh/config` (`ProxyJump`, `IdentityFile`), agent, hardware keys
+and `known_hosts`; a linked-in library would honour none of it. A password or
+key passphrase reaches `ssh` through `SSH_ASKPASS`: a helper script in a
+`0700` temp directory that prints the secret from its environment, never from
+its arguments or its file. Host keys are trusted on first use
+(`StrictHostKeyChecking=accept-new`) because there is no terminal to ask in,
+and a *changed* key is still refused. The tunnel counts as up when ssh logs
+"Local forwarding listening", not when the port accepts: anything between
+the app and loopback that accepts connections -- a proxy, a firewall agent --
+answers a probe before ssh does. `tests/ssh.rs` proves it against a real
+`sshd`, opt-in behind `DBUI_SSH_TESTS=1`.
+
 **`DBUI_CONFIG_DIR` overrides the configuration directory.** It is what lets a
 second profile exist side by side, and what keeps the UI tests — which persist
 a session as they click around — out of the developer's own configuration.

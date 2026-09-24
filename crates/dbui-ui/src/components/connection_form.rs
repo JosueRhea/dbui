@@ -21,6 +21,12 @@ pub enum Field {
     Database,
     /// Seconds before a statement is stopped. Blank for no limit.
     Timeout,
+    SshHost,
+    SshPort,
+    SshUser,
+    /// A private key file; blank for the agent and `~/.ssh/config`.
+    SshKey,
+    SshPassword,
 }
 
 impl Field {
@@ -36,8 +42,16 @@ impl Field {
         matches!(self, Field::Name | Field::Database | Field::Timeout)
     }
 
+    /// Part of the SSH tunnel, drawn only while the tunnel is switched on.
+    pub fn is_ssh(self) -> bool {
+        matches!(
+            self,
+            Field::SshHost | Field::SshPort | Field::SshUser | Field::SshKey | Field::SshPassword
+        )
+    }
+
     /// Tab order, which is also the order they are drawn in.
-    pub const ORDER: [Field; 7] = [
+    pub const ORDER: [Field; 12] = [
         Field::Name,
         Field::Host,
         Field::Port,
@@ -45,6 +59,11 @@ impl Field {
         Field::Password,
         Field::Database,
         Field::Timeout,
+        Field::SshHost,
+        Field::SshPort,
+        Field::SshUser,
+        Field::SshKey,
+        Field::SshPassword,
     ];
 
     pub fn label(self) -> &'static str {
@@ -56,6 +75,11 @@ impl Field {
             Field::Password => "Password",
             Field::Database => "Database",
             Field::Timeout => "Timeout",
+            Field::SshHost => "SSH host",
+            Field::SshPort => "SSH port",
+            Field::SshUser => "SSH user",
+            Field::SshKey => "Key file",
+            Field::SshPassword => "SSH pass",
         }
     }
 
@@ -63,13 +87,16 @@ impl Field {
     fn placeholder(self) -> Option<&'static str> {
         match self {
             Field::Timeout => Some("None · seconds"),
+            Field::SshUser => Some("From ~/.ssh/config"),
+            Field::SshKey => Some("Agent · ~/.ssh/config"),
+            Field::SshPassword => Some("Password or key passphrase"),
             _ => None,
         }
     }
 
     /// Passwords render as bullets.
     fn is_secret(self) -> bool {
-        matches!(self, Field::Password)
+        matches!(self, Field::Password | Field::SshPassword)
     }
 }
 
@@ -182,7 +209,41 @@ impl ConnectionForm {
         // Anything that is not a whole number of seconds is no limit, which
         // is what an empty field says too.
         config.query_timeout_secs = self.text(Field::Timeout).trim().parse().unwrap_or(0);
+        config.ssh.host = self.text(Field::SshHost).trim().to_string();
+        // Same rule as the database port: half-typed is the default, not zero.
+        config.ssh.port = self
+            .text(Field::SshPort)
+            .trim()
+            .parse()
+            .unwrap_or(dbui_app::domain::SshConfig::DEFAULT_PORT);
+        config.ssh.username = self.text(Field::SshUser).trim().to_string();
+        config.ssh.key_path = self.text(Field::SshKey).trim().to_string();
+        config.ssh.password = self.text(Field::SshPassword).to_string();
         config
+    }
+
+    /// Whether `field` is drawn -- and so whether Tab may land in it.
+    pub fn shows(&self, field: Field) -> bool {
+        field.applies_to(self.config.driver) && (!field.is_ssh() || self.ssh_enabled())
+    }
+
+    /// Whether the tunnel is switched on, for an engine that can use one.
+    pub fn ssh_enabled(&self) -> bool {
+        self.config.ssh.enabled && !self.config.driver.is_file_based()
+    }
+
+    /// Switching the tunnel off keeps what was typed in its fields, so
+    /// trying a direct connection and coming back costs nothing.
+    pub fn toggle_ssh(&mut self) {
+        self.config.ssh.enabled = !self.config.ssh.enabled;
+        if self.config.ssh.enabled {
+            self.focus(Field::SshHost);
+        } else if Field::ORDER
+            .get(self.focused)
+            .is_some_and(|field| field.is_ssh())
+        {
+            self.focus(Field::Name);
+        }
     }
 
     pub fn driver(&self) -> Driver {
@@ -244,7 +305,7 @@ impl ConnectionForm {
         // Focus never stays in a field the new engine hides.
         if Field::ORDER
             .get(self.focused)
-            .is_some_and(|field| !field.applies_to(driver))
+            .is_some_and(|field| !self.shows(*field))
         {
             self.focus(Field::Name);
         }
@@ -278,7 +339,7 @@ impl ConnectionForm {
                 self.focused = (self.focused + step) % count;
                 let hidden = Field::ORDER
                     .get(self.focused)
-                    .is_some_and(|field| !field.applies_to(self.config.driver));
+                    .is_some_and(|field| !self.shows(*field));
                 if !hidden {
                     break;
                 }
@@ -335,6 +396,11 @@ fn field_value(config: &ConnectionConfig, field: Field) -> String {
             0 => String::new(),
             seconds => seconds.to_string(),
         },
+        Field::SshHost => config.ssh.host.clone(),
+        Field::SshPort => config.ssh.port.to_string(),
+        Field::SshUser => config.ssh.username.clone(),
+        Field::SshKey => config.ssh.key_path.clone(),
+        Field::SshPassword => config.ssh.password.clone(),
     }
 }
 
@@ -352,11 +418,12 @@ impl DbUi {
         };
 
         let engine = form.config.driver;
-        let rows: Vec<_> = Field::ORDER
+        let (ssh_rows, rows): (Vec<_>, Vec<_>) = Field::ORDER
             .iter()
             .enumerate()
-            // A file-based engine has no host, port, user or password.
-            .filter(|(_, field)| field.applies_to(engine))
+            // A file-based engine has no host, port, user or password, and a
+            // switched-off tunnel has no fields at all.
+            .filter(|(_, field)| form.shows(**field))
             .map(|(index, field)| {
                 let focused = form.focused == index;
                 let input = &form.fields[index];
@@ -372,7 +439,7 @@ impl DbUi {
                 let scroll_x = input.scroll_handle().offset().x;
                 let field = *field;
 
-                div()
+                let row = div()
                     .flex()
                     .items_center()
                     .gap_3()
@@ -509,9 +576,12 @@ impl DbUi {
                                     cx.notify();
                                 }),
                             ),
-                    )
+                    );
+                (field.is_ssh(), row)
             })
-            .collect();
+            .partition(|(is_ssh, _)| *is_ssh);
+        let rows: Vec<_> = rows.into_iter().map(|(_, row)| row).collect();
+        let ssh_rows: Vec<_> = ssh_rows.into_iter().map(|(_, row)| row).collect();
 
         let driver_choice = div()
             .flex()
@@ -597,68 +667,41 @@ impl DbUi {
             })));
 
         let read_only = form.read_only();
-        let read_only_choice = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                div()
-                    .w(metrics::scaled(72.))
-                    .flex_shrink_0()
-                    .text_color(theme.text_muted)
-                    .child("Access"),
+        let read_only_choice = labelled(
+            "Access",
+            toggle_box(
+                "read-only-toggle",
+                read_only,
+                theme.warning,
+                "Read only — refuse every write",
+                theme,
             )
-            .child(
-                div()
-                    .id("read-only-toggle")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .h(metrics::control_height())
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(if read_only {
-                        theme.elevated
-                    } else {
-                        theme.background
-                    })
-                    .border_1()
-                    .border_color(if read_only {
-                        theme.warning
-                    } else {
-                        theme.border
-                    })
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        if let Some(form) = this.modal.as_mut() {
-                            form.toggle_read_only();
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .w(metrics::scaled(12.))
-                            .h(metrics::scaled(12.))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(if read_only {
-                                theme.warning
-                            } else {
-                                gpui::rgba(0x00000000)
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_size(metrics::scaled(11.))
-                            .text_color(if read_only {
-                                theme.text
-                            } else {
-                                theme.text_faint
-                            })
-                            .child("Read only — refuse every write"),
-                    ),
-            );
+            .on_click(cx.listener(|this, _, _window, cx| {
+                if let Some(form) = this.modal.as_mut() {
+                    form.toggle_read_only();
+                }
+                cx.notify();
+            })),
+            theme,
+        );
+
+        let ssh_choice = labelled(
+            "Tunnel",
+            toggle_box(
+                "ssh-toggle",
+                form.ssh_enabled(),
+                theme.accent,
+                "Connect through an SSH server",
+                theme,
+            )
+            .on_click(cx.listener(|this, _, _window, cx| {
+                if let Some(form) = this.modal.as_mut() {
+                    form.toggle_ssh();
+                }
+                cx.notify();
+            })),
+            theme,
+        );
 
         let message = form.message.as_ref().map(|(ok, text)| {
             div()
@@ -691,6 +734,11 @@ div()
                 div()
                     .id("modal-sheet")
                     .w(metrics::scaled(420.))
+                    // With the tunnel's fields open the sheet is tall; on a
+                    // short window it scrolls rather than losing its buttons
+                    // off the bottom.
+                    .max_h(gpui::relative(0.92))
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -706,8 +754,11 @@ div()
                     .child(div().text_size(metrics::scaled(15.)).child(title))
                     .child(driver_choice)
                     .children(rows)
-                    // A local file has no transport to encrypt.
-                    .when(!engine.is_file_based(), |sheet| sheet.child(tls_choice))
+                    // A local file has no transport to encrypt, and no server
+                    // to tunnel to.
+                    .when(!engine.is_file_based(), |sheet| {
+                        sheet.child(tls_choice).child(ssh_choice).children(ssh_rows)
+                    })
                     .child(read_only_choice)
                     .child(caption(
                         "Passwords are kept for this session only and are never written to disk.",
@@ -797,6 +848,59 @@ px(0.),
 )
             .into_any_element()
     }
+}
+
+/// A row with the sheet's left-hand label.
+fn labelled(label: &'static str, control: impl IntoElement, theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .w(metrics::scaled(72.))
+                .flex_shrink_0()
+                .text_color(theme.text_muted)
+                .child(label),
+        )
+        .child(control)
+}
+
+/// A checkbox and its caption, as one click target.
+fn toggle_box(
+    id: &'static str,
+    on: bool,
+    on_color: gpui::Rgba,
+    text: &'static str,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .h(metrics::control_height())
+        .rounded_md()
+        .cursor_pointer()
+        .bg(if on { theme.elevated } else { theme.background })
+        .border_1()
+        .border_color(if on { on_color } else { theme.border })
+        .child(
+            div()
+                .w(metrics::scaled(12.))
+                .h(metrics::scaled(12.))
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .bg(if on { on_color } else { gpui::rgba(0x00000000) }),
+        )
+        .child(
+            div()
+                .text_size(metrics::scaled(11.))
+                .text_color(if on { theme.text } else { theme.text_faint })
+                .child(text),
+        )
 }
 
 /// Draw a field's text with the caret and selection in it.
