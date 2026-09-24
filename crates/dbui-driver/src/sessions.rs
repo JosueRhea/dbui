@@ -15,6 +15,14 @@
 //!
 //! A kept connection used in the last half minute goes straight back to work,
 //! skipping even the liveness ping the pool itself sends on every acquire.
+//!
+//! One connection is set apart from the rest: the console, which every
+//! statement typed into the SQL editor runs on. A session carries state --
+//! an open transaction above all, but also `SET`s and temporary tables -- and
+//! a `BEGIN` in one run means nothing if the `UPDATE` in the next lands on a
+//! different connection. Kept apart, the user's transaction also never leaks
+//! into the page loads that borrow the other connections, and the console is
+//! never closed for being quiet, which would roll that transaction back.
 
 use sqlx::{Connection, Database, Pool};
 use std::future::Future;
@@ -49,13 +57,42 @@ struct Idle<DB: Database> {
 /// The cache itself. One per driver, beside its pool.
 pub(crate) struct Sessions<DB: Database> {
     idle: Mutex<Vec<Idle<DB>>>,
+    /// The editor's own connection, while it is not running anything.
+    console: Mutex<Option<Idle<DB>>>,
 }
 
 impl<DB: SessionId> Sessions<DB> {
     pub(crate) fn new() -> Self {
         Self {
             idle: Mutex::new(Vec::new()),
+            console: Mutex::new(None),
         }
+    }
+
+    /// The console connection: the same session the editor used last, so
+    /// whatever it left open is still open. See the module docs.
+    ///
+    /// Not closed for age the way the others are -- that is exactly the
+    /// rollback this exists to avoid. Only a connection that no longer
+    /// answers is replaced, and then there is nothing left to keep.
+    pub(crate) async fn acquire_console(
+        &self,
+        pool: &Pool<DB>,
+    ) -> Result<Lease<'_, DB>, sqlx::Error> {
+        let kept = self.console.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(mut idle) = kept {
+            if idle.since.elapsed() <= FRESH || idle.conn.ping().await.is_ok() {
+                return Ok(Lease {
+                    conn: Some(idle.conn),
+                    session: idle.session,
+                    home: self,
+                    console: true,
+                });
+            }
+        }
+        let mut lease = self.fresh(pool).await?;
+        lease.console = true;
+        Ok(lease)
     }
 
     /// A connection and its session id, from the cache if one is there and
@@ -77,9 +114,14 @@ impl<DB: SessionId> Sessions<DB> {
                 conn: Some(idle.conn),
                 session: idle.session,
                 home: self,
+                console: false,
             });
         }
+        self.fresh(pool).await
+    }
 
+    /// A connection straight out of `pool`, with its session id learned.
+    async fn fresh(&self, pool: &Pool<DB>) -> Result<Lease<'_, DB>, sqlx::Error> {
         // Detached rather than held: the pool's own capacity stays for the
         // untracked calls, and this one is ours to keep or close.
         let mut conn = pool.acquire().await?.detach();
@@ -88,6 +130,7 @@ impl<DB: SessionId> Sessions<DB> {
             conn: Some(conn),
             session,
             home: self,
+            console: false,
         })
     }
 
@@ -98,7 +141,8 @@ impl<DB: SessionId> Sessions<DB> {
             .lock()
             .map(|mut idle| std::mem::take(&mut *idle))
             .unwrap_or_default();
-        for entry in idle {
+        let console = self.console.lock().ok().and_then(|mut slot| slot.take());
+        for entry in idle.into_iter().chain(console) {
             let _ = entry.conn.close().await;
         }
     }
@@ -112,6 +156,8 @@ pub(crate) struct Lease<'a, DB: Database> {
     conn: Option<DB::Connection>,
     session: u64,
     home: &'a Sessions<DB>,
+    /// Goes back to the console slot rather than among the idle.
+    console: bool,
 }
 
 impl<DB: Database> Lease<'_, DB> {
@@ -143,13 +189,22 @@ impl<DB: Database> Lease<'_, DB> {
         if !reusable {
             return;
         }
-        if let Ok(mut idle) = self.home.idle.lock() {
-            if idle.len() < KEEP {
-                idle.push(Idle {
-                    conn,
-                    session: self.session,
-                    since: Instant::now(),
-                });
+        let idle = Idle {
+            conn,
+            session: self.session,
+            since: Instant::now(),
+        };
+        if self.console {
+            // Only one editor runs at a time; should a second console lease
+            // ever come back to a full slot, the one already there stays.
+            if let Ok(mut slot) = self.home.console.lock() {
+                slot.get_or_insert(idle);
+            }
+            return;
+        }
+        if let Ok(mut kept) = self.home.idle.lock() {
+            if kept.len() < KEEP {
+                kept.push(idle);
             }
         }
     }

@@ -402,13 +402,49 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        self.execute_tracked(sql, &QueryToken::new()).await
+        self.run_statement(sql, &QueryToken::new(), false).await
     }
 
     async fn execute_tracked(&self, sql: &str, token: &QueryToken) -> Result<QueryResult> {
-        // On a connection of its own, held for the whole statement, so the
-        // session noted in `token` is the session the statement runs on.
-        let mut lease = self.lease(sql).await?;
+        // The editor's statements, which share one session across runs.
+        self.run_statement(sql, token, true).await
+    }
+
+    async fn cancel(&self, token: &QueryToken) -> Result<bool> {
+        let Some(session) = token.session() else {
+            return Ok(false);
+        };
+        sqlx::query("SELECT pg_cancel_backend($1)")
+            .bind(session as i32)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| DriverError::query("pg_cancel_backend", &error))?;
+        Ok(true)
+    }
+
+    async fn close(&self) {
+        self.sessions.close().await;
+        self.pool.close().await;
+    }
+}
+
+impl PostgresDriver {
+    /// One statement as typed, on the console connection when `console` --
+    /// see `sessions` -- or on any kept one otherwise. Either way on a
+    /// connection held for the whole statement, so the session noted in
+    /// `token` is the session the statement runs on.
+    async fn run_statement(
+        &self,
+        sql: &str,
+        token: &QueryToken,
+        console: bool,
+    ) -> Result<QueryResult> {
+        let leased = if console {
+            self.sessions.acquire_console(&self.pool).await
+        } else {
+            self.sessions.acquire(&self.pool).await
+        };
+        let mut lease = leased.map_err(|error| DriverError::query(sql, &error))?;
         let tracking = token.track(lease.session());
 
         let started = Instant::now();
@@ -449,23 +485,6 @@ impl DatabaseDriver for PostgresDriver {
                 elapsed: started.elapsed(),
             },
         })
-    }
-
-    async fn cancel(&self, token: &QueryToken) -> Result<bool> {
-        let Some(session) = token.session() else {
-            return Ok(false);
-        };
-        sqlx::query("SELECT pg_cancel_backend($1)")
-            .bind(session as i32)
-            .execute(&self.pool)
-            .await
-            .map_err(|error| DriverError::query("pg_cancel_backend", &error))?;
-        Ok(true)
-    }
-
-    async fn close(&self) {
-        self.sessions.close().await;
-        self.pool.close().await;
     }
 }
 

@@ -1307,6 +1307,63 @@ both_engines!(
     }
 );
 
+// The editor's statements share one session across runs, so a transaction
+// opened in one run is still open in the next -- and it stays the editor's:
+// the page loads and one-off statements that borrow the other connections
+// never land inside it.
+both_engines!(
+    an_editor_transaction_spans_runs_and_stays_private,
+    |fx: Fixture| async move {
+        let driver = fx.driver();
+        let people = format!(
+            "{}.{}",
+            driver.quote_identifier(fx.schema()),
+            driver.quote_identifier("people")
+        );
+        let token = dbui_driver::QueryToken::new();
+        let editor = |sql: String| {
+            let token = &token;
+            let fx = &fx;
+            async move {
+                fx.execute_tracked(&sql, token)
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}\n{error}"))
+            }
+        };
+        let name = |result: dbui_domain::QueryResult| match result.outcome {
+            QueryOutcome::Rows(set) => set.rows[0].0[0].to_text(),
+            other => panic!("expected a row, got {other:?}"),
+        };
+        let read = format!("SELECT name FROM {people} WHERE id = 1");
+
+        editor("BEGIN".into()).await;
+        editor(format!("UPDATE {people} SET name = 'Changed' WHERE id = 1")).await;
+
+        // Elsewhere, the change is not there yet.
+        let outside = fx.execute(&read).await.expect("a one-off read");
+        assert_eq!(name(outside), "Ada", "an uncommitted change stays private");
+        let page = fx
+            .table_rows(&fx.people(), Page::first(), "id = 1", &[])
+            .await
+            .expect("a page load");
+        assert_eq!(
+            page.rows[0].0[1].to_text(),
+            "Ada",
+            "a page load is outside it too"
+        );
+
+        // In the editor it is, because the next run is the same session.
+        assert_eq!(name(editor(read.clone()).await), "Changed");
+
+        editor("ROLLBACK".into()).await;
+        assert_eq!(
+            name(editor(read.clone()).await),
+            "Ada",
+            "and it rolled back"
+        );
+    }
+);
+
 // Changing a table's shape, end to end, with the statements the structure
 // editor shows before it runs them.
 both_engines!(
