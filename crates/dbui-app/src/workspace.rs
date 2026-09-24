@@ -512,7 +512,7 @@ mod tests {
 /// The connection list in folders: ungrouped connections first, in their own
 /// order, then each group in the order its first member appears, members in
 /// their own order. `Some(name)` marks where a folder starts.
-pub fn grouped<'a>(entries: &'a [ConnectionEntry]) -> Vec<(Option<&'a str>, &'a ConnectionEntry)> {
+pub fn grouped(entries: &[ConnectionEntry]) -> Vec<(Option<&str>, &ConnectionEntry)> {
     let mut out: Vec<(Option<&str>, &ConnectionEntry)> = entries
         .iter()
         .filter(|entry| entry.config.group.trim().is_empty())
