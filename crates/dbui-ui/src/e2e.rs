@@ -209,6 +209,67 @@ fn switching_to_a_file_engine_does_not_carry_the_database_over(cx: &mut TestAppC
     });
 }
 
+/// Tab walks the fields the sheet shows. On a SQLite sheet it went from Name
+/// into the hidden Host box, and what was typed next vanished.
+#[gpui::test]
+fn tab_skips_the_fields_an_engine_hides(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().set_driver(Driver::Sqlite);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("app.db"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert_eq!(config.database, "app.db", "typed into File");
+        assert_eq!(config.host, "localhost", "not into the hidden Host");
+    });
+    // And back again, past them the other way.
+    cx.simulate_keystrokes("shift-tab");
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("Local"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.modal.as_ref().unwrap().to_config().name, "Local");
+    });
+}
+
+/// A path longer than the box pans under the caret; the box and the sheet
+/// keep their width. It used to run out past the sheet's edge.
+#[gpui::test]
+fn a_long_file_path_pans_instead_of_widening_the_sheet(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().set_driver(Driver::Sqlite);
+        cx.notify();
+    });
+    cx.simulate_keystrokes("tab");
+    // Painted once, so the field knows how wide it is.
+    cx.run_until_parked();
+    let path = format!("{}app.db", "/a/rather/long/directory".repeat(6));
+    cx.simulate_keystrokes(&typing(&path));
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    view.update(cx, |view, _| {
+        let form = view.modal.as_mut().unwrap();
+        assert_eq!(form.to_config().database, path);
+        let field = form.field_mut(5).unwrap();
+        let box_width = field.hit_bounds_slot().get().expect("painted").size.width;
+        let text_width = gpui::px(path.chars().count() as f32 * crate::text_input::char_width());
+        assert!(box_width < text_width, "the path is longer than the box");
+        assert!(
+            box_width < crate::theme::metrics::scaled(420.),
+            "and the box is still inside the sheet: {box_width:?}"
+        );
+        assert!(
+            field.scroll_handle().offset().x < gpui::px(0.),
+            "the text panned to keep the caret in view"
+        );
+    });
+}
+
 #[gpui::test]
 fn sheet_field_supports_select_all_copy_and_paste(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);

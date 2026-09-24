@@ -241,6 +241,13 @@ impl ConnectionForm {
         if self.text(Field::Name) == format!("New {}", previous.label()) {
             self.set_text(Field::Name, format!("New {}", driver.label()));
         }
+        // Focus never stays in a field the new engine hides.
+        if Field::ORDER
+            .get(self.focused)
+            .is_some_and(|field| !field.applies_to(driver))
+        {
+            self.focus(Field::Name);
+        }
     }
 
     pub fn set_tls(&mut self, tls: TlsMode) {
@@ -259,17 +266,32 @@ impl ConnectionForm {
     pub fn handle_key(&mut self, keystroke: &Keystroke, cx: &App) -> bool {
         if keystroke.key == "tab" && !keystroke.modifiers.platform {
             let count = self.focus_len();
-            self.focused = if keystroke.modifiers.shift {
-                (self.focused + count - 1) % count
+            let step = if keystroke.modifiers.shift {
+                count - 1
             } else {
-                (self.focused + 1) % count
+                1
             };
+            // Past the fields this engine hides: Tab from a SQLite sheet's
+            // Name used to land in the invisible Host box, and what was typed
+            // next went nowhere anyone could see.
+            loop {
+                self.focused = (self.focused + step) % count;
+                let hidden = Field::ORDER
+                    .get(self.focused)
+                    .is_some_and(|field| !field.applies_to(self.config.driver));
+                if !hidden {
+                    break;
+                }
+            }
             return true;
         }
         if self.focused >= self.fields.len() {
             return false;
         }
-        self.fields[self.focused].handle_key(keystroke, cx)
+        let field = &mut self.fields[self.focused];
+        let handled = field.handle_key(keystroke, cx);
+        field.ensure_caret_visible();
+        handled
     }
 
     pub fn field_mut(&mut self, index: usize) -> Option<&mut TextInput> {
@@ -344,6 +366,10 @@ impl DbUi {
                     field.label()
                 };
                 let hit_slot = input.hit_bounds_slot();
+                // Panned with `left`, the way the app's other single-line
+                // fields are, so a long path scrolls under the caret instead
+                // of pushing the box -- and the sheet -- wider.
+                let scroll_x = input.scroll_handle().offset().x;
                 let field = *field;
 
                 div()
@@ -361,6 +387,8 @@ impl DbUi {
                         div()
                             .id(("field", index))
                             .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
                             .relative()
                             .flex()
                             .items_center()
@@ -372,7 +400,18 @@ impl DbUi {
                             .border_color(if focused { theme.accent } else { theme.border })
                             .font_family(metrics::MONO_FONT)
                             .cursor_text()
-                            .child(render_field_text(input, field, focused, theme))
+                            .child(
+                                div().size_full().overflow_hidden().relative().child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left(scroll_x)
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .child(render_field_text(input, field, focused, theme)),
+                                ),
+                            )
                             .child(
                                 canvas(
                                     move |bounds, _, _| {
@@ -419,6 +458,7 @@ impl DbUi {
                                     } else {
                                         input.end_selecting();
                                     }
+                                    input.ensure_caret_visible();
                                     cx.notify();
                                 }),
                             )
@@ -443,6 +483,7 @@ impl DbUi {
                                         text_input::char_width(),
                                     );
                                     input.select_to(offset);
+                                    input.ensure_caret_visible();
                                     cx.notify();
                                 },
                             ))
