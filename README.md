@@ -46,6 +46,11 @@ and it works through an SSH tunnel. *Run SQL File…* runs any file statement by
 statement on one session, with the count on the status line and `⌘.` to stop. A dump
 restores to identical rows on all three engines; that is tested, not assumed.
 
+**The schema, drawn.** `⌘⌥D` (or *Show Diagram* on a schema) lays every table out
+with its columns -- referenced tables to the left of the ones that reference them --
+and draws each foreign key from its column to the column it points at. Hover a table
+to light up its keys both ways, `⌘=`/`⌘-` to zoom the drawing, click a table to open it.
+
 **Production looks like production.** Tag a connection Local, Testing, Staging or
 Production and its colour runs under the title bar and its tab. On Production,
 ⌘S and any writing statement stop for a confirmation that names the server and

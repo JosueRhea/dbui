@@ -6,6 +6,7 @@
 
 mod clock;
 mod components;
+mod er_layout;
 mod highlight;
 mod json_format;
 mod root;
@@ -171,6 +172,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
         KeyBinding::new("cmd-alt-e", ExplainQuery, Some("DbUi")),
         KeyBinding::new("cmd-alt-a", ServerActivity, Some("DbUi")),
+        KeyBinding::new("cmd-alt-d", ErDiagram, Some("DbUi")),
         // ⌘. is the Mac's "stop" -- Terminal, Xcode and Finder copies all
         // answer to it.
         KeyBinding::new("cmd-.", StopQuery, Some("DbUi")),
@@ -223,6 +225,7 @@ fn menus() -> Vec<Menu> {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Change Theme…", ChooseTheme),
+                MenuItem::action("Schema Diagram", ErDiagram),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
@@ -305,6 +308,7 @@ gpui::actions!(
         RunAllQueries,
         ExplainQuery,
         ServerActivity,
+        ErDiagram,
         DumpDatabase,
         RunSqlFile,
         StopQuery,

@@ -558,6 +558,8 @@ pub struct DbUi {
     pub(crate) activity_generation: u64,
     /// Stops the SQL file being run, while one is.
     pub(crate) script_stop: Option<dbui_app::commands::StopHandle>,
+    /// The ER diagram, while it is open.
+    pub(crate) er_diagram: Option<crate::components::er_diagram::ErDiagram>,
     /// Bumped each time a commit puts its "Committing…" line up, so the one
     /// that lands can tell whether the line on screen is still its own.
     pub(crate) commit_stamp: u64,
@@ -783,6 +785,7 @@ impl DbUi {
             activity: None,
             activity_generation: 0,
             script_stop: None,
+            er_diagram: None,
             commit_stamp: 0,
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
@@ -1059,6 +1062,21 @@ impl DbUi {
     }
 
     pub(crate) fn zoom_delta(&mut self, direction: i32, cx: &mut Context<Self>) {
+        // Over the diagram, ⌘= and ⌘- zoom the drawing, not the app: that is
+        // the thing being looked at, and it has a zoom of its own.
+        if self.er_diagram.is_some() {
+            match direction {
+                d if d > 0 => self.zoom_er_diagram(1.25, cx),
+                d if d < 0 => self.zoom_er_diagram(1.0 / 1.25, cx),
+                _ => {
+                    if let Some(diagram) = self.er_diagram.as_mut() {
+                        diagram.zoom = 1.0;
+                    }
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let pct = match direction {
             1 => metrics::zoom_in(),
             -1 => metrics::zoom_out(),
@@ -5979,6 +5997,7 @@ impl DbUi {
             || self.confirm.is_some()
             || self.production_guard.is_some()
             || self.activity.is_some()
+            || self.er_diagram.is_some()
             || self.close_guard.is_some()
             || self.context_menu.is_some()
             || self.modal.is_some()
@@ -6033,6 +6052,15 @@ impl DbUi {
                 // ⌘↵ that raised this question must not also answer it.
                 "enter" if !command => self.confirm_production_write(cx),
                 _ => {}
+            }
+            return;
+        }
+
+        // The diagram is modal the same way; Escape closes it. (Its zoom
+        // arrives as the app's zoom actions -- see `zoom_delta`.)
+        if self.er_diagram.is_some() {
+            if key == "escape" {
+                self.close_er_diagram(cx);
             }
             return;
         }
@@ -6885,6 +6913,7 @@ impl Render for DbUi {
         let close_guard = self.render_close_guard(cx);
         let production_guard = self.render_production_guard(cx);
         let activity = self.render_activity(cx);
+        let er_diagram = self.render_er_diagram(cx);
         let schema_sheet = self.render_schema_sheet(cx);
         let drag_ghost = self.render_drag_ghost();
 
@@ -7060,6 +7089,9 @@ impl Render for DbUi {
                     this.open_activity(cx)
                 }))
                 .on_action(
+                    cx.listener(|this, _: &crate::ErDiagram, _window, cx| this.open_er_diagram(cx)),
+                )
+                .on_action(
                     cx.listener(|this, _: &crate::DumpDatabase, _window, cx| {
                         this.dump_database(cx)
                     }),
@@ -7172,6 +7204,7 @@ impl Render for DbUi {
             .children(context_menu)
             .children(confirm)
             .children(close_guard)
+            .children(er_diagram)
             .children(activity)
             .children(production_guard)
             .children(schema_sheet)

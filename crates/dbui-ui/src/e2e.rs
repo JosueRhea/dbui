@@ -4399,6 +4399,58 @@ fn a_failing_file_names_the_statement(cx: &mut TestAppContext) {
     });
 }
 
+/// ⌘⌥D draws the schema: a box per table and a line for the foreign key,
+/// at every window size and zoom; clicking a box opens that table.
+#[gpui::test]
+fn the_schema_diagram_draws_and_opens_a_table(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "diagram");
+    cx.simulate_keystrokes("cmd-alt-d");
+    settle(&view, cx, |view| {
+        view.er_diagram
+            .as_ref()
+            .is_some_and(|diagram| diagram.loaded)
+    });
+    view.update(cx, |view, _| {
+        let diagram = view.er_diagram.as_ref().unwrap();
+        let names: Vec<&str> = diagram
+            .tables
+            .iter()
+            .map(|t| t.table.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"members") && names.contains(&"teams"),
+            "{names:?}"
+        );
+        assert_eq!(diagram.edges.len(), 1, "members.team_slug -> teams.slug");
+        let edge = diagram.edges[0];
+        assert_eq!(diagram.tables[edge.to].table.name, "teams");
+        let (parent, child) = (
+            diagram.layout.positions[edge.to],
+            diagram.layout.positions[edge.from],
+        );
+        assert!(parent.x < child.x, "the parent is drawn to the left");
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes("cmd-=");
+    view.update(cx, |view, _| {
+        assert!(
+            view.er_diagram.as_ref().unwrap().zoom > 1.0,
+            "⌘= zooms the diagram"
+        );
+        assert_eq!(crate::theme::metrics::zoom_pct(), 100, "not the app");
+    });
+    view.update(cx, |view, cx| {
+        view.er_diagram.as_mut().unwrap().hover = Some(0);
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert!(view.er_diagram.is_none()));
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

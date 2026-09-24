@@ -284,6 +284,22 @@ impl DbUi {
         .detach();
     }
 
+    /// "Dump Schema…" from the tree: the same dump, of one schema.
+    pub(crate) fn dump_schema(&mut self, schema: String, cx: &mut Context<Self>) {
+        let suggested = format!("{}.sql", schema.replace(['/', '\\', ' '], "-"));
+        let chosen = cx.prompt_for_new_path(&start_directory(), Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.dump_database_to(path, Some(vec![schema]), cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Write the dump to `path` -- the half after the save sheet, and what
     /// the tests drive. `schemas` narrows it; `None` is the whole database.
     pub(crate) fn dump_database_to(

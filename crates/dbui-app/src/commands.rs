@@ -482,6 +482,24 @@ pub fn run_script(
     })
 }
 
+/// The columns of every table in `tables`, for the ER diagram. A table that
+/// will not describe itself is drawn with no columns rather than stopping
+/// the rest.
+pub fn fetch_all_columns(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    tables: Vec<TableRef>,
+) -> Task<Vec<(TableRef, Vec<Column>)>> {
+    runtime.spawn(async move {
+        let mut out = Vec::with_capacity(tables.len());
+        for table in tables {
+            let columns = driver.columns(&table).await.unwrap_or_default();
+            out.push((table, columns));
+        }
+        out
+    })
+}
+
 /// Every client connection on the server, for the activity panel.
 pub fn fetch_sessions(
     runtime: &DbRuntime,

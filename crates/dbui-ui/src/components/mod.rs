@@ -13,6 +13,7 @@ pub(crate) mod context_menu;
 mod detail_sidebar;
 mod drag_ghost;
 pub(crate) mod editor_find;
+pub(crate) mod er_diagram;
 mod filters;
 mod grid;
 mod icons;

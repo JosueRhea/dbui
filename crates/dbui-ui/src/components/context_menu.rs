@@ -68,6 +68,8 @@ pub enum MenuAction {
     CloseTabsToRight,
     CloseAllTabs,
     NewTable,
+    ShowDiagram,
+    DumpSchema,
 }
 
 impl MenuAction {
@@ -228,6 +230,14 @@ fn rows_for(target: &ContextTarget) -> Vec<MenuRow> {
             MenuRow::Item {
                 action: MenuAction::NewTable,
                 label: "New Table…".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::ShowDiagram,
+                label: "Show Diagram".into(),
+            },
+            MenuRow::Item {
+                action: MenuAction::DumpSchema,
+                label: "Dump Schema…".into(),
             },
             MenuRow::Separator,
             MenuRow::Item {
@@ -406,6 +416,12 @@ impl DbUi {
             (ContextTarget::Schema { name, .. }, MenuAction::NewTable) => {
                 let schema = name.clone();
                 self.create_table_sheet(Some(schema), cx);
+            }
+            (ContextTarget::Schema { name, .. }, MenuAction::ShowDiagram) => {
+                self.open_er_diagram_for(name.clone(), cx);
+            }
+            (ContextTarget::Schema { name, .. }, MenuAction::DumpSchema) => {
+                self.dump_schema(name.clone(), cx);
             }
             (ContextTarget::Schema { name, .. }, MenuAction::CopyName) => {
                 self.copy_to_clipboard(name.clone(), "Schema name copied", cx);

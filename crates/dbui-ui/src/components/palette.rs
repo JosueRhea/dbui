@@ -55,6 +55,7 @@ enum ActionId {
     PrevConnection,
     RefreshCatalog,
     ServerActivity,
+    ErDiagram,
     DumpDatabase,
     RunSqlFile,
     RefreshResult,
@@ -220,6 +221,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::RefreshCatalog,
         label: "Refresh Catalog",
         shortcut: None,
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::ErDiagram,
+        label: "Schema Diagram",
+        shortcut: Some("⌘⌥D"),
         section: "Connection",
     },
     ActionDef {
@@ -992,7 +999,7 @@ impl DbUi {
                         .unwrap_or(false)
             }
             ActionId::DisconnectActive | ActionId::RefreshCatalog => connected,
-            ActionId::DumpDatabase | ActionId::RunSqlFile => connected,
+            ActionId::DumpDatabase | ActionId::RunSqlFile | ActionId::ErDiagram => connected,
             ActionId::ServerActivity => {
                 connected
                     && !self
@@ -1126,6 +1133,7 @@ impl DbUi {
             ActionId::RefreshCatalog => self.refresh_catalog(cx),
             ActionId::ServerActivity => self.open_activity(cx),
             ActionId::DumpDatabase => self.dump_database(cx),
+            ActionId::ErDiagram => self.open_er_diagram(cx),
             ActionId::RunSqlFile => self.run_sql_file(cx),
             ActionId::RefreshResult => self.refresh_result(cx),
             ActionId::OpenSql => self.open_sql_tab(cx),
