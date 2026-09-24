@@ -216,7 +216,9 @@ impl ConnectionForm {
 
     /// Switching engines re-defaults the port and the user -- the old values
     /// were the other engine's conventions and are almost never right here.
-    /// Anything the user actually typed elsewhere is left alone.
+    /// Anything the user actually typed elsewhere is left alone, except the
+    /// database across a server/file switch: a database name is not a path to
+    /// a file, and a path is not a database name.
     pub fn set_driver(&mut self, driver: Driver) {
         if self.config.driver == driver {
             return;
@@ -230,6 +232,11 @@ impl ConnectionForm {
         let defaults = ConnectionConfig::new(driver);
         if self.text(Field::Username) == ConnectionConfig::new(previous).username {
             self.set_text(Field::Username, defaults.username);
+        }
+        if previous.is_file_based() != driver.is_file_based()
+            || self.text(Field::Database) == previous.default_database()
+        {
+            self.set_text(Field::Database, defaults.database);
         }
         if self.text(Field::Name) == format!("New {}", previous.label()) {
             self.set_text(Field::Name, format!("New {}", driver.label()));
@@ -658,7 +665,8 @@ div()
                     .child(div().text_size(metrics::scaled(15.)).child(title))
                     .child(driver_choice)
                     .children(rows)
-                    .child(tls_choice)
+                    // A local file has no transport to encrypt.
+                    .when(!engine.is_file_based(), |sheet| sheet.child(tls_choice))
                     .child(read_only_choice)
                     .child(caption(
                         "Passwords are kept for this session only and are never written to disk.",

@@ -183,6 +183,33 @@ fn typing_reaches_the_focused_field(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn switching_to_a_file_engine_does_not_carry_the_database_over(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, _| {
+        let form = view.modal.as_mut().expect("sheet open");
+        assert_eq!(form.to_config().database, "postgres");
+
+        // The Postgres default is not a file to open.
+        form.set_driver(Driver::Sqlite);
+        assert_eq!(form.to_config().database, "");
+
+        // Nor is a path a database name on the way back.
+        form.field_mut(5)
+            .expect("database field")
+            .set_text("/tmp/app.db");
+        form.set_driver(Driver::Postgres);
+        assert_eq!(form.to_config().database, "postgres");
+
+        // Between two servers, a name the user typed is theirs to keep.
+        form.field_mut(5).expect("database field").set_text("shop");
+        form.set_driver(Driver::MySql);
+        assert_eq!(form.to_config().database, "shop");
+    });
+}
+
+#[gpui::test]
 fn sheet_field_supports_select_all_copy_and_paste(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
 
