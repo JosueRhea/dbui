@@ -52,6 +52,26 @@ pub trait DatabaseDriver: Send + Sync {
         Ok(None)
     }
 
+    /// Run a query and hand every row it returns to `sink`, a page at a time
+    /// -- no row cap, and never more than a page in memory. For exporting a
+    /// result bigger than the editor keeps. Not on the editor's session: an
+    /// export is a read, and is not part of whatever the editor has open.
+    async fn stream_query(&self, sql: &str, sink: &mut crate::stream::RowSink<'_>) -> Result<u64> {
+        let result = self.execute(sql).await?;
+        match result.outcome {
+            dbui_domain::QueryOutcome::Rows(set) => {
+                let count = set.rows.len() as u64;
+                sink(
+                    &set.columns,
+                    set.rows.into_iter().map(|row| row.0).collect(),
+                )
+                .map_err(|message| DriverError::message(sql, message))?;
+                Ok(count)
+            }
+            dbui_domain::QueryOutcome::Affected(_) => Ok(0),
+        }
+    }
+
     /// Every client connection to the server, for the activity panel.
     async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
         Err(DriverError::message(

@@ -466,6 +466,34 @@ both_engines!(a_column_of_a_custom_type_reads, |fx: Fixture| async move {
     assert_eq!(set.rows[1].0[2], Value::Null);
 });
 
+both_engines!(a_query_streams_past_the_row_cap, |fx: Fixture| async move {
+    let sql = match fx.driver() {
+        Driver::Postgres => "SELECT i, 'row ' || i AS label FROM generate_series(1, 15000) AS i",
+        // MySQL stops a recursive CTE at 1000 rounds; 150 x 100 is 15000.
+        _ => {
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 150) \
+              SELECT (a.i - 1) * 100 + b.i AS i, CONCAT('row ', (a.i - 1) * 100 + b.i) AS label \
+              FROM n a JOIN n b ON b.i <= 100 ORDER BY i"
+        }
+    };
+    let mut pages = 0;
+    let mut last = None;
+    let mut columns = Vec::new();
+    let count = fx
+        .stream_query(sql, &mut |cols, rows| {
+            pages += 1;
+            columns = cols.iter().map(|c| c.name.clone()).collect();
+            last = rows.last().map(|row| row[1].to_text());
+            Ok(())
+        })
+        .await
+        .expect("stream");
+    assert_eq!(count, 15_000);
+    assert!(pages >= 15, "a page at a time, not all at once: {pages}");
+    assert_eq!(columns, vec!["i", "label"]);
+    assert_eq!(last.as_deref(), Some("row 15000"));
+});
+
 both_engines!(a_live_connection_answers, |fx: Fixture| async move {
     fx.ping().await.expect("ping");
     assert!(

@@ -12,10 +12,12 @@ mod postgres;
 mod sessions;
 mod sql_build;
 mod sqlite;
+mod stream;
 mod tunnel;
 
 pub use error::{DriverError, Result};
 pub use port::{DatabaseDriver, QueryToken, RowBatch, RowDelete, RowInsert, RowUpdate};
+pub use stream::RowSink;
 // Statements the UI offers to run but does not compose: quoting an identifier
 // is this crate's job, and there is a test that a hostile table name cannot
 // break out of one.

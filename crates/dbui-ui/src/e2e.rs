@@ -4451,6 +4451,38 @@ fn the_schema_diagram_draws_and_opens_a_table(cx: &mut TestAppContext) {
     view.update(cx, |view, _| assert!(view.er_diagram.is_none()));
 }
 
+/// A result the editor cut off at its cap exports whole: the file has every
+/// row, read again from the server, not just the ten thousand on screen.
+#[gpui::test]
+fn a_capped_result_exports_every_row(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "export-capped");
+    let csv = ScratchFile::new("all.csv");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12000) \
+             SELECT i, 'row ' || i AS label FROM n",
+            cx,
+        );
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|tab| tab.result()).is_some()
+    });
+    view.update(cx, |view, _| {
+        let set = &view.tabs.active().unwrap().result().unwrap().set;
+        assert!(set.truncated, "the editor stopped at its cap");
+        assert_eq!(set.rows.len(), dbui_app::domain::ResultSet::QUERY_ROW_CAP);
+    });
+    view.update(cx, |view, cx| {
+        view.export_to_path(csv.0.clone(), crate::row_export::RowFormat::Csv, cx)
+    });
+    let said = settle_export(&view, cx);
+    assert!(said.contains("Exported 12000 rows"), "{said}");
+    let text = std::fs::read_to_string(&csv.0).unwrap();
+    assert_eq!(text.lines().count(), 12_001, "a header and every row");
+    assert!(text.lines().last().unwrap().starts_with("12000,"));
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

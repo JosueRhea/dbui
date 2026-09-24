@@ -295,6 +295,19 @@ impl DatabaseDriver for PostgresDriver {
         Ok(Catalog { schemas, objects })
     }
 
+    async fn stream_query(&self, sql: &str, sink: &mut crate::stream::RowSink<'_>) -> Result<u64> {
+        let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
+            .persistent(false)
+            .fetch(&self.pool);
+        crate::stream::drain(
+            rows,
+            sql,
+            |page: Vec<sqlx::postgres::PgRow>| build_result_set(page, usize::MAX),
+            sink,
+        )
+        .await
+    }
+
     async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
         let name = TableRef::new(&table.schema, &table.name).quoted(Driver::Postgres);
         let scalar = |sql: &'static str| {

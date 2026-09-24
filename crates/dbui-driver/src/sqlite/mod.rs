@@ -162,6 +162,19 @@ impl DatabaseDriver for SqliteDriver {
         })
     }
 
+    async fn stream_query(&self, sql: &str, sink: &mut crate::stream::RowSink<'_>) -> Result<u64> {
+        let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
+            .persistent(false)
+            .fetch(&self.pool);
+        crate::stream::drain(
+            rows,
+            sql,
+            |page: Vec<SqliteRow>| build_result_set(page, usize::MAX),
+            sink,
+        )
+        .await
+    }
+
     async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
         let create: Vec<String> = sqlx::query_scalar(catalog::CREATE_STATEMENTS)
             .bind(&table.name)

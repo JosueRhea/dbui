@@ -152,6 +152,17 @@ impl DbUi {
                 let Some(view) = tab.result() else {
                     return;
                 };
+                // Cut off at the editor's cap: the file gets every row, read
+                // again from the server, not just the ones on screen.
+                if let (true, crate::root::ResultSource::Query { sql }, Some(driver)) = (
+                    view.set.truncated,
+                    &view.source,
+                    self.workspace.active_driver(),
+                ) {
+                    let task = commands::export_query(&self.runtime, driver, sql.clone(), sink);
+                    self.finish_export(path, task, cx);
+                    return;
+                }
                 commands::export_rows(
                     &self.runtime,
                     view.set.columns.clone(),
@@ -161,10 +172,17 @@ impl DbUi {
             }
         };
 
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
+        self.finish_export(path, task, cx);
+    }
+
+    /// Say that an export is under way, and what came of it.
+    fn finish_export(
+        &mut self,
+        path: PathBuf,
+        task: dbui_app::Task<Result<u64, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let file_name = display_name(&path);
         self.status = Status::busy(format!("Exporting to {file_name}…"));
         cx.notify();
         cx.spawn(async move |this, cx| {

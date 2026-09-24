@@ -241,6 +241,19 @@ impl DatabaseDriver for MySqlDriver {
         Ok(Catalog { schemas, objects })
     }
 
+    async fn stream_query(&self, sql: &str, sink: &mut crate::stream::RowSink<'_>) -> Result<u64> {
+        let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
+            .persistent(false)
+            .fetch(&self.pool);
+        crate::stream::drain(
+            rows,
+            sql,
+            |page: Vec<sqlx::mysql::MySqlRow>| build_result_set(page, usize::MAX),
+            sink,
+        )
+        .await
+    }
+
     async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
         // MySQL writes its own, exactly -- indexes, foreign keys and
         // AUTO_INCREMENT included -- so there is nothing to rebuild. Foreign

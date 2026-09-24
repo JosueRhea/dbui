@@ -165,6 +165,25 @@ pub fn export_table(
     })
 }
 
+/// Run `sql` again and write every row it returns through `sink`, a page at
+/// a time -- for a result the editor cut off at its row cap. The editor
+/// shows ten thousand rows; a file can hold them all.
+pub fn export_query(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    sql: String,
+    mut sink: impl PageSink,
+) -> Task<Result<u64, String>> {
+    runtime.spawn(async move {
+        let count = driver
+            .stream_query(&sql, &mut |columns, rows| sink.page(columns, rows))
+            .await
+            .map_err(|error| error.to_string())?;
+        sink.finish()?;
+        Ok(count)
+    })
+}
+
 /// Write rows already in hand -- a query's result -- through a sink, off the
 /// UI thread.
 pub fn export_rows(
