@@ -24,5 +24,5 @@ pub use query::{
     order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, SortKey,
 };
 pub use sql_split::{split_statements, statement_at};
-pub use statement::StatementInfo;
+pub use statement::{writes, StatementInfo};
 pub use value::{compare as compare_values, Value, ValueKind};

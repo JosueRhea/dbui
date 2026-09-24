@@ -3796,6 +3796,40 @@ fn a_read_only_connection_will_not_change_a_table(cx: &mut TestAppContext) {
     });
 }
 
+/// The editor refuses a write on a read-only connection before sending it --
+/// and refuses the whole run, so the reads in front of it do not go either.
+/// Reads still run.
+#[gpui::test]
+fn a_read_only_connection_refuses_writes_from_the_editor(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "editor-read-only");
+    view.update(cx, |view, cx| {
+        let id = view.workspace.active_id().unwrap();
+        view.workspace.get_mut(id).unwrap().config.read_only = true;
+        view.put_sql_in_editor("SELECT 1; DELETE FROM members; SELECT 2", cx);
+        view.run_all_queries(cx);
+        let said = describe(&view.status);
+        assert!(
+            said.contains("DELETE refused") && said.contains("read only"),
+            "got: {said}"
+        );
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2"
+    );
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT count(*) FROM members", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(!said.contains("refused"), "a read still runs, got: {said}");
+    });
+}
+
 /// The structure pane and every kind of structure sheet paint, at every
 /// window size.
 #[gpui::test]

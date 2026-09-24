@@ -2673,6 +2673,15 @@ impl DbUi {
         if statements.is_empty() {
             return;
         }
+        // The server refuses writes on a read-only connection too, but only
+        // through a session setting the editor could switch off. Nothing in
+        // the batch runs if any of it would write.
+        if let Some(write) = statements.iter().find(|sql| dbui_app::domain::writes(sql)) {
+            let verb = dbui_app::domain::statement::describe(write).verb;
+            if self.refuse_if_read_only(&verb, cx) {
+                return;
+            }
+        }
         self.record_history(&statements);
 
         let Some(driver) = self.workspace.active_driver() else {
