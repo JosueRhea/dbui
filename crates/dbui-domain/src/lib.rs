@@ -12,6 +12,7 @@
 pub mod catalog;
 pub mod connection;
 pub mod ddl;
+pub mod params;
 pub mod query;
 pub mod sql_split;
 pub mod statement;

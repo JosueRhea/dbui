@@ -4548,6 +4548,50 @@ fn a_pinned_result_survives_the_next_query(cx: &mut TestAppContext) {
     });
 }
 
+/// A `:name` in a statement is asked for before it runs, goes in as the
+/// right literal, and is remembered for next time.
+#[gpui::test]
+fn named_parameters_are_asked_for_and_remembered(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "params");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "SELECT name FROM members WHERE team_slug = :team AND id >= :min_id ORDER BY id",
+            cx,
+        );
+        view.run_query(cx);
+        let sheet = view.param_sheet.as_ref().expect("asked first");
+        assert_eq!(sheet.names, vec!["team", "min_id"]);
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes(&typing("ops"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("1"));
+    cx.simulate_keystrokes("enter");
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|t| t.result()).is_some()
+    });
+    view.update(cx, |view, _| {
+        assert!(view.param_sheet.is_none());
+        let rows = &view.tabs.active().unwrap().result().unwrap().set.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0[0].to_text(), "Grace");
+    });
+
+    // Asked again, with last time's answers in place.
+    view.update(cx, |view, cx| {
+        view.run_query(cx);
+        let sheet = view.param_sheet.as_ref().expect("asked again");
+        assert_eq!(sheet.inputs[0].text(), "ops");
+        assert_eq!(sheet.inputs[1].text(), "1");
+    });
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        assert!(view.param_sheet.is_none(), "Esc sends nothing")
+    });
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]

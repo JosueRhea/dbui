@@ -561,6 +561,10 @@ pub struct DbUi {
     pub(crate) script_stop: Option<dbui_app::commands::StopHandle>,
     /// The ER diagram, while it is open.
     pub(crate) er_diagram: Option<crate::components::er_diagram::ErDiagram>,
+    /// Asking for a statement's `:name` values, before it runs.
+    pub(crate) param_sheet: Option<crate::components::params_sheet::ParamSheet>,
+    /// The value each `:name` was last given, to fill the sheet with next time.
+    pub(crate) param_values: std::collections::HashMap<String, String>,
     /// Bumped each time a commit puts its "Committing…" line up, so the one
     /// that lands can tell whether the line on screen is still its own.
     pub(crate) commit_stamp: u64,
@@ -787,6 +791,8 @@ impl DbUi {
             activity_generation: 0,
             script_stop: None,
             er_diagram: None,
+            param_sheet: None,
+            param_values: std::collections::HashMap::new(),
             commit_stamp: 0,
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
@@ -2418,6 +2424,9 @@ impl DbUi {
         let Some(statements) = self.resolve_run_sql() else {
             return;
         };
+        if self.ask_for_params(&statements, false, cx) {
+            return;
+        }
         self.dispatch_statements(statements, cx);
     }
 
@@ -2446,6 +2455,9 @@ impl DbUi {
         let Some(statements) = self.resolve_run_sql() else {
             return;
         };
+        if self.ask_for_params(&statements, true, cx) {
+            return;
+        }
         let driver = self.sql_dialect();
         let explained = statements
             .iter()
@@ -2472,6 +2484,9 @@ impl DbUi {
         let Some(statements) = self.resolve_run_all_sql() else {
             return;
         };
+        if self.ask_for_params(&statements, false, cx) {
+            return;
+        }
         self.dispatch_statements(statements, cx);
     }
 
@@ -6013,6 +6028,7 @@ impl DbUi {
             || self.production_guard.is_some()
             || self.activity.is_some()
             || self.er_diagram.is_some()
+            || self.param_sheet.is_some()
             || self.close_guard.is_some()
             || self.context_menu.is_some()
             || self.modal.is_some()
@@ -6068,6 +6084,12 @@ impl DbUi {
                 "enter" if !command => self.confirm_production_write(cx),
                 _ => {}
             }
+            return;
+        }
+
+        // The Parameters sheet owns the keyboard: its fields take the typing.
+        if self.param_sheet.is_some() {
+            self.handle_param_sheet_key(keystroke, cx);
             return;
         }
 
@@ -6929,6 +6951,7 @@ impl Render for DbUi {
         let production_guard = self.render_production_guard(cx);
         let activity = self.render_activity(cx);
         let er_diagram = self.render_er_diagram(cx);
+        let param_sheet = self.render_param_sheet(cx);
         let schema_sheet = self.render_schema_sheet(cx);
         let drag_ghost = self.render_drag_ghost();
 
@@ -7223,6 +7246,7 @@ impl Render for DbUi {
             .children(confirm)
             .children(close_guard)
             .children(er_diagram)
+            .children(param_sheet)
             .children(activity)
             .children(production_guard)
             .children(schema_sheet)

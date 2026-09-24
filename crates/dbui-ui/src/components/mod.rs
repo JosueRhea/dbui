@@ -20,6 +20,7 @@ mod icons;
 mod main_pane;
 pub(crate) mod motion;
 pub(crate) mod palette;
+pub(crate) mod params_sheet;
 pub(crate) mod plan_view;
 pub(crate) mod production_guard;
 pub(crate) mod schema_sheet;
