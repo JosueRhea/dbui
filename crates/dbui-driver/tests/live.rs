@@ -1365,40 +1365,46 @@ both_engines!(
 );
 
 // A query typed in the editor keeps at most QUERY_ROW_CAP rows and says there
-// were more -- and the connection it left mid-result is fine for the next one.
+// were more -- and the server is told to stop sending the rest, so the next
+// statement on the connection does not wait while millions of rows it will
+// never show are read and thrown away.
 both_engines!(
     an_editor_query_stops_at_the_row_cap,
     |fx: Fixture| async move {
         let cap = dbui_domain::ResultSet::QUERY_ROW_CAP;
         let token = dbui_driver::QueryToken::new();
+        // Eight million rows, streamed rather than built first: a join the
+        // server produces as it sends.
         let many = match fx.driver() {
-            Driver::Postgres => format!("SELECT i FROM generate_series(1, {}) AS i", cap * 5),
-            _ => {
-                // MySQL stops a recursive CTE at 1000 levels unless told
-                // otherwise -- in this session, which is the next run's too.
-                fx.execute_tracked("SET SESSION cte_max_recursion_depth = 1000000", &token)
-                    .await
-                    .expect("raise the depth");
-                format!(
-                    "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {}) \
-                     SELECT i FROM n",
-                    cap * 5
-                )
-            }
+            Driver::Postgres => "SELECT i FROM generate_series(1, 8000000) AS i".to_string(),
+            _ => "WITH RECURSIVE d (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM d WHERE i < 200) \
+                  SELECT a.i * 40000 + b.i * 200 + c.i FROM d a, d b, d c"
+                .to_string(),
         };
+        let started = std::time::Instant::now();
         let result = fx.execute_tracked(&many, &token).await.expect("the query");
+        let first = started.elapsed();
         let QueryOutcome::Rows(set) = result.outcome else {
             panic!("expected rows");
         };
         assert_eq!(set.rows.len(), cap, "kept up to the cap");
         assert!(set.truncated, "and said there were more");
-        assert_eq!(set.rows[cap - 1].0[0].to_text(), cap.to_string());
 
+        let started = std::time::Instant::now();
         let after = fx
             .execute_tracked("SELECT 42", &token)
             .await
             .expect("the same connection answers the next statement");
+        let next = started.elapsed();
         assert_eq!(after.rows().expect("rows").rows[0].0[0].to_text(), "42");
+        eprintln!(
+            "{}: capped query {first:?}, next statement {next:?}",
+            fx.driver()
+        );
+        assert!(
+            first + next < std::time::Duration::from_secs(2),
+            "the rest was not read off the wire: capped query {first:?}, next {next:?}"
+        );
 
         let few = fx
             .execute_tracked("SELECT 1 UNION ALL SELECT 2", &token)
@@ -1408,6 +1414,116 @@ both_engines!(
             !few.rows().unwrap().truncated,
             "a small result is not marked"
         );
+    }
+);
+
+// Cutting a result short inside a transaction leaves the transaction alone.
+// On PostgreSQL that means not stopping the statement, which would fail the
+// transaction; the rest is read instead.
+both_engines!(
+    a_capped_query_inside_a_transaction_keeps_it,
+    |fx: Fixture| async move {
+        let driver = fx.driver();
+        let people = format!(
+            "{}.{}",
+            driver.quote_identifier(fx.schema()),
+            driver.quote_identifier("people")
+        );
+        let token = dbui_driver::QueryToken::new();
+        let run = |sql: String| {
+            let (fx, token) = (&fx, &token);
+            async move {
+                fx.execute_tracked(&sql, token)
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}\n{error}"))
+            }
+        };
+        let many = match driver {
+            Driver::Postgres => "SELECT i FROM generate_series(1, 50000) AS i".to_string(),
+            _ => "WITH RECURSIVE d (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM d WHERE i < 40) \
+                  SELECT a.i FROM d a, d b, d c"
+                .to_string(),
+        };
+
+        run("BEGIN".into()).await;
+        run(format!("UPDATE {people} SET name = 'Changed' WHERE id = 1")).await;
+        assert!(run(many).await.rows().unwrap().truncated);
+        assert_eq!(
+            fx.editor_transaction(),
+            dbui_domain::TransactionState::Open,
+            "still open"
+        );
+        let name = run(format!("SELECT name FROM {people} WHERE id = 1")).await;
+        assert_eq!(name.rows().unwrap().rows[0].0[0].to_text(), "Changed");
+        run("ROLLBACK".into()).await;
+    }
+);
+
+// The editor's session says when it is in a transaction, so the app can.
+both_engines!(
+    the_editor_session_reports_its_transaction,
+    |fx: Fixture| async move {
+        use dbui_domain::TransactionState;
+        let token = dbui_driver::QueryToken::new();
+        let run = |sql: &'static str| {
+            let (fx, token) = (&fx, &token);
+            async move { fx.execute_tracked(sql, token).await }
+        };
+
+        run("SELECT 1").await.unwrap();
+        assert_eq!(fx.editor_transaction(), TransactionState::Idle);
+        run("BEGIN").await.unwrap();
+        assert_eq!(fx.editor_transaction(), TransactionState::Open);
+        run("SELECT 1").await.unwrap();
+        assert_eq!(
+            fx.editor_transaction(),
+            TransactionState::Open,
+            "and stays so"
+        );
+        run("COMMIT").await.unwrap();
+        assert_eq!(fx.editor_transaction(), TransactionState::Idle);
+
+        // PostgreSQL fails the whole transaction on an error inside it.
+        if fx.driver() == Driver::Postgres {
+            run("BEGIN").await.unwrap();
+            assert!(run("SELECT 1 / 0").await.is_err());
+            assert_eq!(fx.editor_transaction(), TransactionState::Failed);
+            run("ROLLBACK").await.unwrap();
+            assert_eq!(fx.editor_transaction(), TransactionState::Idle);
+        }
+    }
+);
+
+// The editor's connection dies with a transaction open. The run that finds
+// out says the transaction is gone -- not a bare network error, and not a
+// fresh session quietly carrying on as if it were still there -- and the
+// run after it starts over.
+both_engines!(
+    a_lost_transaction_is_reported_not_papered_over,
+    |fx: Fixture| async move {
+        use dbui_domain::TransactionState;
+        let token = dbui_driver::QueryToken::new();
+        let (ask, kill) = match fx.driver() {
+            Driver::Postgres => ("SELECT pg_backend_pid()", "SELECT pg_terminate_backend({})"),
+            _ => ("SELECT CONNECTION_ID()", "KILL {}"),
+        };
+
+        fx.execute_tracked("BEGIN", &token).await.unwrap();
+        let session = fx.execute_tracked(ask, &token).await.unwrap();
+        let session = session.rows().unwrap().rows[0].0[0].to_text();
+        fx.execute(&kill.replace("{}", &session))
+            .await
+            .expect("end the editor's session from outside");
+
+        let lost = fx.execute_tracked("SELECT 1", &token).await;
+        assert!(
+            matches!(lost, Err(DriverError::TransactionLost { .. })),
+            "got {lost:?}"
+        );
+        assert_eq!(fx.editor_transaction(), TransactionState::Idle);
+
+        let again = fx.execute_tracked("SELECT 1", &token).await;
+        assert!(again.is_ok(), "the next run starts over: {again:?}");
     }
 );
 

@@ -50,6 +50,9 @@ sqlx = { version = "0.9", default-features = false, features = [
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false }
+# The copy sqlx links, for the one C call sqlx does not expose:
+# `sqlite3_get_autocommit`, which says whether a typed `BEGIN` is still open.
+libsqlite3-sys = { version = "0.37", default-features = false }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is not optional here. Editing one key of a JSON cell

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
     QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, TlsMode, Value,
+    TableRef, TlsMode, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
@@ -432,6 +432,10 @@ impl DatabaseDriver for MySqlDriver {
         Ok(true)
     }
 
+    fn editor_transaction(&self) -> TransactionState {
+        self.sessions.console_transaction()
+    }
+
     async fn close(&self) {
         self.sessions.close().await;
         self.pool.close().await;
@@ -449,13 +453,19 @@ impl MySqlDriver {
         token: &QueryToken,
         console: bool,
     ) -> Result<QueryResult> {
-        let leased = if console {
-            self.sessions.acquire_console(&self.pool).await
+        let mut lease = if console {
+            self.sessions
+                .acquire_console(&self.pool)
+                .await
+                .map_err(|error| error.for_statement(sql))?
         } else {
-            self.sessions.acquire(&self.pool).await
+            self.sessions
+                .acquire(&self.pool)
+                .await
+                .map_err(|error| DriverError::query(sql, &error))?
         };
-        let mut lease = leased.map_err(|error| DriverError::query(sql, &error))?;
         let tracking = token.track(lease.session());
+        let was_open = console && self.sessions.console_transaction() != TransactionState::Idle;
 
         let started = Instant::now();
 
@@ -465,8 +475,8 @@ impl MySqlDriver {
         }
         let ran = if query::returns_rows(sql) {
             // One row past the cap says whether there were more. The rest are
-            // never decoded or kept; the connection drains them before its
-            // next statement.
+            // never decoded or kept, and `cut_short` stops the server sending
+            // them.
             sqlx::query(AssertSqlSafe(sql.to_string()))
                 .fetch(lease.conn())
                 .take(ResultSet::QUERY_ROW_CAP + 1)
@@ -485,7 +495,25 @@ impl MySqlDriver {
                 .map(|done| Ran::Affected(done.rows_affected()))
         };
         drop(tracking);
-        lease.settle(&ran);
+
+        let cut_short =
+            matches!(&ran, Ok(Ran::Rows(rows)) if rows.len() > ResultSet::QUERY_ROW_CAP);
+        let ready = !cut_short || lease.cut_short(&self.pool).await;
+        if ready && crate::sessions::survives(&ran) {
+            lease.note_transaction(sql).await;
+        }
+        if ready {
+            lease.settle(&ran);
+        } else {
+            drop(lease);
+        }
+        // The connection died under a statement inside a transaction: say
+        // that, rather than the bare I/O error, and say it now.
+        if was_open && self.sessions.take_lost() {
+            return Err(DriverError::TransactionLost {
+                statement: sql.to_string(),
+            });
+        }
 
         let outcome = match ran.map_err(|error| DriverError::query(sql, &error))? {
             Ran::Rows(rows) => {
@@ -566,4 +594,37 @@ impl SessionId for sqlx::MySql {
             Ok(session as u64)
         })
     }
+    fn transaction_state(
+        conn: &mut Self::Connection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransactionState> + Send + '_>> {
+        Box::pin(async move {
+            // MySQL keeps no session variable for it; the performance schema
+            // does, on by default since 8.0. Without it -- or on MariaDB,
+            // which has no PS_CURRENT_THREAD_ID -- this cannot tell.
+            let asked = sqlx::raw_sql(
+                "SELECT COUNT(*) FROM performance_schema.events_transactions_current \
+                 WHERE THREAD_ID = PS_CURRENT_THREAD_ID() AND STATE = 'ACTIVE'",
+            )
+            .fetch_one(conn)
+            .await;
+            match asked.map(|row| row.try_get::<i64, _>(0)) {
+                Ok(Ok(open)) if open > 0 => TransactionState::Open,
+                _ => TransactionState::Idle,
+            }
+        })
+    }
+
+    fn stop_session(
+        pool: &sqlx::Pool<Self>,
+        session: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            // A literal, as in `cancel`: the id is a number the server gave.
+            let kill = format!("KILL QUERY {session}");
+            let _ = sqlx::query(AssertSqlSafe(kill)).execute(pool).await;
+        })
+    }
+
+    /// `KILL QUERY` ends the statement and leaves the transaction open.
+    const STOP_KEEPS_TRANSACTION: bool = true;
 }

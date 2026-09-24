@@ -190,6 +190,34 @@ fn writes_in(words: &[String]) -> bool {
             .any(|word| WRITE_WORDS.contains(&word.as_str()))
 }
 
+/// Verbs after which the session may have opened or closed a transaction.
+/// `SET` for `autocommit`; `CALL` and `DO` because a procedure may commit.
+const TRANSACTION_VERBS: [&str; 13] = [
+    "BEGIN",
+    "START",
+    "COMMIT",
+    "ROLLBACK",
+    "END",
+    "ABORT",
+    "SAVEPOINT",
+    "RELEASE",
+    "SET",
+    "XA",
+    "LOCK",
+    "CALL",
+    "DO",
+];
+
+/// Whether running `sql` may have changed whether a transaction is open, so
+/// the session is worth asking afterwards. Anything else leaves an
+/// autocommit session in autocommit, and asking after every `SELECT` would
+/// be a second round trip for each one.
+pub fn may_change_transaction(sql: &str) -> bool {
+    bare_words(sql, false)
+        .first()
+        .is_some_and(|verb| TRANSACTION_VERBS.contains(&verb.as_str()))
+}
+
 /// Every unquoted word of `sql`, upper-cased, in order. Strings, quoted
 /// names, dollar-quoted bodies and comments are skipped whole, so a column
 /// called `"update"` or a string reading `'delete me'` is not a verb.
@@ -347,6 +375,23 @@ mod tests {
             "grant select on t to bob",
         ] {
             assert!(writes(sql), "{sql:?} writes");
+        }
+    }
+
+    #[test]
+    fn transaction_verbs_are_worth_asking_about() {
+        for sql in [
+            "BEGIN",
+            "start transaction",
+            "commit",
+            "ROLLBACK",
+            "set autocommit = 0",
+            "call p()",
+        ] {
+            assert!(may_change_transaction(sql), "{sql:?}");
+        }
+        for sql in ["select 1", "update t set a = 1", "", "-- begin"] {
+            assert!(!may_change_transaction(sql), "{sql:?}");
         }
     }
 

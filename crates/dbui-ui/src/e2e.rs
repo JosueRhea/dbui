@@ -3858,6 +3858,38 @@ fn a_read_only_connection_refuses_writes_from_the_editor(cx: &mut TestAppContext
     });
 }
 
+/// A `BEGIN` run in the editor shows the transaction bar, which paints, and
+/// its Roll back button ends the transaction for real.
+#[gpui::test]
+fn the_transaction_bar_shows_an_open_transaction_and_ends_it(cx: &mut TestAppContext) {
+    use dbui_app::domain::TransactionState;
+    let (view, cx, db) = open_connected(cx, "transaction-bar");
+    let idle = |view: &DbUi| !matches!(view.status, Status::Busy(_));
+
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        assert_eq!(view.editor_transaction(), TransactionState::Idle);
+        view.put_sql_in_editor("BEGIN; DELETE FROM members", cx);
+        view.run_all_queries(cx);
+    });
+    settle(&view, cx, idle);
+    view.update(cx, |view, _| {
+        assert_eq!(view.editor_transaction(), TransactionState::Open);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| view.end_editor_transaction("ROLLBACK", cx));
+    settle(&view, cx, idle);
+    view.update(cx, |view, _| {
+        assert_eq!(view.editor_transaction(), TransactionState::Idle);
+    });
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2",
+        "the delete was rolled back"
+    );
+}
+
 /// The structure pane and every kind of structure sheet paint, at every
 /// window size.
 #[gpui::test]

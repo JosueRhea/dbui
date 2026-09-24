@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use dbui_domain::{
     query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
     QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, TlsMode, Value,
+    TableRef, TlsMode, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -423,6 +423,10 @@ impl DatabaseDriver for PostgresDriver {
         Ok(true)
     }
 
+    fn editor_transaction(&self) -> TransactionState {
+        self.sessions.console_transaction()
+    }
+
     async fn close(&self) {
         self.sessions.close().await;
         self.pool.close().await;
@@ -440,13 +444,19 @@ impl PostgresDriver {
         token: &QueryToken,
         console: bool,
     ) -> Result<QueryResult> {
-        let leased = if console {
-            self.sessions.acquire_console(&self.pool).await
+        let mut lease = if console {
+            self.sessions
+                .acquire_console(&self.pool)
+                .await
+                .map_err(|error| error.for_statement(sql))?
         } else {
-            self.sessions.acquire(&self.pool).await
+            self.sessions
+                .acquire(&self.pool)
+                .await
+                .map_err(|error| DriverError::query(sql, &error))?
         };
-        let mut lease = leased.map_err(|error| DriverError::query(sql, &error))?;
         let tracking = token.track(lease.session());
+        let was_open = console && self.sessions.console_transaction() != TransactionState::Idle;
 
         let started = Instant::now();
 
@@ -456,8 +466,8 @@ impl PostgresDriver {
         }
         let ran = if query::returns_rows(sql) {
             // One row past the cap says whether there were more. The rest are
-            // never decoded or kept; the connection drains them before its
-            // next statement.
+            // never decoded or kept, and `cut_short` stops the server sending
+            // them.
             sqlx::query(AssertSqlSafe(sql.to_string()))
                 .fetch(lease.conn())
                 .take(ResultSet::QUERY_ROW_CAP + 1)
@@ -471,7 +481,25 @@ impl PostgresDriver {
                 .map(|done| Ran::Affected(done.rows_affected()))
         };
         drop(tracking);
-        lease.settle(&ran);
+
+        let cut_short =
+            matches!(&ran, Ok(Ran::Rows(rows)) if rows.len() > ResultSet::QUERY_ROW_CAP);
+        let ready = !cut_short || lease.cut_short(&self.pool).await;
+        if ready && crate::sessions::survives(&ran) {
+            lease.note_transaction(sql).await;
+        }
+        if ready {
+            lease.settle(&ran);
+        } else {
+            drop(lease);
+        }
+        // The connection died under a statement inside a transaction: say
+        // that, rather than the bare I/O error, and say it now.
+        if was_open && self.sessions.take_lost() {
+            return Err(DriverError::TransactionLost {
+                statement: sql.to_string(),
+            });
+        }
 
         let outcome = match ran.map_err(|error| DriverError::query(sql, &error))? {
             Ran::Rows(rows) => {
@@ -568,4 +596,43 @@ impl SessionId for sqlx::Postgres {
             Ok(session as u64)
         })
     }
+    fn transaction_state(
+        conn: &mut Self::Connection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransactionState> + Send + '_>> {
+        Box::pin(async move {
+            // Outside a transaction block every statement is its own
+            // transaction, begun when it arrived, so the two clocks agree.
+            // Inside one, `now()` stopped at the `BEGIN`. Sent as one simple
+            // query so there is exactly one arrival to compare against: the
+            // extended protocol's separate Parse and Execute can tick apart.
+            let asked = sqlx::raw_sql("SELECT now() <> statement_timestamp()")
+                .fetch_one(conn)
+                .await;
+            match asked {
+                Ok(row) => match row.try_get::<bool, _>(0) {
+                    Ok(true) => TransactionState::Open,
+                    _ => TransactionState::Idle,
+                },
+                // "current transaction is aborted": the one error that answers.
+                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("25P02") => {
+                    TransactionState::Failed
+                }
+                Err(_) => TransactionState::Idle,
+            }
+        })
+    }
+
+    fn stop_session(
+        pool: &sqlx::Pool<Self>,
+        session: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(session as i32)
+                .execute(pool)
+                .await;
+        })
+    }
+
+    const STOP_KEEPS_TRANSACTION: bool = false;
 }

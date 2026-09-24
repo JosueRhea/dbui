@@ -22,7 +22,8 @@ pub use connection::{ConnectionConfig, ConnectionId, Driver, TlsMode};
 pub use ddl::{ColumnSpec, Index};
 pub use query::{
     order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, SortKey,
+    TransactionState,
 };
 pub use sql_split::{split_statements, split_statements_for, statement_at, statement_at_for};
-pub use statement::{writes, StatementInfo};
+pub use statement::{may_change_transaction, writes, StatementInfo};
 pub use value::{compare as compare_values, Value, ValueKind};

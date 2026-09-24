@@ -107,6 +107,22 @@ async fn an_editor_query_stops_at_the_row_cap() {
     assert_eq!(after.rows().unwrap().rows[0].0[0].to_text(), "42");
 }
 
+/// The editor's session says when a typed `BEGIN` is still open.
+#[tokio::test]
+async fn the_editor_session_reports_its_transaction() {
+    use dbui_domain::TransactionState;
+    let db = open("transaction-state").await;
+    let token = dbui_driver::QueryToken::new();
+    db.execute_tracked("SELECT 1", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Idle);
+    db.execute_tracked("BEGIN", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Open);
+    db.execute_tracked("SELECT 1", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Open);
+    db.execute_tracked("ROLLBACK", &token).await.unwrap();
+    assert_eq!(db.editor_transaction(), TransactionState::Idle);
+}
+
 /// A path that is not there is a typo worth reporting, not a reason to make an
 /// empty database and look like it worked.
 #[tokio::test]

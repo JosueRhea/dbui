@@ -2362,6 +2362,21 @@ impl DbUi {
         self.dispatch_statements(statements, cx);
     }
 
+    /// Whether the editor's session has a transaction open, as of its last
+    /// statement. Read off the driver, which asked the server.
+    pub(crate) fn editor_transaction(&self) -> dbui_app::domain::TransactionState {
+        self.workspace
+            .active_driver()
+            .map(|driver| driver.editor_transaction())
+            .unwrap_or_default()
+    }
+
+    /// The transaction bar's buttons: end the editor's transaction with
+    /// `statement` (`COMMIT` or `ROLLBACK`), as if it had been typed.
+    pub(crate) fn end_editor_transaction(&mut self, statement: &str, cx: &mut Context<Self>) {
+        self.dispatch_statements(vec![statement.to_string()], cx);
+    }
+
     pub(crate) fn run_all_queries(&mut self, cx: &mut Context<Self>) {
         let Some(statements) = self.resolve_run_all_sql() else {
             return;

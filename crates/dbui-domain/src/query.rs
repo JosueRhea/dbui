@@ -30,6 +30,24 @@ impl Row {
     }
 }
 
+/// What the SQL editor's session is doing with transactions, as last seen.
+///
+/// The editor runs on one connection of its own (see the driver's
+/// `sessions`), so a `BEGIN` typed there stays open across runs -- and
+/// something on screen has to say so, or a forgotten one holds its locks and
+/// its uncommitted changes until the app closes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransactionState {
+    /// Autocommit: every statement stands on its own.
+    #[default]
+    Idle,
+    /// A transaction is open and waiting for `COMMIT` or `ROLLBACK`.
+    Open,
+    /// A transaction is open but a statement in it failed. PostgreSQL refuses
+    /// everything but `ROLLBACK` from here on.
+    Failed,
+}
+
 /// A grid of decoded values.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResultSet {

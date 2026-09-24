@@ -732,7 +732,14 @@ impl DbUi {
                     .px_3()
                     .pt_2()
                     .pb_1()
-                    .child(caption("SQL", theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(caption("SQL", theme))
+                            .children(transaction_bar(self.editor_transaction(), theme, cx)),
+                    )
                     .child(
                         div()
                             .flex()
@@ -933,6 +940,48 @@ fn editor_resize_handle(
                 .bg(theme.text_faint),
         )
         .into_any_element()
+}
+
+/// What says a transaction is open in the editor's session, with the two
+/// ways out of it. Nothing when there is none.
+///
+/// A `BEGIN` typed and forgotten holds its locks and its uncommitted changes
+/// for as long as the app stays open, and nothing else on screen shows it.
+fn transaction_bar(
+    state: dbui_app::domain::TransactionState,
+    theme: &crate::theme::Theme,
+    cx: &mut Context<DbUi>,
+) -> Option<AnyElement> {
+    use dbui_app::domain::TransactionState;
+    let (label, color) = match state {
+        TransactionState::Idle => return None,
+        TransactionState::Open => ("Transaction open", theme.warning),
+        // PostgreSQL takes nothing but ROLLBACK from here.
+        TransactionState::Failed => ("Transaction failed — roll back to go on", theme.danger),
+    };
+    Some(
+        div()
+            .id("transaction-bar")
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(metrics::text_size_small())
+            .child(super::dot(color))
+            .child(div().text_color(color).child(label))
+            .when(state == TransactionState::Open, |bar| {
+                bar.child(
+                    button("transaction-commit", "Commit", theme, false).on_click(cx.listener(
+                        |this, _, _window, cx| this.end_editor_transaction("COMMIT", cx),
+                    )),
+                )
+            })
+            .child(
+                button("transaction-rollback", "Roll back", theme, false).on_click(
+                    cx.listener(|this, _, _window, cx| this.end_editor_transaction("ROLLBACK", cx)),
+                ),
+            )
+            .into_any_element(),
+    )
 }
 
 /// Where the completion popup sits in the editor body, and how tall it may
