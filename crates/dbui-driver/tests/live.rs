@@ -1527,6 +1527,47 @@ both_engines!(
     }
 );
 
+// A table read, then given a column, then read again -- in the editor and in
+// the grid. The second read used to reuse the cached prepared statement with
+// the old columns, which PostgreSQL refuses ("cached plan must not change
+// result type"), so the table could not be opened again until a restart.
+both_engines!(
+    a_table_given_a_column_still_reads,
+    |fx: Fixture| async move {
+        let driver = fx.driver();
+        let people = format!(
+            "{}.{}",
+            driver.quote_identifier(fx.schema()),
+            driver.quote_identifier("people")
+        );
+        let token = dbui_driver::QueryToken::new();
+        let select = format!("SELECT * FROM {people}");
+        let width = |result: dbui_domain::QueryResult| result.rows().unwrap().columns.len();
+
+        let before = width(fx.execute_tracked(&select, &token).await.unwrap());
+        for _ in 0..3 {
+            fx.table_rows(&fx.people(), Page::first(), "", &[])
+                .await
+                .unwrap();
+        }
+        fx.execute(&format!("ALTER TABLE {people} ADD COLUMN extra int"))
+            .await
+            .unwrap();
+
+        let after = fx.execute_tracked(&select, &token).await;
+        assert_eq!(width(after.expect("the editor reads it again")), before + 1);
+        // Several times, so every kept connection that saw the old shape is hit.
+        for _ in 0..5 {
+            let page = fx
+                .table_rows(&fx.people(), Page::first(), "", &[])
+                .await
+                .expect("the grid reads it again");
+            assert_eq!(page.columns.len(), before + 1);
+            assert_eq!(page.rows.len(), 5);
+        }
+    }
+);
+
 // Changing a table's shape, end to end, with the statements the structure
 // editor shows before it runs them.
 both_engines!(

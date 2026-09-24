@@ -199,7 +199,11 @@ impl DatabaseDriver for SqliteDriver {
         token: &QueryToken,
     ) -> Result<ResultSet> {
         let bound = sql_build::select_page_sql(Driver::Sqlite, table, where_clause, order);
-        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
+        // Not kept as a prepared statement: `SELECT *` is shaped by the table,
+        // and after a column is added PostgreSQL refuses a cached plan whose
+        // result type changed -- every later page of the table failed -- and
+        // SQLite quietly returns nothing.
+        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone())).persistent(false);
         for value in &bound.binds {
             query = bind_value(query, value);
         }
@@ -344,10 +348,15 @@ impl DatabaseDriver for SqliteDriver {
         let mut conn = self.interruptible_connection(sql, token).await?;
         let tracking = token.track(0);
 
+        // Never kept as a prepared statement (`persistent(false)`): run again
+        // after an ALTER TABLE -- here, or from any other session -- a cached
+        // plan still has the old columns, which PostgreSQL refuses and SQLite
+        // answers with no rows at all.
         let outcome = if query::returns_rows(sql) {
             // One row past the cap says whether there were more; the
             // statement is reset without stepping through the rest.
             sqlx::query(AssertSqlSafe(sql.to_string()))
+                .persistent(false)
                 .fetch(&mut *conn)
                 .take(ResultSet::QUERY_ROW_CAP + 1)
                 .try_collect()
@@ -355,6 +364,7 @@ impl DatabaseDriver for SqliteDriver {
                 .map(|rows| QueryOutcome::Rows(build_result_set(rows, ResultSet::QUERY_ROW_CAP)))
         } else {
             sqlx::query(AssertSqlSafe(sql.to_string()))
+                .persistent(false)
                 .execute(&mut *conn)
                 .await
                 .map(|done| QueryOutcome::Affected(done.rows_affected()))

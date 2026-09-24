@@ -275,7 +275,11 @@ impl DatabaseDriver for PostgresDriver {
         token: &QueryToken,
     ) -> Result<ResultSet> {
         let bound = sql_build::select_page_sql(Driver::Postgres, table, where_clause, order);
-        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone()));
+        // Not kept as a prepared statement: `SELECT *` is shaped by the table,
+        // and after a column is added PostgreSQL refuses a cached plan whose
+        // result type changed -- every later page of the table failed -- and
+        // SQLite quietly returns nothing.
+        let mut query = sqlx::query(AssertSqlSafe(bound.sql.clone())).persistent(false);
         for value in &bound.binds {
             query = bind_value(query, value);
         }
@@ -464,11 +468,16 @@ impl PostgresDriver {
             Rows(Vec<sqlx::postgres::PgRow>),
             Affected(u64),
         }
+        // Never kept as a prepared statement (`persistent(false)`): run again
+        // after an ALTER TABLE -- here, or from any other session -- a cached
+        // plan still has the old columns, which PostgreSQL refuses and SQLite
+        // answers with no rows at all.
         let ran = if query::returns_rows(sql) {
             // One row past the cap says whether there were more. The rest are
             // never decoded or kept, and `cut_short` stops the server sending
             // them.
             sqlx::query(AssertSqlSafe(sql.to_string()))
+                .persistent(false)
                 .fetch(lease.conn())
                 .take(ResultSet::QUERY_ROW_CAP + 1)
                 .try_collect()
@@ -476,6 +485,7 @@ impl PostgresDriver {
                 .map(Ran::Rows)
         } else {
             sqlx::query(AssertSqlSafe(sql.to_string()))
+                .persistent(false)
                 .execute(lease.conn())
                 .await
                 .map(|done| Ran::Affected(done.rows_affected()))

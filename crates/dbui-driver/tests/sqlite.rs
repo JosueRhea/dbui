@@ -123,6 +123,44 @@ async fn the_editor_session_reports_its_transaction() {
     assert_eq!(db.editor_transaction(), TransactionState::Idle);
 }
 
+/// A table read, then given a column, then read again. The cached statement
+/// kept the old column list while SQLite quietly re-prepared it with the new
+/// one, so the second read panicked inside sqlx and came back with no rows.
+#[tokio::test]
+async fn a_table_given_a_column_still_reads() {
+    let db = open("reshaped").await;
+    let token = dbui_driver::QueryToken::new();
+    let first = db
+        .execute_tracked("SELECT * FROM people", &token)
+        .await
+        .unwrap();
+    let (width, rows) = {
+        let set = first.rows().unwrap();
+        (set.columns.len(), set.rows.len())
+    };
+    assert!(rows > 0);
+    db.table_rows(&TableRef::new("main", "people"), Page::first(), "", &[])
+        .await
+        .unwrap();
+
+    db.execute("ALTER TABLE people ADD COLUMN extra TEXT")
+        .await
+        .unwrap();
+
+    let again = db
+        .execute_tracked("SELECT * FROM people", &token)
+        .await
+        .unwrap();
+    let set = again.rows().unwrap();
+    assert_eq!(set.columns.len(), width + 1);
+    assert_eq!(set.rows.len(), rows, "the same rows, not none");
+    let page = db
+        .table_rows(&TableRef::new("main", "people"), Page::first(), "", &[])
+        .await
+        .unwrap();
+    assert_eq!(page.columns.len(), width + 1);
+}
+
 /// A path that is not there is a typo worth reporting, not a reason to make an
 /// empty database and look like it worked.
 #[tokio::test]
