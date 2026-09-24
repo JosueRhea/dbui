@@ -295,7 +295,10 @@ fn has_returning(sql: &str) -> bool {
     while i < bytes.len() {
         match bytes[i] {
             quote @ (b'\'' | b'"' | b'`') => {
-                i = crate::sql_split::skip_quoted(bytes, i, quote);
+                // Backslashes read as escapes, as this always has: the
+                // question is only which call to make, and a misread costs a
+                // mislabelled summary, never a wrong statement.
+                i = crate::sql_split::skip_quoted(bytes, i, quote, true);
             }
             // Dollar-quoted bodies are values too, and a function body is
             // where a stray `RETURNING` is most likely to sit. Missing this

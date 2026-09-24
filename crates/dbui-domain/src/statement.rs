@@ -165,7 +165,13 @@ const WRITE_WORDS: [&str; 4] = ["INSERT", "UPDATE", "DELETE", "MERGE"];
 /// setting or asks for a writable transaction. `SELECT ... FOR UPDATE` is
 /// refused as well, which the server would do anyway.
 pub fn writes(sql: &str) -> bool {
-    let words = bare_words(sql);
+    // Read both ways a backslash can be taken, so a string this misreads
+    // cannot hide a word from the check: `'C:\' , ...` means different
+    // things to MySQL and to PostgreSQL.
+    writes_in(&bare_words(sql, false)) || writes_in(&bare_words(sql, true))
+}
+
+fn writes_in(words: &[String]) -> bool {
     let Some(first) = words.first() else {
         return false;
     };
@@ -187,7 +193,7 @@ pub fn writes(sql: &str) -> bool {
 /// Every unquoted word of `sql`, upper-cased, in order. Strings, quoted
 /// names, dollar-quoted bodies and comments are skipped whole, so a column
 /// called `"update"` or a string reading `'delete me'` is not a verb.
-fn bare_words(sql: &str) -> Vec<String> {
+fn bare_words(sql: &str, backslash: bool) -> Vec<String> {
     use crate::sql_split::{
         is_ident_cont, skip_block_comment, skip_dollar_quoted, skip_line_comment, skip_quoted,
     };
@@ -197,7 +203,7 @@ fn bare_words(sql: &str) -> Vec<String> {
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
-            quote @ (b'\'' | b'"' | b'`') => i = skip_quoted(bytes, i, quote),
+            quote @ (b'\'' | b'"' | b'`') => i = skip_quoted(bytes, i, quote, backslash),
             b'$' => i = skip_dollar_quoted(bytes, i).unwrap_or(i + 1),
             b'-' if bytes.get(i + 1) == Some(&b'-') => i = skip_line_comment(bytes, i),
             b'/' if bytes.get(i + 1) == Some(&b'*') => i = skip_block_comment(bytes, i),

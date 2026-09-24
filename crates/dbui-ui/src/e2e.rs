@@ -619,14 +619,42 @@ fn run_resolves_selection_then_statement_under_caret(cx: &mut TestAppContext) {
         if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
             editor.move_to(12);
         }
-        assert_eq!(view.resolve_run_sql().as_deref(), Some("SELECT 2"));
+        assert_eq!(view.resolve_run_sql(), Some(vec!["SELECT 2".to_string()]));
 
         // Selection wins over caret.
         if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
             editor.move_to(0);
             editor.select_to(8); // "SELECT 1"
         }
-        assert_eq!(view.resolve_run_sql().as_deref(), Some("SELECT 1"));
+        assert_eq!(view.resolve_run_sql(), Some(vec!["SELECT 1".to_string()]));
+
+        // A selection spanning statements runs each of them, not one string
+        // with a `;` in it.
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(0);
+            editor.select_to(18);
+        }
+        assert_eq!(
+            view.resolve_run_sql(),
+            Some(vec!["SELECT 1".to_string(), "SELECT 2".to_string()])
+        );
+    });
+}
+
+/// The editor splits the way the connected engine reads strings: in SQLite a
+/// backslash is an ordinary character, so `'C:\'` ends where it looks like
+/// it ends and the caret's statement is the second one, not both merged.
+#[gpui::test]
+fn the_caret_statement_follows_the_engine_s_strings(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "backslash");
+    view.update(cx, |view, cx| {
+        open_sql_editor(view, cx);
+        let text = "SELECT 'C:\\'; SELECT 2";
+        set_sql_editor_text(view, text);
+        if let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active_mut() {
+            editor.move_to(text.len());
+        }
+        assert_eq!(view.resolve_run_sql(), Some(vec!["SELECT 2".to_string()]));
     });
 }
 

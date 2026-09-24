@@ -2351,10 +2351,10 @@ impl DbUi {
     }
 
     pub(crate) fn run_query(&mut self, cx: &mut Context<Self>) {
-        let Some(sql) = self.resolve_run_sql() else {
+        let Some(statements) = self.resolve_run_sql() else {
             return;
         };
-        self.dispatch_statements(vec![sql], cx);
+        self.dispatch_statements(statements, cx);
     }
 
     pub(crate) fn run_all_queries(&mut self, cx: &mut Context<Self>) {
@@ -2560,25 +2560,43 @@ impl DbUi {
         }
     }
 
-    /// ⌘↵ target: selection if present, else the statement under the caret.
-    pub(crate) fn resolve_run_sql(&self) -> Option<String> {
+    /// The engine the editor's SQL is for, which decides how its strings
+    /// read. Not connected, the standard reading.
+    pub(crate) fn sql_dialect(&self) -> dbui_app::domain::Driver {
+        self.workspace
+            .active()
+            .map_or(dbui_app::domain::Driver::Postgres, |entry| {
+                entry.config.driver
+            })
+    }
+
+    /// ⌘↵ target: the statements in the selection if there is one, else the
+    /// statement under the caret.
+    ///
+    /// A selection is split like Run All would split it. Sent whole, several
+    /// statements went to the server as one prepared statement, which
+    /// PostgreSQL refuses outright ("cannot insert multiple commands into a
+    /// prepared statement").
+    pub(crate) fn resolve_run_sql(&self) -> Option<Vec<String>> {
         let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active() else {
             return None;
         };
+        let dialect = self.sql_dialect();
         if let Some(selected) = editor.selected_text() {
-            let trimmed = selected.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            return Some(trimmed.to_string());
+            let statements: Vec<String> = dbui_app::domain::split_statements_for(dialect, selected)
+                .into_iter()
+                .map(|range| selected[range].trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return (!statements.is_empty()).then_some(statements);
         }
         let text = editor.text();
-        let range = dbui_app::domain::statement_at(text, editor.cursor())?;
+        let range = dbui_app::domain::statement_at_for(dialect, text, editor.cursor())?;
         let stmt = text[range].trim();
         if stmt.is_empty() {
             None
         } else {
-            Some(stmt.to_string())
+            Some(vec![stmt.to_string()])
         }
     }
 
@@ -2618,11 +2636,12 @@ impl DbUi {
         } else {
             editor.text()
         };
-        let statements: Vec<String> = dbui_app::domain::split_statements(scope)
-            .into_iter()
-            .map(|range| scope[range].trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let statements: Vec<String> =
+            dbui_app::domain::split_statements_for(self.sql_dialect(), scope)
+                .into_iter()
+                .map(|range| scope[range].trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         if statements.is_empty() {
             None
         } else {

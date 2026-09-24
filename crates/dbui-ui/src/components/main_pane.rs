@@ -618,7 +618,7 @@ impl DbUi {
         let hit_slot = editor.hit_bounds_slot();
         let scroll_handle = editor.scroll_handle().clone();
         let completion_scroll = self.completion_scroll.clone();
-        let sql_spans = sql_format::highlight_spans(editor.text());
+        let sql_spans = sql_format::highlight_spans(editor.text(), self.sql_dialect());
         let lines_owned: Vec<String> = layout.lines.iter().map(|l| (*l).to_string()).collect();
         let theme = &self.theme;
         let line_h = metrics::editor_line_height();
