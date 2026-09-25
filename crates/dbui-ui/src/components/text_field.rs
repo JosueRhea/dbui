@@ -61,6 +61,8 @@ pub enum InputTarget {
     FindReplacement,
     /// One of the structure sheet's text fields, by its focus position.
     SheetField(usize),
+    /// A `:name` value in the Parameters sheet.
+    ParamField(usize),
 }
 
 impl DbUi {
@@ -107,6 +109,10 @@ impl DbUi {
                 .schema_sheet
                 .as_mut()
                 .and_then(|sheet| sheet.input_mut(index)),
+            InputTarget::ParamField(index) => self
+                .param_sheet
+                .as_mut()
+                .and_then(|sheet| sheet.inputs.get_mut(index)),
             InputTarget::InsertField(index) => match self.tabs.active_mut() {
                 Some(crate::tabs::WorkspaceTab::Table {
                     pending_inserts,
@@ -181,6 +187,11 @@ impl DbUi {
             // moves which of its fields is typed into.
             InputTarget::SheetField(index) => {
                 if let Some(sheet) = self.schema_sheet.as_mut() {
+                    sheet.focused = index;
+                }
+            }
+            InputTarget::ParamField(index) => {
+                if let Some(sheet) = self.param_sheet.as_mut() {
                     sheet.focused = index;
                 }
             }
@@ -312,6 +323,7 @@ fn field_with_leading(
         InputTarget::FindQuery => "find-query-scroll".into(),
         InputTarget::FindReplacement => "find-replacement-scroll".into(),
         InputTarget::SheetField(index) => ("sheet-field-scroll", index).into(),
+        InputTarget::ParamField(index) => ("param-field-scroll", index).into(),
     };
 
     if input.is_multiline() {

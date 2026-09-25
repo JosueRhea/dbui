@@ -36,6 +36,43 @@ pub const RELATIONS: &str = "
      ORDER BY TABLE_SCHEMA, TABLE_NAME
 ";
 
+/// Stored functions and procedures, then triggers. Events are left out:
+/// they are scheduled jobs, closer to cron than to the schema.
+pub const OBJECTS: &str = "
+    SELECT ROUTINE_SCHEMA      AS schema_name,
+           ROUTINE_NAME        AS object_name,
+           LOWER(ROUTINE_TYPE) AS object_kind,
+           CAST(NULL AS CHAR)  AS detail
+      FROM information_schema.ROUTINES
+     WHERE ROUTINE_SCHEMA NOT IN (
+         'mysql', 'information_schema', 'performance_schema', 'sys', '_vt'
+     )
+    UNION ALL
+    SELECT TRIGGER_SCHEMA, TRIGGER_NAME, 'trigger', EVENT_OBJECT_TABLE
+      FROM information_schema.TRIGGERS
+     WHERE TRIGGER_SCHEMA NOT IN (
+         'mysql', 'information_schema', 'performance_schema', 'sys', '_vt'
+     )
+     ORDER BY 1, 3, 2
+";
+
+/// Client threads, busiest first. The event scheduler and replication
+/// threads report `Daemon` and are not something to cancel.
+pub const SESSIONS: &str = "
+    SELECT CAST(ID AS SIGNED)          AS id,
+           COALESCE(USER, '')          AS user_name,
+           COALESCE(DB, '')            AS database_name,
+           COALESCE(HOST, '')          AS client,
+           COALESCE(COMMAND, '')       AS state,
+           NULLIF(STATE, '')           AS waiting_on,
+           COALESCE(INFO, '')          AS query,
+           CAST(TIME AS DOUBLE)        AS running_for,
+           CAST(ID = CONNECTION_ID() AS SIGNED) AS is_self
+      FROM information_schema.PROCESSLIST
+     WHERE COMMAND <> 'Daemon'
+     ORDER BY COMMAND = 'Sleep', TIME DESC
+";
+
 /// `COLUMN_TYPE` rather than `DATA_TYPE`: the former is `varchar(255)` and
 /// `int unsigned`, the latter just `varchar` and `int`.
 pub const COLUMNS: &str = "

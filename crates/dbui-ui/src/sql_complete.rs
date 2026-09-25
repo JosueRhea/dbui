@@ -413,6 +413,7 @@ mod tests {
 
     fn catalog() -> Catalog {
         Catalog {
+            objects: Vec::new(),
             schemas: vec![Schema {
                 name: "public".into(),
                 tables: vec![Table {
@@ -427,6 +428,7 @@ mod tests {
     /// A catalog wide enough that its tables alone overflow the 40-item cap.
     fn wide_catalog() -> Catalog {
         Catalog {
+            objects: Vec::new(),
             schemas: vec![Schema {
                 name: "public".into(),
                 tables: (0..61)
@@ -581,6 +583,7 @@ mod tests {
     #[test]
     fn a_qualifier_that_names_both_a_schema_and_a_table_leads_with_columns() {
         let catalog = Catalog {
+            objects: Vec::new(),
             schemas: vec![
                 Schema {
                     name: "audit".into(),

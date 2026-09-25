@@ -508,3 +508,64 @@ mod tests {
         assert!(!entry.is_expanded("shop"));
     }
 }
+
+/// The connection list in folders: ungrouped connections first, in their own
+/// order, then each group in the order its first member appears, members in
+/// their own order. `Some(name)` marks where a folder starts.
+pub fn grouped(entries: &[ConnectionEntry]) -> Vec<(Option<&str>, &ConnectionEntry)> {
+    let mut out: Vec<(Option<&str>, &ConnectionEntry)> = entries
+        .iter()
+        .filter(|entry| entry.config.group.trim().is_empty())
+        .map(|entry| (None, entry))
+        .collect();
+    let mut groups: Vec<&str> = Vec::new();
+    for entry in entries {
+        let group = entry.config.group.trim();
+        if !group.is_empty() && !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    for group in groups {
+        let mut first = true;
+        for entry in entries.iter().filter(|e| e.config.group.trim() == group) {
+            out.push((first.then_some(group), entry));
+            first = false;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::*;
+    use dbui_domain::{ConnectionConfig, Driver};
+
+    #[test]
+    fn folders_keep_their_members_in_order_after_the_ungrouped() {
+        let config = |name: &str, group: &str| {
+            let mut config = ConnectionConfig::new(Driver::Postgres);
+            config.name = name.into();
+            config.group = group.into();
+            config
+        };
+        let workspace = Workspace::from_configs(vec![
+            config("a", "Acme"),
+            config("loose", ""),
+            config("b", "Globex"),
+            config("c", " Acme "),
+        ]);
+        let listed: Vec<(Option<&str>, &str)> = grouped(workspace.entries())
+            .into_iter()
+            .map(|(header, entry)| (header, entry.config.name.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (None, "loose"),
+                (Some("Acme"), "a"),
+                (None, "c"),
+                (Some("Globex"), "b"),
+            ]
+        );
+    }
+}

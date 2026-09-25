@@ -258,11 +258,16 @@ fn one_line_value(text: &str) -> String {
 /// Kept even when it produced no rows: "3 rows affected" is a result, and a
 /// batch where the interesting statement is the UPDATE in the middle is
 /// exactly the batch this exists for.
+#[derive(Clone)]
 pub struct StatementResult {
     pub sql: String,
     pub rows: Option<ResultView>,
     /// The one-line verdict, shown on the tab and in the status bar.
     pub summary: String,
+    /// The rows read as a query plan, when they are the output of `EXPLAIN`.
+    pub plan: Option<dbui_app::Plan>,
+    /// Show the raw rows even though they read as a plan.
+    pub show_rows: bool,
 }
 
 /// A run that stopped on an error, kept on the tab that ran it.
@@ -822,6 +827,9 @@ pub enum WorkspaceTab {
         /// their back -- so this reorders the rows already fetched and leaves
         /// the statement alone.
         sort: Option<QuerySort>,
+        /// A result kept to compare against: ⌘E and the history never
+        /// reuse this tab, so the next query does not overwrite it.
+        pinned: bool,
     },
 }
 
@@ -901,6 +909,7 @@ impl WorkspaceTab {
             draft: None,
             error: None,
             sort: None,
+            pinned: false,
         }
     }
 
@@ -928,8 +937,29 @@ impl WorkspaceTab {
     pub fn label(&self) -> String {
         match self {
             Self::Table { table, .. } => table.name.clone(),
+            Self::Sql {
+                pinned: true,
+                results,
+                active_result,
+                ..
+            } => {
+                let sql = results
+                    .get(*active_result)
+                    .map(|result| result.sql.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                let short: String = sql.chars().take(24).collect();
+                if sql.chars().count() > 24 {
+                    format!("Pinned · {short}…")
+                } else {
+                    format!("Pinned · {short}")
+                }
+            }
             Self::Sql { .. } => "SQL Query".into(),
         }
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        matches!(self, Self::Sql { pinned: true, .. })
     }
 
     pub fn is_sql(&self) -> bool {
@@ -1240,7 +1270,11 @@ impl Tabs {
 
     /// Focus the SQL tab, creating one if needed.
     pub fn open_sql(&mut self) -> usize {
-        if let Some(index) = self.items.iter().position(|tab| tab.is_sql()) {
+        if let Some(index) = self
+            .items
+            .iter()
+            .position(|tab| tab.is_sql() && !tab.is_pinned())
+        {
             self.active = index;
             return index;
         }
@@ -1282,11 +1316,62 @@ impl Tabs {
         }
     }
 
-    /// This tab set as it survives a restart.
+    /// Keep the query tab's current result in a tab of its own, next to it,
+    /// and stay where the query is. Returns the new tab's index.
+    pub fn pin_active(&mut self) -> Option<usize> {
+        let Some(WorkspaceTab::Sql {
+            editor,
+            results,
+            active_result,
+            result: Some(result),
+            ..
+        }) = self.items.get(self.active)
+        else {
+            return None;
+        };
+        let (text, results, active_result, result) = (
+            editor.text().to_string(),
+            results.clone(),
+            *active_result,
+            result.clone(),
+        );
+        let id = self.alloc_id();
+        let mut pinned = WorkspaceTab::sql(id);
+        if let WorkspaceTab::Sql {
+            editor,
+            results: r,
+            active_result: a,
+            result: v,
+            pinned: p,
+            ..
+        } = &mut pinned
+        {
+            *editor = TextInput::with_text(text, true);
+            *r = results;
+            *a = active_result;
+            *v = Some(result);
+            *p = true;
+        }
+        let at = self.active + 1;
+        self.items.insert(at, pinned);
+        Some(at)
+    }
+
+    /// This tab set as it survives a restart. Pinned results are left out:
+    /// rows are never saved, and a pinned tab is nothing but its rows.
     pub fn to_saved(&self) -> (Vec<SavedTab>, usize) {
+        let kept: Vec<usize> = (0..self.items.len())
+            .filter(|&index| !self.items[index].is_pinned())
+            .collect();
+        let active = kept
+            .iter()
+            .position(|&index| index >= self.active)
+            .unwrap_or(kept.len().saturating_sub(1));
         (
-            self.items.iter().map(WorkspaceTab::to_saved).collect(),
-            self.active,
+            kept.iter()
+                .map(|&index| self.items[index].to_saved())
+                .collect(),
+            active,
         )
     }
 

@@ -6,7 +6,9 @@
 //! other two can only prove against a running server, this proves on every
 //! `cargo test`.
 
-use dbui_domain::{ConnectionConfig, Driver, Page, QueryOutcome, SortKey, TableRef, Value};
+use dbui_domain::{
+    ConnectionConfig, Driver, ObjectKind, Page, QueryOutcome, SortKey, TableRef, Value,
+};
 use dbui_driver::{DatabaseDriver, RowBatch, RowDelete, RowInsert, RowUpdate};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -772,4 +774,29 @@ async fn the_structure_editor_statements_run_on_sqlite() {
         .unwrap()
         .iter()
         .all(|c| c.name != "slogan"));
+}
+
+/// A trigger is listed under the table it is on, and its definition is the
+/// statement that created it.
+#[tokio::test]
+async fn triggers_are_listed_with_their_definitions() {
+    let db = open("triggers").await;
+    db.execute(
+        "CREATE TRIGGER people_trim AFTER INSERT ON people
+         BEGIN UPDATE people SET name = trim(name) WHERE id = NEW.id; END",
+    )
+    .await
+    .expect("create trigger");
+
+    let catalog = db.catalog().await.expect("catalog");
+    let trigger = catalog
+        .objects_of("main", ObjectKind::Trigger)
+        .find(|object| object.name == "people_trim")
+        .cloned()
+        .expect("the trigger is listed");
+    assert_eq!(trigger.detail.as_deref(), Some("people"));
+
+    let body = db.definition(&trigger).await.expect("definition");
+    assert!(body.starts_with("CREATE TRIGGER people_trim"), "{body}");
+    assert!(body.trim_end().ends_with("END;"), "{body}");
 }

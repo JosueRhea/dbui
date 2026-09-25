@@ -21,7 +21,8 @@
 //! For the engines' own behaviour, under the UI, see
 //! `crates/dbui-driver/tests/live.rs`.
 
-use crate::root::{DbUi, Focus, Status};
+use crate::components::connection_form::Field;
+use crate::root::{DbUi, Focus, SidebarItem, Status};
 use crate::tabs::WorkspaceTab;
 use dbui_app::domain::{ConnectionConfig, Driver, TableRef};
 use dbui_app::{DbRuntime, Workspace};
@@ -235,6 +236,104 @@ fn tab_skips_the_fields_an_engine_hides(cx: &mut TestAppContext) {
     });
 }
 
+/// The Group field files the connection into a folder.
+#[gpui::test]
+fn the_sheet_files_a_connection_into_a_group(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, _| {
+        view.modal.as_mut().unwrap().focus(Field::Group)
+    });
+    cx.simulate_keystrokes(&typing(" Acme "));
+    view.update(cx, |view, _| {
+        assert_eq!(view.modal.as_ref().unwrap().to_config().group, "Acme");
+    });
+}
+
+/// Ticking the tunnel shows its fields and moves into the first of them;
+/// Tab walks them; unticking hides them again but keeps what was typed.
+#[gpui::test]
+fn the_ssh_tunnel_fields_open_with_the_toggle(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        let form = view.modal.as_mut().unwrap();
+        assert!(!form.shows(Field::SshHost), "hidden until asked for");
+        form.toggle_ssh();
+        assert!(form.shows(Field::SshHost));
+        cx.notify();
+    });
+
+    cx.simulate_keystrokes(&typing("bastion.example.com"));
+    // SSH port, then SSH user.
+    cx.simulate_keystrokes("tab tab");
+    cx.simulate_keystrokes(&typing("deploy"));
+    view.update(cx, |view, _| {
+        let config = view.modal.as_ref().unwrap().to_config();
+        assert!(config.uses_ssh());
+        assert_eq!(config.ssh.host, "bastion.example.com");
+        assert_eq!(config.ssh.port, 22);
+        assert_eq!(config.ssh.username, "deploy");
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    });
+
+    view.update(cx, |view, cx| {
+        let form = view.modal.as_mut().unwrap();
+        form.toggle_ssh();
+        assert!(!form.shows(Field::SshHost));
+        let config = form.to_config();
+        assert!(!config.uses_ssh());
+        assert_eq!(config.ssh.host, "bastion.example.com", "kept for next time");
+        cx.notify();
+    });
+    // Focus left the hidden field, so typing lands somewhere visible.
+    cx.simulate_keystrokes(&clear_field());
+    cx.simulate_keystrokes(&typing("Prod"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.modal.as_ref().unwrap().to_config().name, "Prod");
+    });
+}
+
+/// A switched-on tunnel with no host is a complaint, not a dial.
+#[gpui::test]
+fn an_ssh_tunnel_without_a_host_is_refused(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().toggle_ssh();
+        view.save_connection(cx);
+        let form = view.modal.as_ref().expect("still open");
+        assert!(form.has_problem());
+    });
+}
+
+/// SQLite has no server, so it has no tunnel to offer either.
+#[gpui::test]
+fn a_file_engine_hides_the_tunnel(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, _| {
+        let form = view.modal.as_mut().unwrap();
+        form.toggle_ssh();
+        form.set_driver(Driver::Sqlite);
+        assert!(!form.ssh_enabled());
+        assert!(!form.shows(Field::SshHost));
+    });
+}
+
+/// The sheet with every tunnel field open still paints at every size.
+#[gpui::test]
+fn the_sheet_with_a_tunnel_draws(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, cx| {
+        view.modal.as_mut().unwrap().toggle_ssh();
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+}
+
 /// A path longer than the box pans under the caret; the box and the sheet
 /// keep their width. It used to run out past the sheet's edge.
 #[gpui::test]
@@ -317,9 +416,9 @@ fn tab_walks_the_fields_and_wraps(cx: &mut TestAppContext) {
         assert_eq!(config.name, "New PostgreSQL", "the name was left alone");
     });
 
-    // Port, User, Password, Database, Timeout, then Cancel / Test / Save,
-    // then wrap to Name.
-    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab tab");
+    // Port, User, Password, Database, Timeout, Group, then Cancel / Test /
+    // Save, then wrap to Name.
+    cx.simulate_keystrokes("tab tab tab tab tab tab tab tab tab tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("wrapped"));
 
@@ -338,8 +437,8 @@ fn shift_tab_walks_backwards(cx: &mut TestAppContext) {
     let (view, cx) = open(cx);
     cx.simulate_keystrokes("cmd-n");
 
-    // From Name: Save → Test → Cancel → Timeout → Database.
-    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab");
+    // From Name: Save → Test → Cancel → Group → Timeout → Database.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab shift-tab");
     cx.simulate_keystrokes(&clear_field());
     cx.simulate_keystrokes(&typing("shop"));
 
@@ -364,8 +463,8 @@ fn the_query_timeout_is_typed_in_seconds(cx: &mut TestAppContext) {
         );
     });
 
-    // From Name: Save → Test → Cancel → Timeout.
-    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab");
+    // From Name: Save → Test → Cancel → Group → Timeout.
+    cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab shift-tab");
     cx.simulate_keystrokes(&typing("30"));
     view.update(cx, |view, _| {
         let config = view.modal.as_ref().unwrap().to_config();
@@ -3919,6 +4018,619 @@ fn a_read_only_connection_refuses_writes_from_the_editor(cx: &mut TestAppContext
     });
 }
 
+/// Tag a live connection production, the way the sheet would.
+fn tag_production(view: &mut DbUi) {
+    let id = view.workspace.active_id().unwrap();
+    view.workspace.get_mut(id).unwrap().config.environment =
+        dbui_app::domain::Environment::Production;
+}
+
+/// On production a writing statement waits for an answer; Escape sends
+/// nothing, Enter sends the whole run as typed.
+#[gpui::test]
+fn production_asks_before_the_editor_writes(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "editor-production");
+    view.update(cx, |view, cx| {
+        tag_production(view);
+        view.put_sql_in_editor("DELETE FROM members WHERE id = 1", cx);
+        view.run_query(cx);
+        let guard = view.production_guard.as_ref().expect("asked first");
+        assert!(
+            guard.body().contains("DELETE FROM members"),
+            "{}",
+            guard.body()
+        );
+    });
+
+    cx.simulate_keystrokes("escape");
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| assert!(view.production_guard.is_none()));
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2"
+    );
+
+    view.update(cx, |view, cx| view.run_query(cx));
+    // ⌘↵ again is not an answer -- it is how the question was raised.
+    cx.simulate_keystrokes("cmd-enter");
+    view.update(cx, |view, _| assert!(view.production_guard.is_some()));
+    cx.simulate_keystrokes("enter");
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| {
+        assert!(view.production_guard.is_none());
+        assert!(!view.production_confirmed, "the pass was for one run only");
+    });
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "1"
+    );
+}
+
+/// Reads never ask, production or not.
+#[gpui::test]
+fn production_lets_reads_through(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "editor-production-read");
+    view.update(cx, |view, cx| {
+        tag_production(view);
+        view.put_sql_in_editor("SELECT count(*) FROM members", cx);
+        view.run_query(cx);
+        assert!(view.production_guard.is_none());
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+}
+
+/// ⌘S on production asks too, and the answer commits the batch.
+#[gpui::test]
+fn production_asks_before_a_commit(cx: &mut TestAppContext) {
+    let (view, cx, db) = open_connected(cx, "commit-production");
+    view.update(cx, |view, cx| {
+        tag_production(view);
+        view.open_table_tab(TableRef::new("main", "members"), cx);
+    });
+    settle_rows(&view, cx);
+    view.update(cx, stage_one_edit);
+
+    cx.simulate_keystrokes("cmd-s");
+    view.update(cx, |view, _| {
+        let guard = view.production_guard.as_ref().expect("asked first");
+        assert_eq!(guard.body(), "1 staged change will be committed.");
+        assert_eq!(view.tabs.active().unwrap().pending_change_count(), 1);
+    });
+    // Nothing reached the file while the question stood.
+    let before = read_back(&db.path, "SELECT name FROM members ORDER BY id");
+
+    view.update(cx, |view, cx| view.confirm_production_write(cx));
+    settle(&view, cx, |view| {
+        view.tabs.active().unwrap().pending_change_count() == 0
+            && !matches!(view.status, Status::Busy(_))
+    });
+    let after = read_back(&db.path, "SELECT name FROM members ORDER BY id");
+    assert_ne!(before, after, "the commit went through");
+}
+
+/// The question paints, over a commit and over statements, at every size.
+#[gpui::test]
+fn the_production_guard_draws(cx: &mut TestAppContext) {
+    use crate::components::production_guard::{GuardedWrite, ProductionGuard};
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+    for write in [
+        GuardedWrite::Commit { changes: 3 },
+        GuardedWrite::Statements(vec!["UPDATE orders SET status = 'x'".into()]),
+    ] {
+        view.update(cx, |view, cx| {
+            view.production_guard = Some(ProductionGuard {
+                write: write.clone(),
+                connection: "prod".into(),
+            });
+            cx.notify();
+        });
+        draw_at_every_size(&view, cx);
+    }
+}
+
+/// The sheet stores the tag it was given.
+#[gpui::test]
+fn the_sheet_sets_the_environment_tag(cx: &mut TestAppContext) {
+    use dbui_app::domain::Environment;
+    let (view, cx) = open(cx);
+    cx.simulate_keystrokes("cmd-n");
+    view.update(cx, |view, _| {
+        let form = view.modal.as_mut().unwrap();
+        assert_eq!(form.environment(), Environment::None);
+        form.set_environment(Environment::Staging);
+        assert_eq!(form.to_config().environment, Environment::Staging);
+    });
+}
+
+/// ⌘⌥E asks for the plan instead of the rows, draws it as a tree, and the
+/// statement it explains is never run.
+#[gpui::test]
+fn explain_draws_the_plan_and_runs_nothing(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, db) = open_connected(cx, "explain");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "SELECT m.name FROM members m JOIN teams t ON t.slug = m.team_slug WHERE m.id > 0",
+            cx,
+        );
+    });
+    cx.simulate_keystrokes("cmd-alt-e");
+    settle(&view, cx, |view| view.active_plan().is_some());
+    view.update(cx, |view, _| {
+        let plan = view.active_plan().unwrap();
+        let titles: Vec<&str> = plan.steps.iter().map(|s| s.title.as_str()).collect();
+        assert!(
+            titles
+                .iter()
+                .any(|t| t.contains("members") || t.contains(" m")),
+            "{titles:?}"
+        );
+    });
+    draw_at_every_size(&view, cx);
+
+    // The rows are one click away, and the plan one click back.
+    view.update(cx, |view, cx| {
+        view.toggle_plan_rows(cx);
+        assert!(view.active_plan().is_none());
+        assert!(view.active_result_has_plan());
+    });
+    draw_at_every_size(&view, cx);
+    view.update(cx, |view, cx| {
+        view.toggle_plan_rows(cx);
+        assert!(view.active_plan().is_some());
+    });
+
+    // Explaining a DELETE deletes nothing.
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("DELETE FROM members", cx);
+        view.explain_query(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    assert_eq!(
+        read_back(&db.path, "SELECT count(*) FROM members")[0][0],
+        "2"
+    );
+}
+
+/// A trigger shows up in the tree under its own folded group, and opening it
+/// puts the statement that created it in a new query tab.
+#[gpui::test]
+fn a_trigger_is_listed_and_opens_its_definition(cx: &mut TestAppContext) {
+    use dbui_app::domain::ObjectKind;
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "objects");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "CREATE TRIGGER members_trim AFTER INSERT ON members \
+             BEGIN UPDATE members SET name = trim(name) WHERE id = NEW.id; END",
+            cx,
+        );
+        view.run_query(cx);
+    });
+    // A CREATE refreshes the catalog on its own.
+    settle(&view, cx, |view| {
+        view.workspace
+            .active()
+            .and_then(|entry| entry.catalog.as_ref())
+            .is_some_and(|catalog| !catalog.objects.is_empty())
+    });
+
+    let group = SidebarItem::Group {
+        connection: view.update(cx, |view, _| view.workspace.active_id().unwrap()),
+        schema: "main".into(),
+        kind: ObjectKind::Trigger,
+    };
+    view.update(cx, |view, cx| {
+        let items = view.sidebar_visible_items();
+        assert!(items.contains(&group), "the group is listed: {items:?}");
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, SidebarItem::Object { .. })),
+            "and folded until opened"
+        );
+        view.set_sidebar_cursor(group.clone(), cx);
+        view.sidebar_activate(cx);
+        let object = view
+            .sidebar_visible_items()
+            .into_iter()
+            .find(|item| matches!(item, SidebarItem::Object { .. }))
+            .expect("opening the group lists the trigger");
+        view.set_sidebar_cursor(object, cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    let tabs_before = view.update(cx, |view, _| view.tabs.items.len());
+    view.update(cx, |view, cx| view.sidebar_activate(cx));
+    settle(&view, cx, |view| view.tabs.items.len() > tabs_before);
+    view.update(cx, |view, _| {
+        let Some(WorkspaceTab::Sql { editor, .. }) = view.tabs.active() else {
+            panic!("a query tab opened");
+        };
+        assert!(
+            editor.text().starts_with("CREATE TRIGGER members_trim"),
+            "{}",
+            editor.text()
+        );
+    });
+
+    // Left from the object goes back up to its group.
+    view.update(cx, |view, cx| {
+        let object = view
+            .sidebar_visible_items()
+            .into_iter()
+            .find(|item| matches!(item, SidebarItem::Object { .. }))
+            .unwrap();
+        view.set_sidebar_cursor(object, cx);
+        view.sidebar_expand(false, cx);
+        assert_eq!(view.sidebar_cursor.as_ref(), Some(&group));
+    });
+}
+
+/// A SQLite file has no server, so the activity panel says so rather than
+/// opening onto nothing.
+#[gpui::test]
+fn a_file_has_no_server_activity(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "activity-sqlite");
+    cx.simulate_keystrokes("cmd-alt-a");
+    view.update(cx, |view, _| {
+        assert!(view.activity.is_none());
+        assert!(
+            describe(&view.status).contains("no server"),
+            "{}",
+            describe(&view.status)
+        );
+    });
+}
+
+/// The panel paints busy, idle, waiting and slow rows and a row asking to be
+/// confirmed; Escape takes back the question first, then the panel.
+#[gpui::test]
+fn the_activity_panel_draws_and_escape_backs_out(cx: &mut TestAppContext) {
+    use crate::components::activity::ActivityPanel;
+    use dbui_app::domain::ServerSession;
+    let _lock = layout_lock();
+    let (view, cx) = open(cx);
+    let session = |id: i64, state: &str, query: &str, seconds: f64, is_self: bool| ServerSession {
+        id,
+        user: "app".into(),
+        database: "shop".into(),
+        client: "10.0.0.4 · api".into(),
+        state: state.into(),
+        waiting_on: (state == "active").then(|| "Lock: transactionid".to_string()),
+        query: query.into(),
+        running_for: Some(seconds),
+        is_self,
+    };
+    view.update(cx, |view, cx| {
+        view.activity = Some(ActivityPanel {
+            sessions: vec![
+                session(
+                    101,
+                    "active",
+                    "UPDATE orders\n SET status = 'x'",
+                    1_250.0,
+                    false,
+                ),
+                session(102, "idle in transaction", "SELECT 1", 30.0, false),
+                session(103, "idle", "COMMIT", 3.0, false),
+                session(104, "active", "SELECT * FROM pg_stat_activity", 0.01, true),
+            ],
+            loaded: true,
+            error: None,
+            show_idle: false,
+            confirming: Some((101, true)),
+            generation: 1,
+        });
+        let panel = view.activity.as_ref().unwrap();
+        assert_eq!(panel.visible().len(), 3, "the plain idle one is hidden");
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+    view.update(cx, |view, cx| {
+        view.toggle_activity_idle(cx);
+        assert_eq!(view.activity.as_ref().unwrap().visible().len(), 4);
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        let panel = view.activity.as_ref().expect("still open");
+        assert!(panel.confirming.is_none(), "the question went first");
+    });
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert!(view.activity.is_none()));
+}
+
+/// Dump one database from the app, empty another, run the dump there with
+/// Run SQL File, and the two hold the same rows.
+#[gpui::test]
+fn a_dump_run_as_a_file_rebuilds_the_database(cx: &mut TestAppContext) {
+    let (view, cx, first, second) = open_two_connected(cx, "dump");
+    let dump = ScratchFile::new("dump.sql");
+
+    // Something only the first one has.
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "INSERT INTO members (name, team_slug) VALUES ('It''s \\ Linus', 'ops')",
+            cx,
+        );
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, cx| {
+        view.dump_database_to(dump.0.clone(), None, cx)
+    });
+    settle(&view, cx, |view| {
+        describe(&view.status).starts_with("info: Dumped")
+    });
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(said.contains("2 tables, 5 rows"), "{said}");
+    });
+
+    // Over to the second, emptied.
+    let second_id = view.update(cx, |view, _| view.workspace.entries()[1].id());
+    view.update(cx, |view, cx| view.open_connection_tab(second_id, cx));
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "DROP VIEW active_members; DROP TABLE members; DROP TABLE teams",
+            cx,
+        );
+        view.run_all_queries(cx);
+    });
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+
+    view.update(cx, |view, cx| view.run_sql_file_at(&dump.0, cx));
+    settle(&view, cx, |view| {
+        describe(&view.status).starts_with("info: Ran")
+    });
+    for sql in [
+        "SELECT * FROM members ORDER BY id",
+        "SELECT * FROM teams ORDER BY slug",
+        "SELECT * FROM active_members ORDER BY id",
+    ] {
+        assert_eq!(
+            read_back(&first.path, sql),
+            read_back(&second.path, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// A file that fails partway says which statement stopped it.
+#[gpui::test]
+fn a_failing_file_names_the_statement(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "run-file-fails");
+    let file = ScratchFile::new("broken.sql");
+    std::fs::write(&file.0, "SELECT 1;\nSELECT * FROM nowhere;\nSELECT 3;\n").unwrap();
+    view.update(cx, |view, cx| view.run_sql_file_at(&file.0, cx));
+    settle(&view, cx, |view| !matches!(view.status, Status::Busy(_)));
+    view.update(cx, |view, _| {
+        let said = describe(&view.status);
+        assert!(said.contains("stopped at statement 2 of 3"), "{said}");
+    });
+}
+
+/// ⌘⌥D draws the schema: a box per table and a line for the foreign key,
+/// at every window size and zoom; clicking a box opens that table.
+#[gpui::test]
+fn the_schema_diagram_draws_and_opens_a_table(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "diagram");
+    cx.simulate_keystrokes("cmd-alt-d");
+    settle(&view, cx, |view| {
+        view.er_diagram
+            .as_ref()
+            .is_some_and(|diagram| diagram.loaded)
+    });
+    view.update(cx, |view, _| {
+        let diagram = view.er_diagram.as_ref().unwrap();
+        let names: Vec<&str> = diagram
+            .tables
+            .iter()
+            .map(|t| t.table.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"members") && names.contains(&"teams"),
+            "{names:?}"
+        );
+        assert_eq!(diagram.edges.len(), 1, "members.team_slug -> teams.slug");
+        let edge = diagram.edges[0];
+        assert_eq!(diagram.tables[edge.to].table.name, "teams");
+        let (parent, child) = (
+            diagram.layout.positions[edge.to],
+            diagram.layout.positions[edge.from],
+        );
+        assert!(parent.x < child.x, "the parent is drawn to the left");
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes("cmd-=");
+    view.update(cx, |view, _| {
+        assert!(
+            view.er_diagram.as_ref().unwrap().zoom > 1.0,
+            "⌘= zooms the diagram"
+        );
+        assert_eq!(crate::theme::metrics::zoom_pct(), 100, "not the app");
+    });
+    view.update(cx, |view, cx| {
+        view.er_diagram.as_mut().unwrap().hover = Some(0);
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| assert!(view.er_diagram.is_none()));
+}
+
+/// A result the editor cut off at its cap exports whole: the file has every
+/// row, read again from the server, not just the ten thousand on screen.
+#[gpui::test]
+fn a_capped_result_exports_every_row(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "export-capped");
+    let csv = ScratchFile::new("all.csv");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12000) \
+             SELECT i, 'row ' || i AS label FROM n",
+            cx,
+        );
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|tab| tab.result()).is_some()
+    });
+    view.update(cx, |view, _| {
+        let set = &view.tabs.active().unwrap().result().unwrap().set;
+        assert!(set.truncated, "the editor stopped at its cap");
+        assert_eq!(set.rows.len(), dbui_app::domain::ResultSet::QUERY_ROW_CAP);
+    });
+    view.update(cx, |view, cx| {
+        view.export_to_path(csv.0.clone(), crate::row_export::RowFormat::Csv, cx)
+    });
+    let said = settle_export(&view, cx);
+    assert!(said.contains("Exported 12000 rows"), "{said}");
+    let text = std::fs::read_to_string(&csv.0).unwrap();
+    assert_eq!(text.lines().count(), 12_001, "a header and every row");
+    assert!(text.lines().last().unwrap().starts_with("12000,"));
+}
+
+/// A pinned result stays put while the query tab runs the next one; ⌘E and
+/// history go to the query tab, never the pinned one; and a pinned tab is
+/// not written to the session.
+#[gpui::test]
+fn a_pinned_result_survives_the_next_query(cx: &mut TestAppContext) {
+    let (view, cx, _db) = open_connected(cx, "pin");
+    let first_cell = |view: &DbUi, index: usize| {
+        view.tabs.items[index]
+            .result()
+            .and_then(|r| r.set.rows.first())
+            .map(|row| row.0[0].to_text())
+    };
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT count(*) FROM members", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|t| t.result()).is_some()
+    });
+    cx.simulate_keystrokes("cmd-alt-p");
+    view.update(cx, |view, _| {
+        assert_eq!(view.tabs.items.len(), 2);
+        assert!(view.tabs.items[1].is_pinned());
+        assert!(view.tabs.items[1]
+            .label()
+            .starts_with("Pinned · SELECT count"));
+        assert_eq!(view.tabs.active, 0, "the query tab stays in front");
+        assert_eq!(first_cell(view, 1).as_deref(), Some("2"));
+    });
+
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor("SELECT 42", cx);
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        first_cell(view, 0).as_deref() == Some("42")
+    });
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            first_cell(view, 1).as_deref(),
+            Some("2"),
+            "the pin kept its rows"
+        );
+        view.activate_tab(1, cx);
+        view.open_sql_tab(cx);
+        assert_eq!(view.tabs.active, 0, "⌘E goes to the query tab, not the pin");
+        let (saved, _) = view.tabs.to_saved();
+        assert_eq!(saved.len(), 1, "the pin is not saved");
+    });
+}
+
+/// A `:name` in a statement is asked for before it runs, goes in as the
+/// right literal, and is remembered for next time.
+#[gpui::test]
+fn named_parameters_are_asked_for_and_remembered(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "params");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            "SELECT name FROM members WHERE team_slug = :team AND id >= :min_id ORDER BY id",
+            cx,
+        );
+        view.run_query(cx);
+        let sheet = view.param_sheet.as_ref().expect("asked first");
+        assert_eq!(sheet.names, vec!["team", "min_id"]);
+    });
+    draw_at_every_size(&view, cx);
+
+    cx.simulate_keystrokes(&typing("ops"));
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes(&typing("1"));
+    cx.simulate_keystrokes("enter");
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|t| t.result()).is_some()
+    });
+    view.update(cx, |view, _| {
+        assert!(view.param_sheet.is_none());
+        let rows = &view.tabs.active().unwrap().result().unwrap().set.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0[0].to_text(), "Grace");
+    });
+
+    // Asked again, with last time's answers in place.
+    view.update(cx, |view, cx| {
+        view.run_query(cx);
+        let sheet = view.param_sheet.as_ref().expect("asked again");
+        assert_eq!(sheet.inputs[0].text(), "ops");
+        assert_eq!(sheet.inputs[1].text(), "1");
+    });
+    cx.simulate_keystrokes("escape");
+    view.update(cx, |view, _| {
+        assert!(view.param_sheet.is_none(), "Esc sends nothing")
+    });
+}
+
+/// A JSON cell can be read as a tree in the detail sidebar: branches fold,
+/// and clicking a value copies it and names its path.
+#[gpui::test]
+fn a_json_value_reads_as_a_tree(cx: &mut TestAppContext) {
+    let _lock = layout_lock();
+    let (view, cx, _db) = open_connected(cx, "json-tree");
+    view.update(cx, |view, cx| {
+        view.put_sql_in_editor(
+            r#"SELECT 1 AS id, '{"customer": {"name": "Ada", "tags": ["vip", 2]}, "ok": true}' AS meta"#,
+            cx,
+        );
+        view.run_query(cx);
+    });
+    settle(&view, cx, |view| {
+        view.tabs.active().and_then(|t| t.result()).is_some()
+    });
+    view.update(cx, |view, cx| {
+        view.select_row(0, cx);
+        view.toggle_json_tree("meta", cx);
+    });
+    draw_at_every_size(&view, cx);
+
+    view.update(cx, |view, cx| {
+        view.json_tree_closed.insert("meta\u{1f}$.customer".into());
+        cx.notify();
+    });
+    draw_at_every_size(&view, cx);
+    let value: serde_json::Value =
+        serde_json::from_str(r#"{"customer": {"name": "Ada"}, "ok": true}"#).unwrap();
+    let closed: std::collections::HashSet<String> = ["$.customer".to_string()].into();
+    let rows = crate::components::json_tree::rows(&value, &closed);
+    assert_eq!(rows.len(), 3, "the folded branch keeps its own row only");
+
+    view.update(cx, |view, cx| {
+        view.toggle_json_tree("meta", cx);
+        assert!(view.json_tree_fields.is_empty(), "and back to text");
+    });
+}
+
 /// A `BEGIN` run in the editor shows the transaction bar, which paints, and
 /// its Roll back button ends the transaction for real.
 #[gpui::test]
@@ -5181,6 +5893,7 @@ fn with_catalog<'a>(
 
     let (view, cx) = open_with(cx, saved_connections(1));
     let catalog = Catalog {
+        objects: Vec::new(),
         schemas: vec![Schema {
             name: "public".into(),
             tables: tables

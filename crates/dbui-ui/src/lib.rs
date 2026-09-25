@@ -6,6 +6,7 @@
 
 mod clock;
 mod components;
+mod er_layout;
 mod highlight;
 mod json_format;
 mod root;
@@ -169,6 +170,10 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-r", Refresh, Some("DbUi")),
         KeyBinding::new("cmd-enter", RunQuery, Some("DbUi")),
         KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
+        KeyBinding::new("cmd-alt-e", ExplainQuery, Some("DbUi")),
+        KeyBinding::new("cmd-alt-a", ServerActivity, Some("DbUi")),
+        KeyBinding::new("cmd-alt-d", ErDiagram, Some("DbUi")),
+        KeyBinding::new("cmd-alt-p", PinResult, Some("DbUi")),
         // ⌘. is the Mac's "stop" -- Terminal, Xcode and Finder copies all
         // answer to it.
         KeyBinding::new("cmd-.", StopQuery, Some("DbUi")),
@@ -208,6 +213,9 @@ fn menus() -> Vec<Menu> {
             name: "Connection".into(),
             items: vec![
                 MenuItem::action("New Connection", NewConnection),
+                MenuItem::action("Server Activity", ServerActivity),
+                MenuItem::action("Dump Database…", DumpDatabase),
+                MenuItem::action("Run SQL File…", RunSqlFile),
                 MenuItem::separator(),
                 MenuItem::action("Next Connection", NextConnection),
                 MenuItem::action("Previous Connection", PrevConnection),
@@ -218,6 +226,7 @@ fn menus() -> Vec<Menu> {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Change Theme…", ChooseTheme),
+                MenuItem::action("Schema Diagram", ErDiagram),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
@@ -262,6 +271,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("New Table…", NewTable),
                 MenuItem::action("Run Query", RunQuery),
                 MenuItem::action("Run All Queries", RunAllQueries),
+                MenuItem::action("Explain Query", ExplainQuery),
+                MenuItem::action("Pin Result", PinResult),
                 MenuItem::action("Stop Query", StopQuery),
                 MenuItem::separator(),
                 MenuItem::action("Save Query…", SaveQuery),
@@ -297,6 +308,12 @@ gpui::actions!(
         Refresh,
         RunQuery,
         RunAllQueries,
+        ExplainQuery,
+        PinResult,
+        ServerActivity,
+        ErDiagram,
+        DumpDatabase,
+        RunSqlFile,
         StopQuery,
         SaveQuery,
         OpenSavedQuery,

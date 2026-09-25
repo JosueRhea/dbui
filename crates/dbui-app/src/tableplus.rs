@@ -6,9 +6,13 @@
 //! keychain under service `com.tableplus.TablePlus`, account `{uuid}_database`.
 //!
 //! Only PostgreSQL and MySQL are imported — those are the engines dbui speaks.
-//! SSH-tunneled connections are skipped until we have a tunnel story.
+//! A connection TablePlus reaches over SSH comes across with its tunnel: the
+//! bastion's address, port and user, and its password (account
+//! `{uuid}_server`) when the keychain has one. One that names no bastion is
+//! skipped, because the only thing left to import is a direct dial to a host
+//! that was never meant to be reachable directly.
 
-use dbui_domain::{ConnectionConfig, ConnectionId, Driver, TlsMode};
+use dbui_domain::{ConnectionConfig, ConnectionId, Driver, Environment, SshConfig, TlsMode};
 use keyring::Entry;
 use plist::Value as PlistValue;
 use std::path::{Path, PathBuf};
@@ -34,7 +38,8 @@ pub struct ImportReport {
     pub skipped_existing: usize,
     /// Skipped because the driver is not PostgreSQL / MySQL.
     pub skipped_unsupported: usize,
-    /// Skipped because the connection uses an SSH tunnel.
+    /// Skipped because the connection uses an SSH tunnel whose server is not
+    /// in the file.
     pub skipped_ssh: usize,
     /// Imported without a password (keychain miss or empty).
     pub missing_password: usize,
@@ -65,7 +70,10 @@ impl ImportReport {
             ));
         }
         if self.skipped_ssh > 0 {
-            parts.push(format!("{} over SSH (skipped)", self.skipped_ssh));
+            parts.push(format!(
+                "{} over SSH with no server named (skipped)",
+                self.skipped_ssh
+            ));
         }
         if self.missing_password > 0 {
             parts.push(format!("{} without password", self.missing_password));
@@ -134,10 +142,19 @@ pub fn import_from_plist(
             continue;
         };
 
-        if plist_bool(dict.get("isOverSSH")).unwrap_or(false) {
-            report.skipped_ssh += 1;
-            continue;
-        }
+        let tp_id = plist_string(dict.get("ID")).unwrap_or_default();
+
+        let ssh = if plist_bool(dict.get("isOverSSH")).unwrap_or(false) {
+            match ssh_config(dict, &tp_id) {
+                Some(ssh) => ssh,
+                None => {
+                    report.skipped_ssh += 1;
+                    continue;
+                }
+            }
+        } else {
+            SshConfig::default()
+        };
 
         let driver_label = plist_string(dict.get("Driver")).unwrap_or_default();
         let Some(driver) = map_driver(&driver_label) else {
@@ -163,8 +180,7 @@ pub fn import_from_plist(
             continue;
         }
 
-        let tp_id = plist_string(dict.get("ID")).unwrap_or_default();
-        let password = load_tableplus_password(&tp_id).unwrap_or_default();
+        let password = load_tableplus_password(&tp_id, "database").unwrap_or_default();
         if password.is_empty() {
             report.missing_password += 1;
         }
@@ -191,6 +207,12 @@ pub fn import_from_plist(
             // connection -- the flag is the user's to set, not ours to guess.
             read_only: false,
             query_timeout_secs: 0,
+            ssh,
+            group: String::new(),
+            environment: map_environment(
+                plist_string(dict.get("Enviroment"))
+                    .or_else(|| plist_string(dict.get("Environment"))),
+            ),
         });
     }
 
@@ -202,6 +224,24 @@ fn map_driver(label: &str) -> Option<Driver> {
         "postgresql" | "postgres" => Some(Driver::Postgres),
         "mysql" | "mariadb" => Some(Driver::MySql),
         _ => None,
+    }
+}
+
+/// TablePlus tags each connection too, and the tag is the one thing about a
+/// production server worth bringing over intact. (Its plist has spelled the
+/// key both ways over the years.)
+fn map_environment(label: Option<String>) -> Environment {
+    match label
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "local" => Environment::Local,
+        "testing" | "development" => Environment::Testing,
+        "staging" => Environment::Staging,
+        "production" => Environment::Production,
+        _ => Environment::None,
     }
 }
 
@@ -259,11 +299,45 @@ fn already_have(
     })
 }
 
-fn load_tableplus_password(connection_id: &str) -> Option<String> {
+/// The tunnel TablePlus used for a connection, or `None` when the file does
+/// not say which server it goes through.
+fn ssh_config(dict: &plist::Dictionary, tp_id: &str) -> Option<SshConfig> {
+    let host = plist_string(dict.get("ServerAddress")).unwrap_or_default();
+    if host.trim().is_empty() {
+        return None;
+    }
+    let port = plist_string(dict.get("ServerPort"))
+        .and_then(|port| port.trim().parse().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(SshConfig::DEFAULT_PORT);
+    // TablePlus may keep a key as a bare name inside its own container, which
+    // is no path `ssh` can open. Only a real path is carried over; without
+    // one, ssh falls back to the agent and `~/.ssh/config`, which is where a
+    // bastion key usually is anyway.
+    let key_path = plist_string(dict.get("ServerPrivateKeyName"))
+        .map(|key| key.trim().to_string())
+        .filter(|key| key.starts_with('/') || key.starts_with("~/"))
+        .unwrap_or_default();
+    Some(SshConfig {
+        enabled: true,
+        host: host.trim().to_string(),
+        port,
+        username: plist_string(dict.get("ServerUser"))
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        key_path,
+        password: load_tableplus_password(tp_id, "server").unwrap_or_default(),
+    })
+}
+
+/// A secret TablePlus keeps in the keychain: `kind` is `database` for the
+/// database password and `server` for the SSH one.
+fn load_tableplus_password(connection_id: &str, kind: &str) -> Option<String> {
     if connection_id.is_empty() {
         return None;
     }
-    let account = format!("{connection_id}_database");
+    let account = format!("{connection_id}_{kind}");
     let entry = Entry::new(KEYCHAIN_SERVICE, &account).ok()?;
     match entry.get_password() {
         Ok(password) => Some(password),
@@ -336,6 +410,7 @@ mod tests {
     <key>DatabaseName</key><string>app</string>
     <key>tLSMode</key><integer>0</integer>
     <key>isOverSSH</key><false/>
+    <key>Enviroment</key><string>production</string>
   </dict>
   <dict>
     <key>ID</key><string>BBBB</string>
@@ -378,23 +453,23 @@ mod tests {
         assert_eq!(pg.driver, Driver::Postgres);
         assert_eq!(pg.port, 5432);
         assert_eq!(pg.tls, TlsMode::Prefer);
+        assert_eq!(pg.environment, Environment::Production);
 
         let mysql = &report.imported[1];
         assert_eq!(mysql.name, "shop");
         assert_eq!(mysql.driver, Driver::MySql);
         assert_eq!(mysql.port, 3307);
         assert_eq!(mysql.tls, TlsMode::Require);
+        assert_eq!(mysql.environment, Environment::None);
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A connection TablePlus reaches over SSH is skipped, not imported.
-    ///
-    /// dbui has no tunnel, so importing one would produce a connection that
-    /// dials the database host directly -- which either fails, or succeeds
-    /// against something that was never meant to be reachable.
+    /// A connection TablePlus reaches over SSH keeps its tunnel; one that
+    /// does not name the SSH server is skipped rather than imported as a
+    /// direct dial to a host that was never meant to be reachable.
     #[test]
-    fn skips_connections_that_go_over_ssh() {
+    fn brings_ssh_connections_over_with_their_tunnel() {
         let dir =
             std::env::temp_dir().join(format!("dbui-tableplus-{}-{}", std::process::id(), "ssh"));
         let path = dir.join("Connections.plist");
@@ -412,6 +487,19 @@ mod tests {
     <key>DatabaseUser</key><string>postgres</string>
     <key>DatabaseName</key><string>prod</string>
     <key>isOverSSH</key><true/>
+    <key>ServerAddress</key><string>bastion.example.com</string>
+    <key>ServerPort</key><string>2222</string>
+    <key>ServerUser</key><string>deploy</string>
+    <key>ServerPrivateKeyName</key><string>~/.ssh/id_bastion</string>
+  </dict>
+  <dict>
+    <key>Driver</key><string>PostgreSQL</string>
+    <key>ConnectionName</key><string>No server named</string>
+    <key>DatabaseHost</key><string>10.0.0.6</string>
+    <key>DatabasePort</key><string>5432</string>
+    <key>DatabaseUser</key><string>postgres</string>
+    <key>DatabaseName</key><string>other</string>
+    <key>isOverSSH</key><true/>
   </dict>
   <dict>
     <key>Driver</key><string>PostgreSQL</string>
@@ -428,8 +516,19 @@ mod tests {
 
         let report = import_from_plist(&path, &[]).expect("import");
         assert_eq!(report.skipped_ssh, 1);
-        assert_eq!(report.imported.len(), 1, "only the direct one came over");
-        assert_eq!(report.imported[0].host, "127.0.0.1");
+        assert_eq!(report.imported.len(), 2);
+
+        let tunneled = &report.imported[0];
+        assert_eq!(tunneled.host, "10.0.0.5");
+        assert!(tunneled.uses_ssh());
+        assert_eq!(tunneled.ssh.host, "bastion.example.com");
+        assert_eq!(tunneled.ssh.port, 2222);
+        assert_eq!(tunneled.ssh.username, "deploy");
+        assert_eq!(tunneled.ssh.key_path, "~/.ssh/id_bastion");
+
+        let direct = &report.imported[1];
+        assert_eq!(direct.host, "127.0.0.1");
+        assert!(!direct.uses_ssh());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

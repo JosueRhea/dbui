@@ -7,8 +7,8 @@
 
 use crate::runtime::{DbRuntime, Task};
 use dbui_domain::{
-    Catalog, Column, ColumnInfo, ConnectionConfig, Index, Page, QueryOutcome, QueryResult,
-    ResultSet, SortKey, TableKind, TableRef, Value,
+    Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Index, Page, QueryOutcome,
+    QueryResult, ResultSet, ServerSession, SortKey, TableKind, TableRef, Value,
 };
 use dbui_driver::{DatabaseDriver, DriverError, QueryToken, RowBatch, RowUpdate};
 use std::sync::Arc;
@@ -162,6 +162,25 @@ pub fn export_table(
         }
         sink.finish()?;
         Ok(read)
+    })
+}
+
+/// Run `sql` again and write every row it returns through `sink`, a page at
+/// a time -- for a result the editor cut off at its row cap. The editor
+/// shows ten thousand rows; a file can hold them all.
+pub fn export_query(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    sql: String,
+    mut sink: impl PageSink,
+) -> Task<Result<u64, String>> {
+    runtime.spawn(async move {
+        let count = driver
+            .stream_query(&sql, &mut |columns, rows| sink.page(columns, rows))
+            .await
+            .map_err(|error| error.to_string())?;
+        sink.finish()?;
+        Ok(count)
     })
 }
 
@@ -393,6 +412,139 @@ pub fn fetch_indexes(
     table: TableRef,
 ) -> Task<Outcome<Vec<Index>>> {
     runtime.spawn(async move { driver.indexes(&table).await })
+}
+
+/// Dump `schemas` to `path`, reporting each table as it starts in
+/// `progress`. Written beside the target and renamed into place, so a dump
+/// that fails halfway leaves no file that looks complete.
+pub fn dump_database(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    schemas: Vec<String>,
+    path: std::path::PathBuf,
+    progress: Arc<std::sync::Mutex<String>>,
+) -> Task<Result<crate::dump::DumpReport, String>> {
+    runtime.spawn(async move {
+        let partial = path.with_extension("sql.partial");
+        let file = std::fs::File::create(&partial)
+            .map_err(|error| format!("Could not create {}: {error}", partial.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        let written = crate::dump::dump(driver.as_ref(), &schemas, &mut out, |table| {
+            if let Ok(mut line) = progress.lock() {
+                *line = table.to_string();
+            }
+        })
+        .await;
+        drop(out);
+        match written {
+            Ok(report) => {
+                std::fs::rename(&partial, &path)
+                    .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&partial);
+                Err(error)
+            }
+        }
+    })
+}
+
+/// How a script run went.
+#[derive(Debug)]
+pub struct ScriptOutcome {
+    pub ran: usize,
+    pub total: usize,
+    pub elapsed: Duration,
+    /// The statement that stopped it (1-based), its text, and why.
+    pub failure: Option<(usize, String, DriverError)>,
+}
+
+/// Run a file's statements in order on the editor's session, stopping at the
+/// first that fails. `progress` counts the ones done, for a status line.
+///
+/// The editor's session rather than the pool, because a script sets things
+/// for the statements after it -- `USE`, `SET FOREIGN_KEY_CHECKS`, a `BEGIN`
+/// -- and a pool would hand each statement a different connection. Nothing
+/// is kept but the count: a restore is thousands of INSERTs, and their
+/// "1 row affected" is not worth holding.
+pub fn run_script(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    statements: Vec<String>,
+    mut stop: Stop,
+    progress: Arc<std::sync::atomic::AtomicUsize>,
+) -> Task<ScriptOutcome> {
+    runtime.spawn(async move {
+        let started = std::time::Instant::now();
+        let total = statements.len();
+        let mut ran = 0;
+        let mut failure = None;
+        for (index, sql) in statements.into_iter().enumerate() {
+            match run_stoppable(driver.as_ref(), &sql, &mut stop).await {
+                Ok(_) => {
+                    ran += 1;
+                    progress.store(ran, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    failure = Some((index + 1, sql, error));
+                    break;
+                }
+            }
+        }
+        ScriptOutcome {
+            ran,
+            total,
+            elapsed: started.elapsed(),
+            failure,
+        }
+    })
+}
+
+/// The columns of every table in `tables`, for the ER diagram. A table that
+/// will not describe itself is drawn with no columns rather than stopping
+/// the rest.
+pub fn fetch_all_columns(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    tables: Vec<TableRef>,
+) -> Task<Vec<(TableRef, Vec<Column>)>> {
+    runtime.spawn(async move {
+        let mut out = Vec::with_capacity(tables.len());
+        for table in tables {
+            let columns = driver.columns(&table).await.unwrap_or_default();
+            out.push((table, columns));
+        }
+        out
+    })
+}
+
+/// Every client connection on the server, for the activity panel.
+pub fn fetch_sessions(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+) -> Task<Outcome<Vec<ServerSession>>> {
+    runtime.spawn(async move { driver.server_sessions().await })
+}
+
+/// Cancel what a session is running, or (`terminate`) end the session.
+pub fn end_session(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    id: i64,
+    terminate: bool,
+) -> Task<Outcome<()>> {
+    runtime.spawn(async move { driver.end_session(id, terminate).await })
+}
+
+/// The statement that creates one function, trigger, sequence... for the
+/// tree to open in an editor.
+pub fn fetch_definition(
+    runtime: &DbRuntime,
+    driver: Arc<dyn DatabaseDriver>,
+    object: DbObject,
+) -> Task<Outcome<String>> {
+    runtime.spawn(async move { driver.definition(&object).await })
 }
 
 /// Run the statements a structure change is made of, in order, stopping at

@@ -351,7 +351,7 @@ fn inserts(
             .enumerate()
             .map(|(index, _)| {
                 row.get(index)
-                    .map(sql_literal)
+                    .map(|value| value.sql_literal(driver))
                     .unwrap_or_else(|| "NULL".to_string())
             })
             .collect();
@@ -362,23 +362,6 @@ fn inserts(
         ));
     }
     out
-}
-
-/// A value as SQL text.
-///
-/// This is the one place in the codebase that interpolates a *value* rather
-/// than binding it -- the output is text for a human to read and run, not a
-/// statement this app executes. Quotes are still doubled, so a pasted string
-/// cannot end its own literal.
-pub fn sql_literal(value: &Value) -> String {
-    match value {
-        Value::Null | Value::Default => "NULL".to_string(),
-        Value::Bool(flag) => if *flag { "TRUE" } else { "FALSE" }.to_string(),
-        Value::Int(number) => number.to_string(),
-        Value::Float(number) => number.to_string(),
-        Value::Decimal(text) => text.clone(),
-        other => format!("'{}'", other.to_text().replace('\'', "''")),
-    }
 }
 
 /// Rows read back off the clipboard.

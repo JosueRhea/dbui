@@ -8,6 +8,7 @@
 use crate::components::close_guard::{CloseGuard, CloseTarget, TabScope};
 use crate::components::context_menu::{ConfirmPrompt, ContextMenu};
 use crate::components::palette::{Palette, PaletteKind};
+use crate::components::production_guard::{GuardedWrite, ProductionGuard};
 use crate::components::{ConnectionForm, DetailInput, FormAction};
 use crate::sql_complete::CompletionPopup;
 use crate::tabs::{RowDraft, TabId, Tabs, WorkspaceTab};
@@ -79,6 +80,25 @@ pub enum SidebarItem {
         connection: ConnectionId,
         table: TableRef,
     },
+    /// "Functions", "Triggers"... under a schema, folded until opened.
+    Group {
+        connection: ConnectionId,
+        schema: String,
+        kind: dbui_app::domain::ObjectKind,
+    },
+    Object {
+        connection: ConnectionId,
+        object: dbui_app::domain::DbObject,
+    },
+}
+
+impl SidebarItem {
+    /// The fold key for an object group. Kept in the same list as schema
+    /// names -- and so in the session -- with a separator no schema name
+    /// can contain.
+    pub fn group_key(schema: &str, kind: dbui_app::domain::ObjectKind) -> String {
+        format!("{schema}\u{1f}{}", kind.label())
+    }
 }
 
 /// Where the rows on screen came from.
@@ -100,6 +120,7 @@ pub enum ResultSource {
 
 /// A result set, plus everything derived from it that the grid would otherwise
 /// recompute every frame.
+#[derive(Clone)]
 pub struct ResultView {
     pub set: ResultSet,
     /// Per-column pixel widths, measured once when the rows arrive.
@@ -459,6 +480,10 @@ pub struct DbUi {
     /// selection moves down the table, and a different table -- with different
     /// column names -- starts fresh.
     pub(crate) detail_collapsed: HashSet<String>,
+    /// JSON fields shown as a tree, by column name.
+    pub(crate) json_tree_fields: HashSet<String>,
+    /// Folded branches of those trees, as `field\u{1f}$.path`.
+    pub(crate) json_tree_closed: HashSet<String>,
     /// SQL editor pane height (dragged by the strip under the editor).
     pub(crate) editor_height: Pixels,
     /// Live drag for the SQL editor resize: `(pointer y, height)`.
@@ -525,6 +550,25 @@ pub struct DbUi {
     pub(crate) confirm: Option<ConfirmPrompt>,
     /// A close waiting on the user deciding what to do about staged changes.
     pub(crate) close_guard: Option<CloseGuard>,
+    /// "Write to production?" -- standing in front of a commit or a writing
+    /// statement on a connection tagged production.
+    pub(crate) production_guard: Option<ProductionGuard>,
+    /// Set for the one call the guard's answer makes, so that call is not
+    /// stopped by the same question again.
+    pub(crate) production_confirmed: bool,
+    /// The server activity panel, while it is open.
+    pub(crate) activity: Option<crate::components::activity::ActivityPanel>,
+    /// Counts openings of the panel, so a refresh loop can tell it has been
+    /// replaced by a newer one.
+    pub(crate) activity_generation: u64,
+    /// Stops the SQL file being run, while one is.
+    pub(crate) script_stop: Option<dbui_app::commands::StopHandle>,
+    /// The ER diagram, while it is open.
+    pub(crate) er_diagram: Option<crate::components::er_diagram::ErDiagram>,
+    /// Asking for a statement's `:name` values, before it runs.
+    pub(crate) param_sheet: Option<crate::components::params_sheet::ParamSheet>,
+    /// The value each `:name` was last given, to fill the sheet with next time.
+    pub(crate) param_values: std::collections::HashMap<String, String>,
     /// Bumped each time a commit puts its "Committing…" line up, so the one
     /// that lands can tell whether the line on screen is still its own.
     pub(crate) commit_stamp: u64,
@@ -720,6 +764,8 @@ impl DbUi {
             glass_blur: store::default_glass_blur(),
             detail_drag: None,
             detail_collapsed: HashSet::new(),
+            json_tree_fields: HashSet::new(),
+            json_tree_closed: HashSet::new(),
             change_bubble_height: px(BUBBLE_HEIGHT_DEFAULT),
             change_bubble_drag: None,
             editor_height: px(EDITOR_HEIGHT_DEFAULT),
@@ -745,6 +791,14 @@ impl DbUi {
             context_menu: None,
             confirm: None,
             close_guard: None,
+            production_guard: None,
+            production_confirmed: false,
+            activity: None,
+            activity_generation: 0,
+            script_stop: None,
+            er_diagram: None,
+            param_sheet: None,
+            param_values: std::collections::HashMap::new(),
             commit_stamp: 0,
             grid_scroll: UniformListScrollHandle::new(),
             grid_h_scroll: ScrollHandle::new(),
@@ -1021,6 +1075,21 @@ impl DbUi {
     }
 
     pub(crate) fn zoom_delta(&mut self, direction: i32, cx: &mut Context<Self>) {
+        // Over the diagram, ⌘= and ⌘- zoom the drawing, not the app: that is
+        // the thing being looked at, and it has a zoom of its own.
+        if self.er_diagram.is_some() {
+            match direction {
+                d if d > 0 => self.zoom_er_diagram(1.25, cx),
+                d if d < 0 => self.zoom_er_diagram(1.0 / 1.25, cx),
+                _ => {
+                    if let Some(diagram) = self.er_diagram.as_mut() {
+                        diagram.zoom = 1.0;
+                    }
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let pct = match direction {
             1 => metrics::zoom_in(),
             -1 => metrics::zoom_out(),
@@ -1788,7 +1857,9 @@ impl DbUi {
             .into_iter()
             .find_map(|item| match item {
                 SidebarItem::Table { table, .. } => Some(table),
-                SidebarItem::Schema { .. } => None,
+                SidebarItem::Schema { .. }
+                | SidebarItem::Group { .. }
+                | SidebarItem::Object { .. } => None,
             });
         let Some(table) = first else {
             return;
@@ -2359,6 +2430,9 @@ impl DbUi {
         let Some(statements) = self.resolve_run_sql() else {
             return;
         };
+        if self.ask_for_params(&statements, false, cx) {
+            return;
+        }
         self.dispatch_statements(statements, cx);
     }
 
@@ -2377,10 +2451,48 @@ impl DbUi {
         self.dispatch_statements(vec![statement.to_string()], cx);
     }
 
+    /// Ask for the plan of the statement under the caret (or each one in
+    /// the selection) instead of running it. The plan lands in the result
+    /// pane drawn as a tree; see `plan_view`.
+    ///
+    /// Plain `EXPLAIN`, never `ANALYZE`: the statement itself is not run, so
+    /// explaining a `DELETE` deletes nothing.
+    pub(crate) fn explain_query(&mut self, cx: &mut Context<Self>) {
+        let Some(statements) = self.resolve_run_sql() else {
+            return;
+        };
+        if self.ask_for_params(&statements, true, cx) {
+            return;
+        }
+        let driver = self.sql_dialect();
+        let explained = statements
+            .iter()
+            .map(|sql| dbui_app::plan::explain_sql(driver, sql))
+            .collect();
+        self.dispatch_statements(explained, cx);
+    }
+
+    /// Keep the result on screen in a tab of its own, to compare the next
+    /// run against. The query tab stays in front, ready for that run.
+    pub(crate) fn pin_result(&mut self, cx: &mut Context<Self>) {
+        match self.tabs.pin_active() {
+            Some(_) => {
+                self.status =
+                    Status::info("Pinned the result as a tab — run the next query to compare");
+                self.persist_session();
+            }
+            None => self.status = Status::info("Run a query first, then pin its result"),
+        }
+        cx.notify();
+    }
+
     pub(crate) fn run_all_queries(&mut self, cx: &mut Context<Self>) {
         let Some(statements) = self.resolve_run_all_sql() else {
             return;
         };
+        if self.ask_for_params(&statements, false, cx) {
+            return;
+        }
         self.dispatch_statements(statements, cx);
     }
 
@@ -2398,6 +2510,49 @@ impl DbUi {
     /// As one edit, so ⌘Z brings back what it replaced: the tab has one
     /// editor, and whatever was being written in it is not lost to a
     /// mis-picked history row or saved query.
+    /// Read a function's, trigger's... definition and open it in a new query
+    /// tab, where it can be read, changed and run back.
+    pub(crate) fn open_definition(
+        &mut self,
+        object: dbui_app::domain::DbObject,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(driver) = self.workspace.active_driver() else {
+            self.status = Status::error("Not connected");
+            cx.notify();
+            return;
+        };
+        let connection = self.workspace.active_id();
+        let label = format!("{} {}", object.kind.label(), object.name);
+        self.status = Status::busy(format!("Reading {label}…"));
+        cx.notify();
+        let task = commands::fetch_definition(&self.runtime, driver, object);
+        cx.spawn(async move |this, cx| {
+            let landed = task.await;
+            this.update(cx, |this, cx| {
+                // Opened on the connection it came from, or not at all: a
+                // definition dropped into another server's editor is one
+                // ⌘↵ away from being created there.
+                if this.workspace.active_id() != connection {
+                    return;
+                }
+                match landed {
+                    Some(Ok(sql)) => {
+                        this.load_sql_into_editor(&sql, &format!("Opened the {label}"), cx);
+                        if let Some(WorkspaceTab::Sql { editor, .. }) = this.tabs.active_mut() {
+                            editor.move_to(0);
+                        }
+                    }
+                    Some(Err(error)) => this.status = Status::error(error.to_string()),
+                    None => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn load_sql_into_editor(&mut self, sql: &str, said: &str, cx: &mut Context<Self>) {
         self.open_sql_tab(cx);
         if let Some(WorkspaceTab::Sql { editor, .. }) = self.tabs.active_mut() {
@@ -2686,6 +2841,13 @@ impl DbUi {
     /// The handle is taken rather than read, so a second press while the
     /// server is still winding down is quiet instead of a second cancel.
     pub(crate) fn stop_query(&mut self, cx: &mut Context<Self>) {
+        // A file being run stops between statements; what ran, stays.
+        if let Some(handle) = self.script_stop.take() {
+            handle.stop();
+            self.status = Status::busy("Stopping the file…");
+            cx.notify();
+            return;
+        }
         let connection = self.workspace.active_id();
         let Some((_, handle)) = self
             .tabs
@@ -2761,16 +2923,24 @@ impl DbUi {
             .and_then(|path| dbui_app::history::save(&path, &self.history));
     }
 
-    fn dispatch_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
+    pub(crate) fn dispatch_statements(&mut self, statements: Vec<String>, cx: &mut Context<Self>) {
         if statements.is_empty() {
             return;
         }
+        // A completion list open at the caret is about the text, not the
+        // run; left up, it hangs over the results the run brings back.
+        self.completion = None;
         // The server refuses writes on a read-only connection too, but only
         // through a session setting the editor could switch off. Nothing in
         // the batch runs if any of it would write.
         if let Some(write) = statements.iter().find(|sql| dbui_app::domain::writes(sql)) {
             let verb = dbui_app::domain::statement::describe(write).verb;
             if self.refuse_if_read_only(&verb, cx) {
+                return;
+            }
+            // A production connection takes writes, but asks first. The whole
+            // batch waits, reads included, so the answer runs it as typed.
+            if self.hold_for_production(GuardedWrite::Statements(statements.clone()), cx) {
                 return;
             }
         }
@@ -2943,10 +3113,17 @@ impl DbUi {
                     )),
                     QueryOutcome::Affected(_) => None,
                 };
+                // Read once, here: a plan is drawn on every frame the tab
+                // is in front, and the rows it comes from never change.
+                let plan = rows
+                    .as_ref()
+                    .and_then(|view| dbui_app::Plan::from_result(&view.set));
                 crate::tabs::StatementResult {
                     sql,
                     rows,
                     summary: one_line,
+                    plan,
+                    show_rows: false,
                 }
             })
             .collect();
@@ -3463,6 +3640,14 @@ impl DbUi {
         self.focus == Focus::Grid || (self.focus == Focus::Detail && self.detail_input.is_none())
     }
 
+    /// The active connection's environment tag.
+    pub(crate) fn active_environment(&self) -> dbui_app::domain::Environment {
+        self.workspace
+            .active()
+            .map(|entry| entry.config.environment)
+            .unwrap_or_default()
+    }
+
     /// Whether the active connection refuses writes.
     pub(crate) fn is_read_only(&self) -> bool {
         self.workspace
@@ -3974,7 +4159,7 @@ impl DbUi {
         let predicate = format!(
             "{} = {}",
             driver.quote_identifier(&key.references_column),
-            crate::row_export::sql_literal(&value)
+            value.sql_literal(driver)
         );
 
         let target = key.references.clone();
@@ -5188,6 +5373,11 @@ impl DbUi {
         };
 
         let count = edits.len() + deletes.len() + inserts.len();
+        // Last, so the question is only ever asked about a batch that would
+        // actually go -- never in place of "no changes" or "not connected".
+        if self.hold_for_production(GuardedWrite::Commit { changes: count }, cx) {
+            return;
+        }
         if let Some(WorkspaceTab::Table { saving, .. }) = self.tabs.get_mut(tab_id) {
             *saving = true;
         }
@@ -5841,6 +6031,10 @@ impl DbUi {
     fn keyboard_is_claimed(&self) -> bool {
         self.palette.is_some()
             || self.confirm.is_some()
+            || self.production_guard.is_some()
+            || self.activity.is_some()
+            || self.er_diagram.is_some()
+            || self.param_sheet.is_some()
             || self.close_guard.is_some()
             || self.context_menu.is_some()
             || self.modal.is_some()
@@ -5883,6 +6077,54 @@ impl DbUi {
         // something to be set off from underneath it.
         if self.schema_sheet.is_some() {
             self.handle_schema_sheet_key(keystroke, cx);
+            return;
+        }
+
+        // The production question owns it too, and is checked before the
+        // close guard: ⌘S from under that guard is what can raise this one.
+        if self.production_guard.is_some() {
+            match key {
+                "escape" => self.cancel_production_write(cx),
+                // Unmodified, for the reason the close guard gives below: the
+                // ⌘↵ that raised this question must not also answer it.
+                "enter" if !command => self.confirm_production_write(cx),
+                _ => {}
+            }
+            return;
+        }
+
+        // The Parameters sheet owns the keyboard: its fields take the typing.
+        if self.param_sheet.is_some() {
+            self.handle_param_sheet_key(keystroke, cx);
+            return;
+        }
+
+        // The diagram is modal the same way; Escape closes it. (Its zoom
+        // arrives as the app's zoom actions -- see `zoom_delta`.)
+        if self.er_diagram.is_some() {
+            if key == "escape" {
+                self.close_er_diagram(cx);
+            }
+            return;
+        }
+
+        // The activity panel is modal; Escape closes it, and nothing
+        // underneath hears a key while it is up.
+        if self.activity.is_some() {
+            if key == "escape" {
+                let confirming = self
+                    .activity
+                    .as_ref()
+                    .is_some_and(|panel| panel.confirming.is_some());
+                if confirming {
+                    if let Some(panel) = self.activity.as_mut() {
+                        panel.confirming = None;
+                    }
+                    cx.notify();
+                } else {
+                    self.close_activity(cx);
+                }
+            }
             return;
         }
 
@@ -6712,6 +6954,10 @@ impl Render for DbUi {
         let context_menu = self.render_context_menu(window, cx);
         let confirm = self.render_confirm(cx);
         let close_guard = self.render_close_guard(cx);
+        let production_guard = self.render_production_guard(cx);
+        let activity = self.render_activity(cx);
+        let er_diagram = self.render_er_diagram(cx);
+        let param_sheet = self.render_param_sheet(cx);
         let schema_sheet = self.render_schema_sheet(cx);
         let drag_ghost = self.render_drag_ghost();
 
@@ -6879,6 +7125,28 @@ impl Render for DbUi {
                     this.run_all_queries(cx)
                 }))
                 .on_action(
+                    cx.listener(|this, _: &crate::ExplainQuery, _window, cx| {
+                        this.explain_query(cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &crate::ServerActivity, _window, cx| {
+                    this.open_activity(cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &crate::PinResult, _window, cx| this.pin_result(cx)),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::ErDiagram, _window, cx| this.open_er_diagram(cx)),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::DumpDatabase, _window, cx| {
+                        this.dump_database(cx)
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::RunSqlFile, _window, cx| this.run_sql_file(cx)),
+                )
+                .on_action(
                     cx.listener(|this, _: &crate::StopQuery, _window, cx| this.stop_query(cx)),
                 )
                 .on_action(
@@ -6942,12 +7210,15 @@ impl Render for DbUi {
             // closes them once the commit is actually sent, which is what
             // keeps a dropdown from hanging open over work that already went.
             .when(
-                !self.keyboard_is_claimed()
-                    || self.close_guard.is_some()
-                    || self.connection_picker_open
-                    || self.settings_menu_open
-                    || self.detail_menu_open
-                    || self.page_size_menu_open,
+                // Never under the production question, though: that is the
+                // one ⌘S is waiting on, and pressing it again is not an answer.
+                self.production_guard.is_none()
+                    && (!self.keyboard_is_claimed()
+                        || self.close_guard.is_some()
+                        || self.connection_picker_open
+                        || self.settings_menu_open
+                        || self.detail_menu_open
+                        || self.page_size_menu_open),
                 |root| {
                     root.on_action(cx.listener(|this, _: &crate::CommitChanges, _window, cx| {
                         this.save_pending_edits(cx)
@@ -6980,6 +7251,10 @@ impl Render for DbUi {
             .children(context_menu)
             .children(confirm)
             .children(close_guard)
+            .children(er_diagram)
+            .children(param_sheet)
+            .children(activity)
+            .children(production_guard)
             .children(schema_sheet)
             // Over everything: it is the pointer's, and the pointer can be
             // anywhere.
@@ -7263,6 +7538,7 @@ mod tests {
 
     fn catalog_of(names: &[&str]) -> Catalog {
         Catalog {
+            objects: Vec::new(),
             schemas: names
                 .iter()
                 .map(|name| dbui_app::domain::Schema {

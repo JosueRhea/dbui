@@ -22,7 +22,9 @@
 //! single shared fixture looks tidier right up until one test's `DELETE`
 //! changes another's row count, and until two of them race to create it.
 
-use dbui_domain::{ConnectionConfig, Driver, Page, QueryOutcome, TableRef, TlsMode, Value};
+use dbui_domain::{
+    ConnectionConfig, Driver, ObjectKind, Page, QueryOutcome, TableRef, TlsMode, Value,
+};
 use dbui_driver::{DatabaseDriver, DriverError};
 use std::sync::Arc;
 
@@ -236,6 +238,261 @@ macro_rules! both_engines {
 }
 
 // -- the tests -------------------------------------------------------------
+
+both_engines!(
+    routines_and_triggers_are_listed_with_their_definitions,
+    |fx: Fixture| async move {
+        let schema = fx.schema().to_string();
+        let q = |name: &str| {
+            format!(
+                "{}.{}",
+                fx.driver().quote_identifier(&schema),
+                fx.driver().quote_identifier(name)
+            )
+        };
+        let statements: Vec<String> = match fx.driver() {
+            Driver::Postgres => vec![
+                format!(
+                    "CREATE FUNCTION {}(x integer) RETURNS integer LANGUAGE sql AS 'SELECT x * 2'",
+                    q("double_it")
+                ),
+                format!(
+                    "CREATE FUNCTION {}() RETURNS trigger LANGUAGE plpgsql AS \
+                     'BEGIN NEW.name := trim(NEW.name); RETURN NEW; END'",
+                    q("trim_name")
+                ),
+                format!(
+                    "CREATE TRIGGER people_trim BEFORE INSERT ON {} \
+                     FOR EACH ROW EXECUTE FUNCTION {}()",
+                    q("people"),
+                    q("trim_name")
+                ),
+                format!("CREATE TYPE {} AS ENUM ('low', 'high')", q("level")),
+                format!("CREATE SEQUENCE {} START 40", q("ticket_seq")),
+            ],
+            Driver::MySql => vec![
+                format!(
+                    "CREATE FUNCTION {}(x INT) RETURNS INT DETERMINISTIC RETURN x * 2",
+                    q("double_it")
+                ),
+                format!(
+                    "CREATE TRIGGER {} BEFORE INSERT ON {} \
+                     FOR EACH ROW SET NEW.name = TRIM(NEW.name)",
+                    q("people_trim"),
+                    q("people")
+                ),
+            ],
+            Driver::Sqlite => unreachable!(),
+        };
+        for sql in &statements {
+            fx.execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("{error}\n{sql}"));
+        }
+
+        let catalog = fx.catalog().await.expect("catalog");
+        let find = |kind: ObjectKind, name: &str| {
+            catalog
+                .objects_of(&schema, kind)
+                .find(|object| object.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {} {name} in {:?}", kind.label(), catalog.objects))
+        };
+
+        let function = find(ObjectKind::Function, "double_it");
+        let body = fx.definition(&function).await.expect("function definition");
+        assert!(
+            body.contains("double_it") && body.contains("x * 2"),
+            "{body}"
+        );
+        assert!(body.to_uppercase().contains("CREATE"), "{body}");
+
+        let trigger = find(ObjectKind::Trigger, "people_trim");
+        assert_eq!(
+            trigger.detail.as_deref(),
+            Some("people"),
+            "the table it is on"
+        );
+        let body = fx.definition(&trigger).await.expect("trigger definition");
+        assert!(
+            body.to_uppercase().contains("TRIGGER") && body.contains("people"),
+            "{body}"
+        );
+
+        if fx.driver() == Driver::Postgres {
+            let level = find(ObjectKind::Type, "level");
+            assert_eq!(level.detail.as_deref(), Some("enum"));
+            let body = fx.definition(&level).await.expect("enum definition");
+            assert!(body.contains("ENUM") && body.contains("'high'"), "{body}");
+
+            let sequence = find(ObjectKind::Sequence, "ticket_seq");
+            let body = fx.definition(&sequence).await.expect("sequence definition");
+            assert!(body.contains("START WITH 40"), "{body}");
+        }
+
+        // The tree's lists are the user's: nothing the server ships comes along.
+        assert!(
+            catalog
+                .objects
+                .iter()
+                .all(|object| object.schema != "pg_catalog" && object.schema != "mysql"),
+            "system objects leaked into the tree"
+        );
+    }
+);
+
+both_engines!(
+    a_running_statement_is_listed_and_can_be_cancelled,
+    |fx: Fixture| async move {
+        // A second connection, so the statement being cancelled is not on the
+        // pool the listing and the cancel go out on.
+        let other = dbui_driver::connect(&config(fx.driver()))
+            .await
+            .expect("second connection");
+        let marker = format!("dbui_cancel_{}", fx.schema().len());
+        let sleep = match fx.driver() {
+            Driver::Postgres => format!("SELECT pg_sleep(30) AS {marker}"),
+            _ => format!("SELECT SLEEP(30) AS {marker}"),
+        };
+        let started = std::time::Instant::now();
+        let running = tokio::spawn({
+            let other = other.clone();
+            async move { other.execute(&sleep).await }
+        });
+
+        let mut found = None;
+        for _ in 0..100 {
+            let sessions = fx.server_sessions().await.expect("sessions");
+            assert!(
+                sessions.iter().any(|s| s.is_self),
+                "our own connection is marked"
+            );
+            if let Some(session) = sessions.iter().find(|s| s.query.contains(&marker)) {
+                found = Some(session.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let session = found.expect("the sleeping statement is listed");
+        assert!(!session.is_self);
+        assert!(!session.is_idle());
+
+        fx.end_session(session.id, false).await.expect("cancel");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+            .await
+            .expect("the statement stopped")
+            .expect("task");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        // Postgres raises on a cancelled statement; MySQL's SLEEP returns 1 early.
+        if fx.driver() == Driver::Postgres {
+            assert!(outcome.is_err(), "{outcome:?}");
+        }
+        other.close().await;
+    }
+);
+
+// A column of a type the server defines -- an enum, a domain -- reads the
+// first time, from the grid and from the editor alike. On Postgres the driver
+// has to look such a type up mid-statement, and that lookup used to clobber
+// the unnamed statement it was in the middle of.
+both_engines!(a_column_of_a_custom_type_reads, |fx: Fixture| async move {
+    let schema = fx.schema().to_string();
+    let q = |name: &str| TableRef::new(&schema, name).quoted(fx.driver());
+    let setup: Vec<String> = match fx.driver() {
+        Driver::Postgres => vec![
+            format!("CREATE TYPE {} AS ENUM ('new', 'paid')", q("status")),
+            format!("CREATE DOMAIN {} AS bigint CHECK (VALUE >= 0)", q("cents")),
+            format!(
+                "CREATE TABLE {} (id int PRIMARY KEY, status {} NOT NULL, total {})",
+                q("orders"),
+                q("status"),
+                q("cents")
+            ),
+            format!("INSERT INTO {} VALUES (1, 'paid', 5), (2, 'new', NULL)", q("orders")),
+        ],
+        _ => vec![
+            format!(
+                "CREATE TABLE {} (id INT PRIMARY KEY, status ENUM('new', 'paid') NOT NULL, total BIGINT)",
+                q("orders")
+            ),
+            format!("INSERT INTO {} VALUES (1, 'paid', 5), (2, 'new', NULL)", q("orders")),
+        ],
+    };
+    for sql in &setup {
+        fx.execute(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{error}\n{sql}"));
+    }
+
+    let page = fx
+        .table_rows(&fx.table("orders"), Page::first(), "", &[])
+        .await
+        .expect("the grid reads it");
+    assert_eq!(page.rows.len(), 2);
+    assert_eq!(page.rows[0].0[1].to_text(), "paid");
+
+    let result = fx
+        .execute(&format!("SELECT * FROM {} ORDER BY id", q("orders")))
+        .await
+        .expect("the editor reads it");
+    let QueryOutcome::Rows(set) = result.outcome else {
+        panic!("rows");
+    };
+    assert_eq!(set.rows[1].0[1].to_text(), "new");
+    // An array may hold a NULL; the element is NULL, not the whole cell.
+    if fx.driver() == Driver::Postgres {
+        let result = fx
+            .execute("SELECT ARRAY['a', NULL, 'b']::text[], ARRAY[1, NULL]::int[]")
+            .await
+            .expect("arrays");
+        let QueryOutcome::Rows(set) = result.outcome else {
+            panic!("rows");
+        };
+        assert_eq!(
+            set.rows[0].0[0],
+            Value::Array(vec![
+                Value::Text("a".into()),
+                Value::Null,
+                Value::Text("b".into())
+            ])
+        );
+        assert_eq!(
+            set.rows[0].0[1],
+            Value::Array(vec![Value::Int(1), Value::Null])
+        );
+    }
+    // The domain reads as its base type, not as an unknown.
+    assert_eq!(set.rows[0].0[2], Value::Int(5));
+    assert_eq!(set.rows[1].0[2], Value::Null);
+});
+
+both_engines!(a_query_streams_past_the_row_cap, |fx: Fixture| async move {
+    let sql = match fx.driver() {
+        Driver::Postgres => "SELECT i, 'row ' || i AS label FROM generate_series(1, 15000) AS i",
+        // MySQL stops a recursive CTE at 1000 rounds; 150 x 100 is 15000.
+        _ => {
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 150) \
+              SELECT (a.i - 1) * 100 + b.i AS i, CONCAT('row ', (a.i - 1) * 100 + b.i) AS label \
+              FROM n a JOIN n b ON b.i <= 100 ORDER BY i"
+        }
+    };
+    let mut pages = 0;
+    let mut last = None;
+    let mut columns = Vec::new();
+    let count = fx
+        .stream_query(sql, &mut |cols, rows| {
+            pages += 1;
+            columns = cols.iter().map(|c| c.name.clone()).collect();
+            last = rows.last().map(|row| row[1].to_text());
+            Ok(())
+        })
+        .await
+        .expect("stream");
+    assert_eq!(count, 15_000);
+    assert!(pages >= 15, "a page at a time, not all at once: {pages}");
+    assert_eq!(columns, vec!["i", "label"]);
+    assert_eq!(last.as_deref(), Some("row 15000"));
+});
 
 both_engines!(a_live_connection_answers, |fx: Fixture| async move {
     fx.ping().await.expect("ping");

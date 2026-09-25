@@ -4,6 +4,7 @@
 //! [`Value`] so that a `BIGINT` from MySQL and an `int8` from Postgres reach
 //! the UI as the same thing, and so the renderer has a closed set to match on.
 
+use crate::Driver;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
@@ -247,6 +248,67 @@ pub enum ValueKind {
     Temporal,
     Structured,
     Unsupported,
+}
+
+impl Value {
+    /// This value as a literal `driver` reads back to the same value, for a
+    /// statement that writes it -- an `INSERT` in a dump or an export.
+    ///
+    /// Unlike [`Value::to_text`], which is for eyes: bytes are written whole
+    /// rather than previewed, arrays in Postgres's own array syntax, and a
+    /// string's backslashes are doubled for MySQL, which reads `\` in a
+    /// quoted string as an escape. [`Value::Unsupported`] carries no value to
+    /// write, and becomes `NULL`; callers that care count those first.
+    pub fn sql_literal(&self, driver: Driver) -> String {
+        match self {
+            Value::Null | Value::Default | Value::Unsupported(_) => "NULL".to_string(),
+            Value::Bool(flag) => if *flag { "TRUE" } else { "FALSE" }.to_string(),
+            Value::Int(number) => number.to_string(),
+            Value::Float(number) if number.is_finite() => format!("{number:?}"),
+            Value::Float(number) => match driver {
+                // Postgres has names for these; the others have no such value.
+                Driver::Postgres if number.is_nan() => "'NaN'".into(),
+                Driver::Postgres if *number > 0.0 => "'Infinity'".into(),
+                Driver::Postgres => "'-Infinity'".into(),
+                _ => "NULL".into(),
+            },
+            Value::Decimal(text) => text.clone(),
+            Value::Bytes(bytes) => {
+                let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                match driver {
+                    Driver::Postgres => format!("'\\x{hex}'"),
+                    Driver::MySql | Driver::Sqlite => format!("X'{hex}'"),
+                }
+            }
+            Value::Array(items) => quote_sql(&postgres_array(items), driver),
+            other => quote_sql(&other.to_text(), driver),
+        }
+    }
+}
+
+/// `'text'`, with the quote doubled -- and, for MySQL, the backslash too.
+fn quote_sql(text: &str, driver: Driver) -> String {
+    let escaped = text.replace('\'', "''");
+    match driver {
+        Driver::MySql => format!("'{}'", escaped.replace('\\', "\\\\")),
+        _ => format!("'{escaped}'"),
+    }
+}
+
+/// `{"a","b",NULL}` -- the text form Postgres reads an array from.
+fn postgres_array(items: &[Value]) -> String {
+    let inner: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            Value::Null => "NULL".to_string(),
+            Value::Array(nested) => postgres_array(nested),
+            other => format!(
+                "\"{}\"",
+                other.to_text().replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+        })
+        .collect();
+    format!("{{{}}}", inner.join(","))
 }
 
 impl ValueKind {
@@ -531,6 +593,46 @@ mod prototype_tests {
         assert_eq!(
             compare(&long, &Value::Array(vec![Value::Int(2)])),
             Ordering::Less
+        );
+    }
+
+    #[test]
+    fn literals_read_back_as_the_same_value_on_each_engine() {
+        let text = Value::Text("it's C:\\temp".into());
+        assert_eq!(text.sql_literal(Driver::Postgres), "'it''s C:\\temp'");
+        assert_eq!(text.sql_literal(Driver::MySql), "'it''s C:\\\\temp'");
+        assert_eq!(text.sql_literal(Driver::Sqlite), "'it''s C:\\temp'");
+
+        let bytes = Value::Bytes(vec![0xde, 0xad, 0x00, 0xff]);
+        assert_eq!(bytes.sql_literal(Driver::Postgres), "'\\xdead00ff'");
+        assert_eq!(bytes.sql_literal(Driver::MySql), "X'dead00ff'");
+
+        let array = Value::Array(vec![
+            Value::Text("a\"b".into()),
+            Value::Null,
+            Value::Text("c,d".into()),
+        ]);
+        assert_eq!(
+            array.sql_literal(Driver::Postgres),
+            r#"'{"a\"b",NULL,"c,d"}'"#
+        );
+
+        assert_eq!(Value::Float(0.1).sql_literal(Driver::MySql), "0.1");
+        assert_eq!(
+            Value::Float(f64::NAN).sql_literal(Driver::Postgres),
+            "'NaN'"
+        );
+        assert_eq!(
+            Value::Float(f64::INFINITY).sql_literal(Driver::MySql),
+            "NULL"
+        );
+        assert_eq!(
+            Value::Decimal("12.50".into()).sql_literal(Driver::MySql),
+            "12.50"
+        );
+        assert_eq!(
+            Value::Unsupported("tsvector".into()).sql_literal(Driver::Postgres),
+            "NULL"
         );
     }
 }

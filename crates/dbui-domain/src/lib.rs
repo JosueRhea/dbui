@@ -12,17 +12,21 @@
 pub mod catalog;
 pub mod connection;
 pub mod ddl;
+pub mod params;
 pub mod query;
 pub mod sql_split;
 pub mod statement;
 pub mod value;
 
-pub use catalog::{Catalog, Column, ForeignKey, Schema, Table, TableKind, TableRef};
-pub use connection::{ConnectionConfig, ConnectionId, Driver, TlsMode};
+pub use catalog::{
+    Catalog, Column, CreateStatements, DbObject, ForeignKey, ObjectKind, Schema, Table, TableKind,
+    TableRef,
+};
+pub use connection::{ConnectionConfig, ConnectionId, Driver, Environment, SshConfig, TlsMode};
 pub use ddl::{ColumnSpec, Index};
 pub use query::{
-    order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row, SortKey,
-    TransactionState,
+    order_for, ColumnInfo, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row,
+    ServerSession, SortKey, TransactionState,
 };
 pub use sql_split::{split_statements, split_statements_for, statement_at, statement_at_for};
 pub use statement::{may_change_transaction, writes, StatementInfo};

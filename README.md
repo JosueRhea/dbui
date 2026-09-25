@@ -20,9 +20,55 @@ transaction; `⌘Z` throws it away. With several rows selected, the panel on the
 edits all of them at once — `MIXED` marks a column they disagree on, and a field left
 reading `MIXED` is written to nobody.
 
+**Through a bastion.** Tick *Tunnel* on a connection to reach it through an SSH
+server. It runs your own `ssh`, so `~/.ssh/config`, the agent and `known_hosts`
+all apply; a password or key passphrase is kept in the keychain beside the
+database one. TablePlus connections that go over SSH import with their tunnel.
+
+**More than tables.** Under each schema's tables the tree folds away its
+functions, procedures, triggers, sequences, types and extensions (MySQL: routines
+and triggers; SQLite: triggers). Open one and its `CREATE` statement lands in a
+query tab, ready to read, change and run back. Objects an extension installed
+are left out; the extension is listed instead.
+
+**Who is on the server.** `⌘⌥A` lists every client session -- user, database,
+state, how long its statement has run, what it is waiting on -- busiest first,
+refreshed every two seconds. Long-running statements and sessions idle inside a
+transaction are picked out, and either can be cancelled or ended after a
+confirmation on the row (`pg_cancel_backend` / `pg_terminate_backend`,
+`KILL QUERY` / `KILL`).
+
+**Dump and restore, built in.** *Dump Database…* writes the whole database -- types,
+extensions and sequences, every table with its rows, indexes and constraints
+(composite foreign keys included), functions, views and triggers -- as one SQL file,
+through the app's own connection: no `pg_dump` or `mysqldump` to install or version-match,
+and it works through an SSH tunnel. *Run SQL File…* runs any file statement by
+statement on one session, with the count on the status line and `⌘.` to stop. A dump
+restores to identical rows on all three engines; that is tested, not assumed.
+
+**The schema, drawn.** `⌘⌥D` (or *Show Diagram* on a schema) lays every table out
+with its columns -- referenced tables to the left of the ones that reference them --
+and draws each foreign key from its column to the column it points at. Hover a table
+to light up its keys both ways, `⌘=`/`⌘-` to zoom the drawing, click a table to open it.
+
+**Small things.** `:name` placeholders are asked for before a statement runs, and
+remembered. *Pin* keeps a result in its own tab to compare against the next run. A
+result cut off at 10,000 rows exports every row. JSON cells read as a foldable tree
+in the row details, where clicking a value copies it and names its path. Connections
+can be filed into groups.
+
+**Production looks like production.** Tag a connection Local, Testing, Staging or
+Production and its colour runs under the title bar and its tab. On Production,
+⌘S and any writing statement stop for a confirmation that names the server and
+what is about to be sent.
+
 **SQL, with the catalog behind it.** `⌘↵` runs the statement under the caret, `⌘⇧↵`
 runs every statement in the buffer, and `⌃Space` completes against the schemas, tables
 and columns the connection actually has. Results land in the same typed grid, timed.
+`⌘⌥E` explains the statement instead of running it, and any `EXPLAIN` -- Postgres
+text or JSON, MySQL or MariaDB JSON, MySQL's tree, SQLite's query plan, with or
+without `ANALYZE` -- is drawn as a tree, with each step's own share of the cost
+(or of the measured time) as a bar and the most expensive step picked out.
 
 ## Install
 

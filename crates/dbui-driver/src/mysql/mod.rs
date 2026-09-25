@@ -8,10 +8,11 @@ use crate::port::{DatabaseDriver, QueryToken, RowBatch, RowUpdate};
 use crate::sessions::{Lease, SessionId, Sessions};
 use crate::sql_build;
 use async_trait::async_trait;
+use dbui_domain::CreateStatements;
 use dbui_domain::{
-    query, Catalog, Column, ColumnInfo, ConnectionConfig, Driver, ForeignKey, Index, Page,
-    QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema, SortKey, Table,
-    TableRef, TlsMode, TransactionState, Value,
+    query, Catalog, Column, ColumnInfo, ConnectionConfig, DbObject, Driver, ForeignKey, Index,
+    ObjectKind, Page, QueryOutcome, QueryResult, QueryStats, ResultSet, Row as DomainRow, Schema,
+    ServerSession, SortKey, Table, TableRef, TlsMode, TransactionState, Value,
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
@@ -24,6 +25,9 @@ pub struct MySqlDriver {
     /// Connections kept with their session ids, for statements that may have
     /// to be cancelled. See `sessions`.
     sessions: Sessions<sqlx::MySql>,
+    /// The SSH tunnel this pool dials through, when there is one. Held, never
+    /// read: dropping the driver is what closes it.
+    pub(crate) tunnel: Option<crate::tunnel::SshTunnel>,
 }
 
 impl MySqlDriver {
@@ -79,6 +83,7 @@ impl MySqlDriver {
         Ok(Self {
             pool,
             sessions: Sessions::new(),
+            tunnel: None,
             server_version: format!("MySQL {server_version}"),
         })
     }
@@ -204,7 +209,164 @@ impl DatabaseDriver for MySqlDriver {
             }
         }
 
-        Ok(Catalog { schemas })
+        // Best effort: a server that hides routines from this user, or a
+        // Vitess keyspace that does not answer for them, still has a tree
+        // of tables worth showing.
+        let objects = sqlx::query(catalog::OBJECTS)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let schema: String = row.try_get("schema_name").ok()?;
+                        let name: String = row.try_get("object_name").ok()?;
+                        let kind = match row.try_get::<String, _>("object_kind").ok()?.as_str() {
+                            "function" => ObjectKind::Function,
+                            "procedure" => ObjectKind::Procedure,
+                            "trigger" => ObjectKind::Trigger,
+                            _ => return None,
+                        };
+                        Some(DbObject {
+                            key: String::new(),
+                            detail: row.try_get::<Option<String>, _>("detail").ok().flatten(),
+                            schema,
+                            name,
+                            kind,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Catalog { schemas, objects })
+    }
+
+    async fn stream_query(&self, sql: &str, sink: &mut crate::stream::RowSink<'_>) -> Result<u64> {
+        let rows = sqlx::query(AssertSqlSafe(sql.to_string()))
+            .persistent(false)
+            .fetch(&self.pool);
+        crate::stream::drain(
+            rows,
+            sql,
+            |page: Vec<sqlx::mysql::MySqlRow>| build_result_set(page, usize::MAX),
+            sink,
+        )
+        .await
+    }
+
+    async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
+        // MySQL writes its own, exactly -- indexes, foreign keys and
+        // AUTO_INCREMENT included -- so there is nothing to rebuild. Foreign
+        // keys stay inline; a dump turns their checks off while it loads.
+        let what = if table.kind.is_view() {
+            "VIEW"
+        } else {
+            "TABLE"
+        };
+        let sql = format!(
+            "SHOW CREATE {what} {}",
+            TableRef::new(&table.schema, &table.name).quoted(Driver::MySql)
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.clone()))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(&sql, &error))?;
+        let text = row
+            .try_get::<String, _>(1)
+            .or_else(|_| {
+                row.try_get::<Vec<u8>, _>(1)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .map_err(|error| DriverError::query(&sql, &error))?;
+        Ok(CreateStatements {
+            create: vec![text],
+            after_data: Vec::new(),
+        })
+    }
+
+    async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
+        let rows = sqlx::query(catalog::SESSIONS)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(catalog::SESSIONS, &error))?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let text = |column: &str| row.try_get::<String, _>(column).unwrap_or_default();
+                Some(ServerSession {
+                    id: row.try_get("id").ok()?,
+                    user: text("user_name"),
+                    database: text("database_name"),
+                    client: text("client"),
+                    state: text("state"),
+                    waiting_on: row.try_get("waiting_on").ok().flatten(),
+                    query: text("query"),
+                    running_for: row.try_get("running_for").ok().flatten(),
+                    is_self: row.try_get::<i64, _>("is_self").is_ok_and(|n| n != 0),
+                })
+            })
+            .collect())
+    }
+
+    async fn end_session(&self, id: i64, terminate: bool) -> Result<()> {
+        // An integer, so nothing to quote; `KILL` takes no bound parameter.
+        let sql = if terminate {
+            format!("KILL {id}")
+        } else {
+            format!("KILL QUERY {id}")
+        };
+        sqlx::query(AssertSqlSafe(sql.clone()))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|error| DriverError::query(&sql, &error))
+    }
+
+    async fn definition(&self, object: &DbObject) -> Result<String> {
+        let what = match object.kind {
+            ObjectKind::Function => "FUNCTION",
+            ObjectKind::Procedure => "PROCEDURE",
+            ObjectKind::Trigger => "TRIGGER",
+            other => {
+                return Err(DriverError::message(
+                    "",
+                    format!("MySQL has no {}s", other.label()),
+                ))
+            }
+        };
+        let sql = format!(
+            "SHOW CREATE {what} {}.{}",
+            Driver::MySql.quote_identifier(&object.schema),
+            Driver::MySql.quote_identifier(&object.name)
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.clone()))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| DriverError::query(&sql, &error))?;
+        // The third column in all three: `Create Function`, `Create
+        // Procedure`, `SQL Original Statement`. NULL when this user may see
+        // that the routine exists but not its body.
+        let body = row
+            .try_get::<Option<String>, _>(2)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                row.try_get::<Option<Vec<u8>>, _>(2)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            })
+            .ok_or_else(|| {
+                DriverError::message(
+                    &sql,
+                    format!(
+                        "The server did not show the body of {} -- this user may lack the \
+                         privilege to read it",
+                        object.name
+                    ),
+                )
+            })?;
+        Ok(format!("{};\n", body.trim_end().trim_end_matches(';')))
     }
 
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>> {

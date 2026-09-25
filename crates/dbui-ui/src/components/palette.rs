@@ -54,10 +54,16 @@ enum ActionId {
     NextConnection,
     PrevConnection,
     RefreshCatalog,
+    ServerActivity,
+    ErDiagram,
+    DumpDatabase,
+    RunSqlFile,
     RefreshResult,
     OpenSql,
     RunQuery,
     RunAllQueries,
+    ExplainQuery,
+    PinResult,
     StopQuery,
     SaveQuery,
     OpenSavedQuery,
@@ -218,6 +224,30 @@ const ACTIONS: &[ActionDef] = &[
         shortcut: None,
         section: "Connection",
     },
+    ActionDef {
+        id: ActionId::ErDiagram,
+        label: "Schema Diagram",
+        shortcut: Some("⌘⌥D"),
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::DumpDatabase,
+        label: "Dump Database…",
+        shortcut: None,
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::RunSqlFile,
+        label: "Run SQL File…",
+        shortcut: None,
+        section: "Connection",
+    },
+    ActionDef {
+        id: ActionId::ServerActivity,
+        label: "Server Activity",
+        shortcut: Some("⌘⌥A"),
+        section: "Connection",
+    },
     // Query
     ActionDef {
         id: ActionId::OpenSql,
@@ -235,6 +265,18 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::RunAllQueries,
         label: "Run All Queries",
         shortcut: Some("⌘⇧↵"),
+        section: "Query",
+    },
+    ActionDef {
+        id: ActionId::ExplainQuery,
+        label: "Explain Query",
+        shortcut: Some("⌘⌥E"),
+        section: "Query",
+    },
+    ActionDef {
+        id: ActionId::PinResult,
+        label: "Pin Result",
+        shortcut: Some("⌘⌥P"),
         section: "Query",
     },
     ActionDef {
@@ -964,11 +1006,22 @@ impl DbUi {
                         .unwrap_or(false)
             }
             ActionId::DisconnectActive | ActionId::RefreshCatalog => connected,
+            ActionId::DumpDatabase | ActionId::RunSqlFile | ActionId::ErDiagram => connected,
+            ActionId::ServerActivity => {
+                connected
+                    && !self
+                        .active_driver_kind()
+                        .is_some_and(|driver| driver.is_file_based())
+            }
             ActionId::CloseConnection => has_active,
             // Nothing to step to with one tab open, or none.
             ActionId::NextConnection | ActionId::PrevConnection => self.workspace.open_count() > 1,
             ActionId::RefreshResult => connected && (is_table || is_sql),
             ActionId::RunQuery | ActionId::RunAllQueries | ActionId::ClearSql => is_sql,
+            ActionId::ExplainQuery => is_sql && connected,
+            ActionId::PinResult => {
+                is_sql && self.tabs.active().and_then(|tab| tab.result()).is_some()
+            }
             ActionId::StopQuery => self.active_run_is_stoppable(),
             ActionId::SaveQuery => is_sql,
             ActionId::OpenSavedQuery => true,
@@ -1088,6 +1141,10 @@ impl DbUi {
             ActionId::NextConnection => self.cycle_connection_tab(true, cx),
             ActionId::PrevConnection => self.cycle_connection_tab(false, cx),
             ActionId::RefreshCatalog => self.refresh_catalog(cx),
+            ActionId::ServerActivity => self.open_activity(cx),
+            ActionId::DumpDatabase => self.dump_database(cx),
+            ActionId::ErDiagram => self.open_er_diagram(cx),
+            ActionId::RunSqlFile => self.run_sql_file(cx),
             ActionId::RefreshResult => self.refresh_result(cx),
             ActionId::OpenSql => self.open_sql_tab(cx),
             ActionId::CloseTab => self.close_active_tab(cx),
@@ -1108,6 +1165,8 @@ impl DbUi {
             ActionId::PrevTab => self.prev_tab(cx),
             ActionId::RunQuery => self.run_query(cx),
             ActionId::RunAllQueries => self.run_all_queries(cx),
+            ActionId::ExplainQuery => self.explain_query(cx),
+            ActionId::PinResult => self.pin_result(cx),
             ActionId::StopQuery => self.stop_query(cx),
             ActionId::SaveQuery => self.open_save_query(cx),
             ActionId::OpenSavedQuery => self.open_palette(PaletteKind::SavedQueries, cx),

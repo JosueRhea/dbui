@@ -4,11 +4,11 @@
 //! engine. Adding SQLite would mean one more implementation here and one more
 //! arm in [`crate::connect`] -- and no change at all in the UI.
 
-use crate::error::Result;
+use crate::error::{DriverError, Result};
 use async_trait::async_trait;
 use dbui_domain::{
-    Catalog, Column, Driver, Index, Page, QueryResult, ResultSet, SortKey, TableRef,
-    TransactionState, Value,
+    Catalog, Column, CreateStatements, DbObject, Driver, Index, Page, QueryResult, ResultSet,
+    ServerSession, SortKey, Table, TableRef, TransactionState, Value,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,74 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// The columns of one table, in declaration order.
     async fn columns(&self, table: &TableRef) -> Result<Vec<Column>>;
+
+    /// The statements that would create `table` (or view) again, exactly,
+    /// for a dump.
+    async fn create_statements(&self, table: &Table) -> Result<CreateStatements> {
+        Err(DriverError::message(
+            "",
+            format!("Cannot script {} on this engine", table.name),
+        ))
+    }
+
+    /// For a sequence, the statement that puts a restored copy back where
+    /// this one is -- so rows dumped with their ids do not collide with the
+    /// next value handed out. `None` where there is nothing to restore.
+    async fn sequence_position(&self, sequence: &DbObject) -> Result<Option<String>> {
+        let _ = sequence;
+        Ok(None)
+    }
+
+    /// Run a query and hand every row it returns to `sink`, a page at a time
+    /// -- no row cap, and never more than a page in memory. For exporting a
+    /// result bigger than the editor keeps. Not on the editor's session: an
+    /// export is a read, and is not part of whatever the editor has open.
+    async fn stream_query(&self, sql: &str, sink: &mut crate::stream::RowSink<'_>) -> Result<u64> {
+        let result = self.execute(sql).await?;
+        match result.outcome {
+            dbui_domain::QueryOutcome::Rows(set) => {
+                let count = set.rows.len() as u64;
+                sink(
+                    &set.columns,
+                    set.rows.into_iter().map(|row| row.0).collect(),
+                )
+                .map_err(|message| DriverError::message(sql, message))?;
+                Ok(count)
+            }
+            dbui_domain::QueryOutcome::Affected(_) => Ok(0),
+        }
+    }
+
+    /// Every client connection to the server, for the activity panel.
+    async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
+        Err(DriverError::message(
+            "",
+            "This engine has no server to list connections on",
+        ))
+    }
+
+    /// Stop what session `id` is running (`terminate` false), or end the
+    /// session outright (`terminate` true).
+    async fn end_session(&self, id: i64, terminate: bool) -> Result<()> {
+        let _ = (id, terminate);
+        Err(DriverError::message(
+            "",
+            "This engine has no server sessions to end",
+        ))
+    }
+
+    /// The statement that would create `object` as it stands: a function's
+    /// `CREATE OR REPLACE FUNCTION`, a trigger's `CREATE TRIGGER`, and so on.
+    /// Opened in an editor, where it can be read, changed and run again.
+    async fn definition(&self, object: &DbObject) -> Result<String> {
+        Err(DriverError::message(
+            "",
+            format!(
+                "Reading a {}'s definition is not supported on this engine",
+                object.kind.label()
+            ),
+        ))
+    }
 
     /// One table's indexes, by name, each with its columns in index order.
     async fn indexes(&self, table: &TableRef) -> Result<Vec<Index>> {
