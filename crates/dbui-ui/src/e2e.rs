@@ -6444,7 +6444,8 @@ fn duplicating_copies_a_key_the_table_cannot_generate(cx: &mut TestAppContext) {
     let _ = cx;
 }
 
-/// ⌘V is the exact inverse of ⌘C: rows copied out come back in as new ones.
+/// ⌘C then ⌘V on the same table is ⌘D in two strokes: rows copied out come
+/// back in as new ones, with the generated key left for the table.
 #[gpui::test]
 fn copied_rows_paste_back_as_new_rows(cx: &mut TestAppContext) {
     let (view, cx) = open_table_with_rows(cx, 3);
@@ -6461,8 +6462,14 @@ fn copied_rows_paste_back_as_new_rows(cx: &mut TestAppContext) {
         let staged = view
             .collect_batch_inserts(view.tabs.active)
             .expect("parses");
-        // Paste is faithful: it writes back exactly what was copied, key and
-        // all. ⌘D is the one that knows to leave the key out.
+        // Pasting the row back with its own `id` would clash with the row it
+        // was copied from on every commit.
+        for row in &staged {
+            assert!(
+                !row.values.iter().any(|(column, _)| column == "id"),
+                "the generated key is left for the table"
+            );
+        }
         let names: Vec<String> = staged
             .iter()
             .flat_map(|row| row.values.iter())
@@ -6470,6 +6477,56 @@ fn copied_rows_paste_back_as_new_rows(cx: &mut TestAppContext) {
             .map(|(_, value)| value.to_text())
             .collect();
         assert_eq!(names, vec!["row 1", "row 2"]);
+    });
+}
+
+/// A click on a row lands on one of its cells, so ⌘C copies that cell -- and
+/// ⌘V straight after still duplicates the row, the way ⌘D would.
+#[gpui::test]
+fn a_copied_cell_pastes_back_as_its_row(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, Some(1), gpui::Modifiers::default(), cx);
+    });
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("row 2".to_string()),
+        "the clipboard holds the cell, for pasting anywhere else"
+    );
+    cx.simulate_keystrokes("cmd-v");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.staged_insert_count(), 1);
+        let staged = view
+            .collect_batch_inserts(view.tabs.active)
+            .expect("parses");
+        assert_eq!(
+            staged[0].values,
+            vec![(
+                "name".to_string(),
+                dbui_app::domain::Value::Text("row 2".into())
+            )],
+            "the whole row, less the key the table generates"
+        );
+    });
+}
+
+/// Something copied since is what gets pasted, not the rows from before it.
+#[gpui::test]
+fn a_later_copy_elsewhere_wins_over_remembered_rows(cx: &mut TestAppContext) {
+    let (view, cx) = open_table_with_rows(cx, 3);
+
+    view.update(cx, |view, cx| {
+        view.grid_pointer_down(1, Some(1), gpui::Modifiers::default(), cx);
+    });
+    cx.simulate_keystrokes("cmd-c");
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("hello".into()));
+    cx.simulate_keystrokes("cmd-v");
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.staged_insert_count(), 0, "plain text is not rows");
     });
 }
 

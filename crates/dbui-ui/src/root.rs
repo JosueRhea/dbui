@@ -345,6 +345,27 @@ pub(crate) struct RowFlash {
     pub started: Instant,
 }
 
+/// The rows behind the last ⌘C from a table, kept so ⌘V can tell its own
+/// clipboard apart from text that came from anywhere else.
+///
+/// Pasted back into the table it came from, a copy is a duplicate -- and a
+/// duplicate has to leave a generated key to the table the way ⌘D does, or
+/// every paste of a row clashes with the row it was copied from. Text alone
+/// cannot say which columns those are; the rows can.
+pub(crate) struct CopiedRows {
+    pub table: TableRef,
+    /// The result's column names when the copy was made. A refresh that
+    /// changed the columns makes the rows unreadable, and the paste falls
+    /// back to the clipboard text.
+    pub columns: Vec<String>,
+    /// Values in result order, not drawn order: they are read back against
+    /// `view.set.columns`.
+    pub rows: Vec<Vec<Value>>,
+    /// What was written to the clipboard. Anything else there means the user
+    /// has copied something since, and that is what they are pasting.
+    pub clipboard: String,
+}
+
 pub(crate) enum FlashRows {
     /// Copied: named by position, since the page they sit on stays put.
     Copied(Vec<usize>),
@@ -404,6 +425,8 @@ pub struct DbUi {
     pub(crate) cell_flash: Option<(TabId, usize, usize, Instant)>,
     /// Rows lit for a moment after something happened to them.
     pub(crate) row_flash: Option<RowFlash>,
+    /// See [`CopiedRows`].
+    pub(crate) copied_rows: Option<CopiedRows>,
     /// Presses of the two reload buttons. Each spins its icon once, keyed on
     /// the count so a press mid-spin starts a fresh turn.
     pub(crate) catalog_refreshes: usize,
@@ -741,6 +764,7 @@ impl DbUi {
             copied_at: None,
             cell_flash: None,
             row_flash: None,
+            copied_rows: None,
             catalog_refreshes: 0,
             result_refreshes: 0,
             copied_field: None,
@@ -4620,20 +4644,39 @@ impl DbUi {
             return;
         }
 
-        let columns = view.set.columns.clone();
-        let structure = view.structure.clone();
-        let copies: Vec<crate::tabs::PendingRowInsert> = rows
+        let values: Vec<Vec<Value>> = rows
             .iter()
             .filter_map(|row| view.set.rows.get(*row))
+            .map(|values| values.0.clone())
+            .collect();
+        self.stage_duplicates(values, "duplicated", cx);
+    }
+
+    /// Stage a copy of each row -- values in the active result's column
+    /// order -- leaving generated keys to the table. ⌘D and a ⌘V of rows
+    /// copied from this same table both end here, so the two cannot drift.
+    fn stage_duplicates(&mut self, values: Vec<Vec<Value>>, verb: &str, cx: &mut Context<Self>) {
+        let Some(WorkspaceTab::Table {
+            result: Some(view), ..
+        }) = self.tabs.active()
+        else {
+            return;
+        };
+        let copies: Vec<crate::tabs::PendingRowInsert> = values
+            .iter()
             .map(|values| {
-                crate::tabs::PendingRowInsert::duplicating(&columns, &structure, &values.0)
+                crate::tabs::PendingRowInsert::duplicating(
+                    &view.set.columns,
+                    &view.structure,
+                    values,
+                )
             })
             .collect();
 
         let count = copies.len();
         self.stage_inserts(copies, cx);
         let plural = if count == 1 { "row" } else { "rows" };
-        self.status = Status::info(format!("{count} {plural} duplicated — ⌘S to commit"));
+        self.status = Status::info(format!("{count} {plural} {verb} — ⌘S to commit"));
         cx.notify();
     }
 
@@ -4706,6 +4749,11 @@ impl DbUi {
             return;
         };
 
+        if let Some(rows) = self.own_copied_rows(&text) {
+            self.stage_duplicates(rows, "pasted", cx);
+            return;
+        }
+
         let Some(pasted) = crate::row_export::parse_tsv(&text) else {
             self.status = Status::info("The clipboard does not hold rows copied from a table");
             cx.notify();
@@ -4713,6 +4761,53 @@ impl DbUi {
         };
 
         self.stage_named_rows(pasted, "Pasted", cx);
+    }
+
+    /// The rows behind `clipboard`, when it is still what ⌘C put there and
+    /// the front tab is the table they were copied from -- with the columns
+    /// they were read against.
+    fn own_copied_rows(&self, clipboard: &str) -> Option<Vec<Vec<Value>>> {
+        let copied = self.copied_rows.as_ref()?;
+        if copied.clipboard != clipboard {
+            return None;
+        }
+        let Some(WorkspaceTab::Table {
+            table,
+            result: Some(view),
+            ..
+        }) = self.tabs.active()
+        else {
+            return None;
+        };
+        let same_columns = view
+            .set
+            .columns
+            .iter()
+            .map(|column| &column.name)
+            .eq(copied.columns.iter());
+        (*table == copied.table && same_columns).then(|| copied.rows.clone())
+    }
+
+    /// Note what ⌘C just put on the clipboard, when it came from rows of a
+    /// table. See [`CopiedRows`].
+    fn remember_copied_rows(&mut self, rows: &[usize], clipboard: &str) {
+        self.copied_rows = match self.tabs.active() {
+            Some(WorkspaceTab::Table {
+                table,
+                result: Some(view),
+                ..
+            }) => Some(CopiedRows {
+                table: table.clone(),
+                columns: view.set.columns.iter().map(|c| c.name.clone()).collect(),
+                rows: rows
+                    .iter()
+                    .filter_map(|row| view.set.rows.get(*row))
+                    .map(|values| values.0.clone())
+                    .collect(),
+                clipboard: clipboard.to_string(),
+            }),
+            _ => None,
+        };
     }
 
     /// Stage rows that name their columns -- pasted, or read from a file --
@@ -4985,6 +5080,9 @@ impl DbUi {
             return false;
         };
 
+        // A row's cell is how a click on that row reads ⌘C, so the row is
+        // what ⌘V brings back: copy and paste is ⌘D in two strokes.
+        self.remember_copied_rows(&[row], &text);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.copied_cell = Some((row, column));
         self.copied_at = Some(Instant::now());
@@ -5056,9 +5154,10 @@ impl DbUi {
         };
         self.row_flash = Some(RowFlash {
             tab: tab.id(),
-            rows: FlashRows::Copied(copied),
+            rows: FlashRows::Copied(copied.clone()),
             started: Instant::now(),
         });
+        self.remember_copied_rows(&copied, &text);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.status = Status::info(format!("Copied {count} {plural}"));
         cx.notify();
