@@ -5,6 +5,7 @@
 //! store -- and it does not depend on GPUI, so all of that can be exercised
 //! from a plain `#[test]`.
 
+pub mod assistant;
 pub mod commands;
 pub mod dump;
 pub mod history;

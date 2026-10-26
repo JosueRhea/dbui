@@ -172,6 +172,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-enter", RunAllQueries, Some("DbUi")),
         KeyBinding::new("cmd-alt-e", ExplainQuery, Some("DbUi")),
         KeyBinding::new("cmd-alt-a", ServerActivity, Some("DbUi")),
+        KeyBinding::new("cmd-i", ToggleAssistant, Some("DbUi")),
         KeyBinding::new("cmd-alt-d", ErDiagram, Some("DbUi")),
         KeyBinding::new("cmd-alt-p", PinResult, Some("DbUi")),
         // ⌘. is the Mac's "stop" -- Terminal, Xcode and Finder copies all
@@ -227,6 +228,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Change Theme…", ChooseTheme),
                 MenuItem::action("Schema Diagram", ErDiagram),
+                MenuItem::action("Assistant", ToggleAssistant),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
@@ -311,6 +313,7 @@ gpui::actions!(
         ExplainQuery,
         PinResult,
         ServerActivity,
+        ToggleAssistant,
         ErDiagram,
         DumpDatabase,
         RunSqlFile,

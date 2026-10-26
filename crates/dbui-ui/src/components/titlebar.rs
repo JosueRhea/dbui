@@ -140,6 +140,10 @@ impl DbUi {
                     }),
             )
             .child(self.render_titlebar_search(cx))
+            .child(
+                icon_button("titlebar-assistant", "✦", theme, self.assistant_open)
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_assistant(cx))),
+            )
             // Reloading the catalog is about the connection, not the result,
             // so it sits with the other controls that are about the app rather
             // than about the rows -- and next to the box you would have gone

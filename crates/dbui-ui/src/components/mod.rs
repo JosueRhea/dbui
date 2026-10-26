@@ -6,6 +6,7 @@
 //! knows" in one file instead of spread across the widgets that draw it.
 
 pub(crate) mod activity;
+pub(crate) mod assistant;
 mod change_bubble;
 pub(crate) mod close_guard;
 pub(crate) mod connection_form;
