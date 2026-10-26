@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 ///
 /// `Send + Sync` because the UI holds it in an `Arc` on the main thread and
 /// every call runs on the shared tokio runtime.
+// `async_trait` marks the futures it returns `#[must_use]`, which newer clippy
+// reads as doubling up on `Result`'s own.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DatabaseDriver: Send + Sync {
     /// Which engine this is -- the callers that generate SQL need it for
