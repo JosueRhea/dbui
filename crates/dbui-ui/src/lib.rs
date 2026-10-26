@@ -9,6 +9,7 @@ mod components;
 mod er_layout;
 mod highlight;
 mod json_format;
+mod markdown;
 mod root;
 mod row_export;
 mod sql_complete;

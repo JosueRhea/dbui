@@ -362,7 +362,7 @@ fn render_entry(index: usize, entry: &Entry, theme: &Theme, cx: &mut Context<DbU
                     .child(text.clone()),
             )
             .into_any_element(),
-        Entry::Assistant(text) => render_text(text, theme),
+        Entry::Assistant(text) => crate::markdown::render(text, theme),
         Entry::Notice { text, error } => div()
             .text_size(metrics::text_size_small())
             .text_color(if *error {
@@ -449,44 +449,4 @@ fn render_entry(index: usize, entry: &Entry, theme: &Theme, cx: &mut Context<DbU
                 .into_any_element()
         }
     }
-}
-
-/// Prose, with fenced code drawn as code.
-fn render_text(text: &str, theme: &Theme) -> AnyElement {
-    let blocks = text.split("```").enumerate().filter_map(|(index, part)| {
-        if index % 2 == 0 {
-            let prose = part.trim();
-            (!prose.is_empty()).then(|| {
-                div()
-                    .text_color(theme.text)
-                    .child(prose.to_string())
-                    .into_any_element()
-            })
-        } else {
-            // The fence's first line names the language.
-            let code = part
-                .split_once('\n')
-                .map_or(part, |(_, rest)| rest)
-                .trim_end();
-            Some(
-                div()
-                    .p_2()
-                    .rounded_md()
-                    .bg(theme.background)
-                    .border_1()
-                    .border_color(theme.border)
-                    .font_family(metrics::MONO_FONT)
-                    .text_size(metrics::text_size_small())
-                    .text_color(theme.text)
-                    .child(code.to_string())
-                    .into_any_element(),
-            )
-        }
-    });
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .children(blocks)
-        .into_any_element()
 }
