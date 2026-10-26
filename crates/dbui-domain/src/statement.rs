@@ -181,9 +181,9 @@ fn writes_in(words: &[String]) -> bool {
     let lifts_read_only = words
         .windows(2)
         .any(|pair| pair[0] == "READ" && pair[1] == "WRITE")
-        || words
-            .iter()
-            .any(|word| word.contains("READ_ONLY") || word == "SET_CONFIG");
+        || words.iter().any(|word| {
+            word.contains("READ_ONLY") || word.contains("QUERY_ONLY") || word == "SET_CONFIG"
+        });
     lifts_read_only
         || words
             .iter()
@@ -410,6 +410,8 @@ mod tests {
             "select pg_catalog.set_config('x', 'y', false)",
             "reset all",
             "reset default_transaction_read_only",
+            "pragma query_only = off",
+            "PRAGMA main.query_only=0",
             "discard all",
         ] {
             assert!(writes(sql), "{sql:?} lifts read only");
