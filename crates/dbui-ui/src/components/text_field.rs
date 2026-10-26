@@ -63,6 +63,8 @@ pub enum InputTarget {
     SheetField(usize),
     /// A `:name` value in the Parameters sheet.
     ParamField(usize),
+    /// The assistant panel's prompt.
+    AssistantPrompt,
 }
 
 impl DbUi {
@@ -99,6 +101,7 @@ impl DbUi {
             },
             InputTarget::PaletteQuery => self.palette.as_mut().map(|p| &mut p.query),
             InputTarget::SidebarFilter => Some(&mut self.sidebar_filter),
+            InputTarget::AssistantPrompt => Some(&mut self.assistant_input),
             InputTarget::ConfirmName => self.confirm.as_mut().map(|prompt| &mut prompt.input),
             InputTarget::CellEditor => Some(&mut self.cell_editor),
             InputTarget::FindQuery => self.editor_find.as_mut().map(|find| &mut find.query),
@@ -164,6 +167,12 @@ impl DbUi {
             }
             InputTarget::SidebarFilter => {
                 self.focus = crate::root::Focus::SidebarSearch;
+                self.filter_focus = None;
+                self.page_size_focus = false;
+                self.detail_input = None;
+            }
+            InputTarget::AssistantPrompt => {
+                self.focus = crate::root::Focus::Assistant;
                 self.filter_focus = None;
                 self.page_size_focus = false;
                 self.detail_input = None;
@@ -316,6 +325,7 @@ fn field_with_leading(
         InputTarget::PageSize => "page-size-scroll".into(),
         InputTarget::PaletteQuery => "palette-query-scroll".into(),
         InputTarget::SidebarFilter => "sidebar-filter-scroll".into(),
+        InputTarget::AssistantPrompt => "assistant-prompt-scroll".into(),
         InputTarget::ConfirmName => "confirm-name-scroll".into(),
         InputTarget::InsertField(index) => ("insert-field-scroll", index).into(),
         InputTarget::CellEditor => "cell-editor-scroll".into(),

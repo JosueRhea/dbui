@@ -87,6 +87,7 @@ enum ActionId {
     ToggleFilters,
     ToggleColumns,
     ToggleDetail,
+    ToggleAssistant,
     PagePrev,
     PageNext,
     FocusSidebar,
@@ -453,6 +454,12 @@ const ACTIONS: &[ActionDef] = &[
         id: ActionId::ToggleDetail,
         label: "Toggle Row Detail",
         shortcut: None,
+        section: "View",
+    },
+    ActionDef {
+        id: ActionId::ToggleAssistant,
+        label: "Toggle Assistant",
+        shortcut: Some("⌘I"),
         section: "View",
     },
     ActionDef {
@@ -1073,7 +1080,7 @@ impl DbUi {
             ActionId::CommitChanges | ActionId::DiscardChanges => {
                 !self.collect_batch_edits().is_empty() || !self.collect_batch_deletes().is_empty()
             }
-            ActionId::ToggleDetail => true,
+            ActionId::ToggleDetail | ActionId::ToggleAssistant => true,
             // Offered only when there is something for them to close, so the
             // palette never lists a command that would do nothing.
             ActionId::CloseAllTabs => !self.tabs.items.is_empty(),
@@ -1200,6 +1207,7 @@ impl DbUi {
             ActionId::ToggleFilters => self.toggle_filters_open(cx),
             ActionId::ToggleColumns => self.toggle_columns_open(cx),
             ActionId::ToggleDetail => self.toggle_detail(cx),
+            ActionId::ToggleAssistant => self.toggle_assistant(cx),
             ActionId::PagePrev => self.page(false, cx),
             ActionId::PageNext => self.page(true, cx),
             ActionId::FocusSidebar => {

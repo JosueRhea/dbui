@@ -42,6 +42,8 @@ pub enum Focus {
     Detail,
     Filter,
     PageSize,
+    /// The assistant panel's prompt.
+    Assistant,
 }
 
 /// Focus target inside the filter strip (Tab cycle).
@@ -521,6 +523,12 @@ pub struct DbUi {
     pub(crate) column_cache: HashMap<(String, String), Vec<Column>>,
     /// Substring filter over the schema tree. Empty means show everything.
     pub(crate) sidebar_filter: crate::text_input::TextInput,
+    /// The assistant panel on the right, and one conversation per connection.
+    pub(crate) assistant_open: bool,
+    pub(crate) assistant_input: crate::text_input::TextInput,
+    pub(crate) assistant_mode: dbui_app::assistant::AccessMode,
+    pub(crate) assistant_chats: HashMap<ConnectionId, crate::components::assistant::AssistantChat>,
+    pub(crate) assistant_scroll: ScrollHandle,
     /// The row a drag has reached, set while the button is down. `Some` means
     /// a drag is in progress; the value is what stops a pointer wandering
     /// inside one row from rebuilding the range on every mouse-move.
@@ -798,6 +806,11 @@ impl DbUi {
             completion_auto: false,
             column_cache: HashMap::new(),
             sidebar_filter: crate::text_input::TextInput::new(false),
+            assistant_open: false,
+            assistant_input: crate::text_input::TextInput::new(true),
+            assistant_mode: Default::default(),
+            assistant_chats: HashMap::new(),
+            assistant_scroll: ScrollHandle::new(),
             row_drag: None,
             editing_cell: None,
             cell_editor: crate::text_input::TextInput::new(false),
@@ -1523,6 +1536,7 @@ impl DbUi {
             commands::disconnect(&self.runtime, driver);
         }
         entry.disconnect();
+        self.end_assistant(id);
 
         // The rows are stale, but the arrangement is not: what was open is
         // still what the user wants open when the connection comes back.
@@ -3717,7 +3731,8 @@ impl DbUi {
             | Focus::Find
             | Focus::Filter
             | Focus::PageSize
-            | Focus::SidebarSearch => true,
+            | Focus::SidebarSearch
+            | Focus::Assistant => true,
             Focus::Detail => self.detail_input.is_some(),
             Focus::Sidebar | Focus::Grid => false,
         }
@@ -6712,6 +6727,26 @@ impl DbUi {
             }
         }
 
+        if self.focus == Focus::Assistant {
+            match key {
+                "escape" => {
+                    self.focus = Focus::Grid;
+                    cx.notify();
+                    return;
+                }
+                "enter" if !shift && !command && !alt => {
+                    self.send_assistant_message(cx);
+                    return;
+                }
+                _ => {
+                    if self.assistant_input.handle_key(keystroke, cx) {
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.focus == Focus::SidebarSearch {
             match key {
                 "escape" => {
@@ -7232,6 +7267,11 @@ impl Render for DbUi {
                     this.open_activity(cx)
                 }))
                 .on_action(
+                    cx.listener(|this, _: &crate::ToggleAssistant, _window, cx| {
+                        this.toggle_assistant(cx)
+                    }),
+                )
+                .on_action(
                     cx.listener(|this, _: &crate::PinResult, _window, cx| this.pin_result(cx)),
                 )
                 .on_action(
@@ -7400,6 +7440,7 @@ impl DbUi {
     /// The grid and the detail panel. Opaque, they simply fill the space
     /// beside the rail; translucent, they sit in a rounded card on the glass.
     fn render_content_card(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let assistant = self.assistant_open.then(|| self.render_assistant(cx));
         let content = div()
             .flex()
             .flex_1()
@@ -7408,7 +7449,8 @@ impl DbUi {
             .overflow_hidden()
             .child(self.render_main(window, cx))
             .children(self.render_detail_resize(cx))
-            .child(self.render_detail_sidebar(cx));
+            .child(self.render_detail_sidebar(cx))
+            .children(assistant);
         if !self.glass {
             return content.into_any_element();
         }

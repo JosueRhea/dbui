@@ -11425,3 +11425,32 @@ fn an_edit_under_a_filter_commits_against_mysql(cx: &mut TestAppContext) {
     }
     filtered_edit_commits_live(cx, Driver::MySql);
 }
+
+#[gpui::test]
+fn cmd_i_opens_the_assistant_and_its_prompt_takes_the_typing(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+
+    cx.simulate_keystrokes("cmd-i");
+    view.update(cx, |view, _| {
+        assert!(view.assistant_open);
+        assert_eq!(view.focus, Focus::Assistant);
+    });
+
+    cx.simulate_keystrokes(&typing("how many users"));
+    view.update(cx, |view, _| {
+        assert_eq!(view.assistant_input.text(), "how many users")
+    });
+
+    // Without a connection there is nothing to ask; the prompt keeps the text.
+    cx.simulate_keystrokes("enter");
+    view.update(cx, |view, _| {
+        assert_eq!(view.assistant_input.text(), "how many users");
+        assert!(view.assistant_chats.is_empty());
+    });
+
+    cx.simulate_keystrokes("escape cmd-i");
+    view.update(cx, |view, _| {
+        assert!(!view.assistant_open);
+        assert_ne!(view.focus, Focus::Assistant);
+    });
+}

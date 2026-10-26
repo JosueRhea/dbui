@@ -11,6 +11,7 @@ description = "GPUI front-end: window, layout, and input handling."
 [dependencies]
 dbui-app = { workspace = true }
 gpui = { workspace = true }
+pulldown-cmark = { version = "0.13.5", default-features = false }
 serde_json = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
